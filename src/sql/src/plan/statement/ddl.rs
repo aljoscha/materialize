@@ -1662,7 +1662,7 @@ pub fn plan_create_sink(
     let envelope = match envelope {
         None | Some(Envelope::Debezium(sql_parser::ast::DbzMode::Plain)) => SinkEnvelope::Debezium,
         Some(Envelope::Upsert) => SinkEnvelope::Upsert,
-        Some(Envelope::CdcV2) => bail_unsupported!("CDCv2 sinks"),
+        Some(Envelope::CdcV2) => SinkEnvelope::CdcV2,
         Some(Envelope::Debezium(sql_parser::ast::DbzMode::Upsert)) => {
             bail_unsupported!("UPSERT doesn't make sense for sinks")
         }
@@ -1737,6 +1737,7 @@ pub fn plan_create_sink(
 
     let value_desc = match envelope {
         SinkEnvelope::Debezium => envelopes::dbz_desc(desc.clone()),
+        SinkEnvelope::CdcV2 => desc.clone(),
         SinkEnvelope::Upsert => desc.clone(),
     };
 

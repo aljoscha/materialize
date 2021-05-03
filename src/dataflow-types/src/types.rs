@@ -681,6 +681,7 @@ pub struct SinkDesc {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SinkEnvelope {
     Debezium,
+    CdcV2,
     Upsert,
 }
 

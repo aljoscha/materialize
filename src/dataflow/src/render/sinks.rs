@@ -182,6 +182,7 @@ where
             });
             collection
         }
+        Some(SinkEnvelope::CdcV2) => unimplemented!(),
         // No envelope, this can only happen for TAIL sinks, which work
         // on vanilla rows.
         None => keyed.map(|(key, value)| (key, Some(value))),
