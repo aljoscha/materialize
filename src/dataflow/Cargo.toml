@@ -16,13 +16,14 @@ chrono = { version = "0.4.0", default-features = false, features = ["std"] }
 crossbeam-channel = "0.5.1"
 csv-core = "0.1.10"
 dataflow-types = { path = "../dataflow-types" }
+dec = "0.4.0"
 differential-dataflow = { git = "https://github.com/TimelyDataflow/differential-dataflow.git" }
 dogsdogsdogs = { git = "https://github.com/TimelyDataflow/differential-dataflow.git" }
 expr = { path = "../expr" }
 flate2 = "1.0.20"
 futures = "0.3.14"
 globset = "0.4.0"
-inotify = "0.9.2"
+inotify = "0.9.3"
 interchange = { path = "../interchange" }
 itertools = "0.9.0"
 kafka-util = { path = "../kafka-util" }
@@ -31,25 +32,25 @@ log = "0.4.13"
 mz-avro = { path = "../avro", features = ["snappy"] }
 ore = { path = "../ore" }
 pdqselect = "0.1.0"
-postgres-protocol = { git = "https://github.com/MaterializeInc/rust-postgres" }
+postgres-protocol = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }
 postgres-util = { path = "../postgres-util" }
 prometheus = { git = "https://github.com/MaterializeInc/rust-prometheus.git", default-features = false }
 prometheus-static-metric = { git = "https://github.com/MaterializeInc/rust-prometheus.git" }
 pubnub-hyper = { git = "https://github.com/MaterializeInc/pubnub-rust", default-features = false }
 rand = "0.8.3"
 rdkafka = { git = "https://github.com/fede1024/rust-rdkafka.git", features = ["cmake-build", "ssl-vendored", "gssapi-vendored", "libz-static", "zstd"] }
-regex = "1.4.6"
+regex = "1.5.4"
 repr = { path = "../repr" }
 rusoto_core = { git = "https://github.com/rusoto/rusoto.git" }
 rusoto_credential = { git = "https://github.com/rusoto/rusoto.git" }
 rusoto_kinesis = { git = "https://github.com/rusoto/rusoto.git" }
 rusoto_s3 = { git = "https://github.com/rusoto/rusoto.git" }
 rusoto_sqs = { git = "https://github.com/rusoto/rusoto.git" }
-serde = { version = "1.0.125", features = ["derive"] }
+serde = { version = "1.0.126", features = ["derive"] }
 serde_json = "1.0.64"
 timely = { git = "https://github.com/TimelyDataflow/timely-dataflow", default-features = false, features = ["bincode"] }
-tokio = { version = "1.5.0", features = ["fs", "rt", "sync"] }
-tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", features = ["with-uuid-0_8", "with-chrono-0_4"] }
-tokio-util = { version = "0.6.6", features = ["codec"] }
-url = { version = "2.2.1", features = ["serde"] }
+tokio = { version = "1.6.0", features = ["fs", "rt", "sync"] }
+tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", branch = "mz-0.7.2" }
+tokio-util = { version = "0.6.7", features = ["codec"] }
+url = { version = "2.2.2", features = ["serde"] }
 uuid = { version = "0.8.2", features = ["serde", "v4"] }
