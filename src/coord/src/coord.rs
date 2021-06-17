@@ -1235,7 +1235,7 @@ impl Coordinator {
             id,
             sink.from,
             connector.clone(),
-            sink.envelope,
+            Some(sink.envelope),
             as_of,
         );
 
@@ -2478,7 +2478,7 @@ impl Coordinator {
                 object_columns,
                 value_desc: desc,
             }),
-            SinkEnvelope::Tail { emit_progress },
+            None,
             SinkAsOf {
                 frontier,
                 strict: !with_snapshot,

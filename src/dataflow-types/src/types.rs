@@ -197,7 +197,7 @@ impl DataflowDesc {
         from_id: GlobalId,
         from_desc: RelationDesc,
         connector: SinkConnector,
-        envelope: SinkEnvelope,
+        envelope: Option<SinkEnvelope>,
         as_of: SinkAsOf,
     ) {
         let key_desc = connector.get_key_desc().cloned();
@@ -573,7 +573,7 @@ pub struct SinkDesc {
     pub value_desc: RelationDesc,
     pub key_desc: Option<RelationDesc>,
     pub connector: SinkConnector,
-    pub envelope: SinkEnvelope,
+    pub envelope: Option<SinkEnvelope>,
     pub as_of: SinkAsOf,
 }
 
@@ -581,7 +581,6 @@ pub struct SinkDesc {
 pub enum SinkEnvelope {
     Debezium,
     Upsert,
-    Tail { emit_progress: bool },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
