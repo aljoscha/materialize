@@ -27,6 +27,7 @@ All
 Alter
 And
 Any
+AppendOnly
 Arn
 Array
 As

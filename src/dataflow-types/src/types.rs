@@ -581,6 +581,7 @@ pub struct SinkDesc {
 pub enum SinkEnvelope {
     Debezium,
     Upsert,
+    AppendOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -686,6 +687,24 @@ impl SourceConnector {
                 // Currently, the Kinesis connector assigns "offsets" by counting the message in the order it was received
                 // and this order is not replayable across different reads of the same Kinesis stream.
                 ExternalSourceConnector::Kinesis(_) => false,
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Returns `true` if this connector yields append-only updates. That is,
+    /// there will be no retractions and/or upserts.
+    pub fn yields_appends_only(&self) -> bool {
+        if let SourceConnector::External {
+            connector,
+            envelope,
+            ..
+        } = self
+        {
+            match (connector, envelope) {
+                (ExternalSourceConnector::Kafka(_), &SourceEnvelope::None) => true,
                 _ => false,
             }
         } else {

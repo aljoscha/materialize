@@ -195,6 +195,19 @@ where
             });
             collection
         }
+        Some(SinkEnvelope::AppendOnly) => {
+            let combined = combine_at_timestamp(keyed.arrange_by_key().stream);
+
+            let collection = combined.flat_map(|(k, v)| {
+                let v = upsert_format(v);
+                if v.is_none() {
+                    None
+                } else {
+                    Some((k, v))
+                }
+            });
+            collection
+        }
         None => keyed.map(|(key, value)| (key, Some(value))),
     };
 

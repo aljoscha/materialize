@@ -671,7 +671,9 @@ pub fn plan_create_source(
 
     // TODO: remove bails as more support for upsert is added.
     let envelope = match &envelope {
-        sql_parser::ast::Envelope::None => SourceEnvelope::None,
+        sql_parser::ast::Envelope::None | sql_parser::ast::Envelope::AppendOnly => {
+            SourceEnvelope::None
+        }
         sql_parser::ast::Envelope::Debezium(mode) => {
             let is_avro = match encoding.value_ref() {
                 DataEncoding::Avro(_) => true,
@@ -1361,6 +1363,7 @@ pub fn plan_create_sink(
     let envelope = match envelope {
         None | Some(Envelope::Debezium(sql_parser::ast::DbzMode::Plain)) => SinkEnvelope::Debezium,
         Some(Envelope::Upsert) => SinkEnvelope::Upsert,
+        Some(Envelope::AppendOnly) => SinkEnvelope::AppendOnly,
         Some(Envelope::CdcV2) => unsupported!("CDCv2 sinks"),
         Some(Envelope::Debezium(sql_parser::ast::DbzMode::Upsert)) => {
             unsupported!("UPSERT doesn't make sense for sinks")
@@ -1442,6 +1445,7 @@ pub fn plan_create_sink(
     let value_desc = match envelope {
         SinkEnvelope::Debezium => envelopes::dbz_desc(desc.clone()),
         SinkEnvelope::Upsert => desc.clone(),
+        SinkEnvelope::AppendOnly => desc.clone(),
     };
 
     if as_of.is_some() {
@@ -1452,6 +1456,24 @@ pub fn plan_create_sink(
     depends_on.extend(from.uses());
 
     let root_user_dependencies = get_root_dependencies(scx, &depends_on);
+
+    if envelope == SinkEnvelope::AppendOnly {
+        for item in root_user_dependencies.iter() {
+            if item.item_type() == CatalogItemType::Source {
+                if !item.source_connector()?.yields_appends_only() {
+                    bail!(
+                    "all input sources of an append-only Kafka sink must be append-only, {} is not",
+                    item.name()
+                );
+                }
+            } else if item.item_type() != CatalogItemType::Source {
+                bail!(
+                    "all inputs of an append-only sink must be sources, {} is not",
+                    item.name()
+                );
+            };
+        }
+    }
 
     let connector_builder = match connector {
         Connector::File { .. } => unsupported!("file sinks"),

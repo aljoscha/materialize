@@ -1584,6 +1584,8 @@ impl<'a> Parser<'a> {
             Envelope::Upsert
         } else if self.parse_keyword(MATERIALIZE) {
             Envelope::CdcV2
+        } else if self.parse_keyword(APPENDONLY) {
+            Envelope::AppendOnly
         } else {
             return self.expected(
                 self.peek_pos(),

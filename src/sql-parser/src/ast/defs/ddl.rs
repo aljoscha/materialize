@@ -208,6 +208,7 @@ pub enum Envelope {
     Debezium(DbzMode),
     Upsert,
     CdcV2,
+    AppendOnly,
 }
 
 impl Default for Envelope {
@@ -232,6 +233,9 @@ impl AstDisplay for Envelope {
             }
             Self::CdcV2 => {
                 f.write_str("MATERIALIZE");
+            }
+            Self::AppendOnly => {
+                f.write_str("APPENDONLY");
             }
         }
     }
