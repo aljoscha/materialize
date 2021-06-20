@@ -24,6 +24,6 @@ unicode-width = "0.1.8"
 [build-dependencies]
 anyhow = "1.0.41"
 ore = { path = "../ore" }
-phf_codegen = "0.8.0"
+phf_codegen = "0.9.0"
 unicase = "2.4.0"
 walkabout = { path = "../walkabout" }
