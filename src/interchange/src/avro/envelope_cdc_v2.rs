@@ -44,12 +44,12 @@ pub fn extract_data_columns<'a>(schema: &'a Schema) -> anyhow::Result<SchemaNode
 
 /// Collected state to encode update batches and progress statements.
 #[derive(Debug)]
-pub struct Encoder {
+pub struct AvroCdcV2Encoder {
     columns: Vec<(ColumnName, ColumnType)>,
     schema: Schema,
 }
 
-impl Encoder {
+impl AvroCdcV2Encoder {
     /// Creates a new CDCv2 encoder from a relation description.
     pub fn new(desc: RelationDesc) -> Self {
         let columns = column_names_and_types(desc);
@@ -272,7 +272,7 @@ mod tests {
             .with_named_column("id", ScalarType::Int64.nullable(false))
             .with_named_column("price", ScalarType::Float64.nullable(true));
 
-        let encoder = Encoder::new(desc.clone());
+        let encoder = AvroCdcV2Encoder::new(desc.clone());
         let row_schema =
             build_row_schema_json(&crate::encode::column_names_and_types(desc), "data");
         let schema = build_schema(row_schema);
