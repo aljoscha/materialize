@@ -41,8 +41,6 @@ where
         sink: &SinkDesc,
         metrics: &SinkBaseMetrics,
     ) {
-        let sink_render = get_sink_render_for(&sink.connector);
-
         // put together tokens that belong to the export
         let mut needed_source_tokens = Vec::new();
         let mut needed_additional_tokens = Vec::new();
@@ -56,18 +54,12 @@ where
             }
         }
 
-        let (collection, _err_collection) = self
-            .lookup_id(expr::Id::Global(sink.from))
-            .expect("Sink source collection not loaded")
-            .as_collection();
-
-        let collection = apply_sink_envelope(sink, &sink_render, collection);
-
-        // TODO(benesch): errors should stream out through the sink,
-        // if we figure out a protocol for that.
-
-        let sink_token =
-            sink_render.render_continuous_sink(render_state, sink, sink_id, collection, metrics);
+        let sink_token = match sink.envelope {
+            Some(SinkEnvelope::CdcV2) => {
+                unimplemented!("CDCv2 sink")
+            }
+            _ => self.render_classic_sink(render_state, sink_id, sink, metrics),
+        };
 
         if let Some(sink_token) = sink_token {
             needed_sink_tokens.push(sink_token);
@@ -81,6 +73,30 @@ where
         render_state
             .dataflow_tokens
             .insert(sink_id, Box::new(tokens));
+    }
+
+    fn render_classic_sink(
+        &mut self,
+        render_state: &mut RenderState,
+        sink_id: GlobalId,
+        sink: &SinkDesc,
+        metrics: &SinkBaseMetrics,
+    ) -> Option<Box<dyn Any>> {
+        let sink_render = get_sink_render_for(&sink.connector);
+
+        // TODO(benesch): errors should stream out through the sink,
+        // if we figure out a protocol for that.
+        let (collection, _err_collection) = self
+            .lookup_id(expr::Id::Global(sink.from))
+            .expect("Sink source collection not loaded")
+            .as_collection();
+
+        let collection = apply_sink_envelope(sink, &sink_render, collection);
+
+        let sink_token =
+            sink_render.render_continuous_sink(render_state, sink, sink_id, collection, metrics);
+
+        sink_token
     }
 }
 
@@ -182,7 +198,7 @@ where
             });
             collection
         }
-        Some(SinkEnvelope::CdcV2) => unimplemented!(),
+        Some(SinkEnvelope::CdcV2) => unreachable!("CDCv2 sinks are not rendered as classic sinks"),
         // No envelope, this can only happen for TAIL sinks, which work
         // on vanilla rows.
         None => keyed.map(|(key, value)| (key, Some(value))),
