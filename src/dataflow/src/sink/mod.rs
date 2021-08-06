@@ -8,6 +8,7 @@
 // by the Apache License, Version 2.0.
 
 mod avro_ocf;
+pub mod cdcv2;
 mod kafka;
 mod metrics;
 mod tail;
