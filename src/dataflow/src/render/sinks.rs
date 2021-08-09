@@ -35,6 +35,7 @@ where
     pub(crate) fn export_sink(
         &mut self,
         render_state: &mut RenderState,
+        _worker_id: usize,
         tokens: &mut RelevantTokens,
         import_ids: HashSet<GlobalId>,
         sink_id: GlobalId,

@@ -256,6 +256,7 @@ pub fn build_dataflow<A: Allocate>(
                 let imports = dataflow.get_imports(&sink.from);
                 context.export_sink(
                     render_state,
+                    scope.index(),
                     &mut tokens,
                     imports,
                     *sink_id,
