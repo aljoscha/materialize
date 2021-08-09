@@ -346,8 +346,9 @@ async fn build_kafka(
     let maybe_append_nonce = {
         let reuse_topic = builder.reuse_topic;
         let topic_suffix_nonce = builder.topic_suffix_nonce;
+        let is_cdcv2 = builder.is_cdcv2;
         move |topic: &str| {
-            if reuse_topic {
+            if reuse_topic || is_cdcv2 {
                 topic.to_string()
             } else {
                 format!("{}-{}-{}", topic, id, topic_suffix_nonce)
@@ -375,7 +376,7 @@ async fn build_kafka(
         &topic,
         builder.partition_count,
         builder.replication_factor,
-        builder.reuse_topic,
+        builder.reuse_topic || builder.is_cdcv2,
     )
     .await
     .context("error registering kafka topic for sink")?;

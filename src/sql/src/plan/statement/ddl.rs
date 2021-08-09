@@ -1358,6 +1358,7 @@ fn kafka_sink_builder<GAS>(
     with_options: &mut BTreeMap<String, Value>,
     broker: String,
     topic_prefix: String,
+    is_cdcv2: bool,
     relation_key_indices: Option<Vec<usize>>,
     key_desc_and_indices: Option<(RelationDesc, Vec<usize>)>,
     value_desc: RelationDesc,
@@ -1383,6 +1384,14 @@ where
         Some(_) => bail!("reuse_topic must be a boolean"),
     };
     let config_options = kafka_util::extract_config(with_options)?;
+
+    if is_cdcv2 && reuse_topic {
+        bail!("reuse_topic is neither allowed nor needed with ENVELOPE MATERIALIZE");
+    }
+
+    if is_cdcv2 && (consistency_topic.is_some() || consistency.is_some()) {
+        bail!("a consistency topic is neither allowed nor needed with ENVELOPE MATERIALIZE");
+    }
 
     let format = match format {
         Some(Format::Avro(AvroSchema::Csr {
@@ -1507,6 +1516,7 @@ where
         key_desc_and_indices,
         value_desc,
         reuse_topic,
+        is_cdcv2,
         transitive_source_dependencies,
     }))
 }
@@ -1764,6 +1774,7 @@ pub fn plan_create_sink(
                 &mut with_options,
                 broker,
                 topic,
+                true,
                 relation_key_indices,
                 key_desc_and_indices,
                 value_desc,
@@ -1776,6 +1787,7 @@ pub fn plan_create_sink(
                 &mut with_options,
                 broker,
                 topic,
+                false,
                 relation_key_indices,
                 key_desc_and_indices,
                 value_desc,

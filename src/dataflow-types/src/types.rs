@@ -1180,6 +1180,8 @@ pub struct KafkaSinkConnectorBuilder {
     // Forces the sink to always write to the same topic across restarts instead
     // of picking a new topic each time.
     pub reuse_topic: bool,
+    /// Whether this sink is a CDCv2 sink or a regular/classic sink.
+    pub is_cdcv2: bool,
     // Source dependencies for exactly-once sinks.
     pub transitive_source_dependencies: Vec<GlobalId>,
 }
