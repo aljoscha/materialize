@@ -23,11 +23,12 @@ use mz_avro::{
     define_unexpected, ArrayAsVecDecoder, AvroDecodable, AvroDecode, AvroDeserializer, AvroRead,
     StatefulAvroDecodable,
 };
+use std::fmt;
 use std::{cell::RefCell, rc::Rc};
 
 use crate::encode::column_names_and_types;
 
-use super::RowWrapper;
+use super::{GenerateAvroSchema, RowWrapper};
 
 pub fn extract_data_columns<'a>(schema: &'a Schema) -> anyhow::Result<SchemaNode<'a>> {
     let data_name = FullName::from_parts("data", Some("com.materialize.cdc"), "");
@@ -42,27 +43,76 @@ pub fn extract_data_columns<'a>(schema: &'a Schema) -> anyhow::Result<SchemaNode
     })
 }
 
-/// Collected state to encode update batches and progress statements.
-#[derive(Debug)]
-pub struct AvroCdcV2Encoder {
+/// Generates key and value Avro schemas for the CDCv2 envelope.
+pub struct AvroCdcV2SchemaGenerator {
     columns: Vec<(ColumnName, ColumnType)>,
     schema: Schema,
 }
 
-impl AvroCdcV2Encoder {
-    /// Creates a new CDCv2 encoder from a relation description.
-    pub fn new(desc: RelationDesc) -> Self {
-        let columns = column_names_and_types(desc);
+impl GenerateAvroSchema for AvroCdcV2SchemaGenerator {
+    fn new(
+        key_desc: Option<RelationDesc>,
+        value_desc: RelationDesc,
+        include_transaction: bool,
+    ) -> Self {
+        assert!(key_desc.is_none(), "cannot have a key with CDCv2");
+        assert!(
+            !include_transaction,
+            "cannot include transaction information with CDCv2"
+        );
+
+        let columns = column_names_and_types(value_desc);
         let row_schema = super::build_row_schema_json(&columns, "data");
         let schema = build_schema(row_schema);
         Self { columns, schema }
+    }
+
+    fn value_writer_schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    fn value_columns(&self) -> &[(ColumnName, ColumnType)] {
+        &self.columns
+    }
+
+    fn key_writer_schema(&self) -> Option<&Schema> {
+        None
+    }
+
+    fn key_columns(&self) -> Option<&[(ColumnName, ColumnType)]> {
+        None
+    }
+}
+
+impl fmt::Debug for AvroCdcV2SchemaGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Cdcv2SchemaGenerator")
+            .field("schema", &self.schema)
+            .finish()
+    }
+}
+
+/// Collected state to encode update batches and progress statements.
+#[derive(Debug)]
+pub struct AvroCdcV2Encoder {
+    schema_generator: AvroCdcV2SchemaGenerator,
+    schema_id: i32,
+}
+
+impl AvroCdcV2Encoder {
+    /// Creates a new [`AvroCdcV2Encoder`] that uses the schema from the given `schema_generator`.
+    pub fn new(schema_generator: AvroCdcV2SchemaGenerator, schema_id: i32) -> Self {
+        Self {
+            schema_generator,
+            schema_id,
+        }
     }
 
     /// Encodes a batch of updates as an Avro value.
     pub fn encode_updates(&self, updates: &[(Row, i64, i64)]) -> Value {
         let mut enc_updates = Vec::new();
         for (data, time, diff) in updates {
-            let enc_data = super::encode_datums_as_avro(data, &self.columns);
+            let enc_data = super::encode_datums_as_avro(data, &self.schema_generator.columns);
             let enc_time = Value::Long(time.clone());
             let enc_diff = Value::Long(diff.clone());
             enc_updates.push(Value::Record(vec![
@@ -272,7 +322,9 @@ mod tests {
             .with_named_column("id", ScalarType::Int64.nullable(false))
             .with_named_column("price", ScalarType::Float64.nullable(true));
 
-        let encoder = AvroCdcV2Encoder::new(desc.clone());
+        let schema_generator = AvroCdcV2SchemaGenerator::new(None, desc.clone(), false);
+        let encoder = AvroCdcV2Encoder::new(schema_generator, 0);
+
         let row_schema =
             build_row_schema_json(&crate::encode::column_names_and_types(desc), "data");
         let schema = build_schema(row_schema);
