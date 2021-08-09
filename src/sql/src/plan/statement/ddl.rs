@@ -38,7 +38,9 @@ use dataflow_types::{
     SourceConnector, SourceDataEncoding, SourceEnvelope, Timeline,
 };
 use expr::{func, GlobalId, MirRelationExpr, TableFunc, UnaryFunc};
-use interchange::avro::{self, AvroSchemaGenerator, DebeziumDeduplicationStrategy};
+use interchange::avro::{
+    self, AvroSchemaGenerator, DebeziumDeduplicationStrategy, GenerateAvroSchema,
+};
 use interchange::envelopes;
 use ore::collections::CollectionExt;
 use ore::str::StrExt;
@@ -1349,7 +1351,7 @@ pub fn plan_create_views(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn kafka_sink_builder(
+fn kafka_sink_builder<GAS>(
     format: Option<Format<Raw>>,
     consistency: Option<KafkaConsistency<Raw>>,
     with_options: &mut BTreeMap<String, Value>,
@@ -1360,7 +1362,10 @@ fn kafka_sink_builder(
     value_desc: RelationDesc,
     topic_suffix_nonce: String,
     root_dependencies: &[&dyn CatalogItem],
-) -> Result<SinkConnectorBuilder, anyhow::Error> {
+) -> Result<SinkConnectorBuilder, anyhow::Error>
+where
+    GAS: GenerateAvroSchema,
+{
     let consistency_topic = match with_options.remove("consistency_topic") {
         None => None,
         Some(Value::String(topic)) => Some(topic),
@@ -1400,7 +1405,7 @@ fn kafka_sink_builder(
 
             let include_transaction =
                 reuse_topic || consistency_topic.is_some() || consistency.is_some();
-            let schema_generator = AvroSchemaGenerator::new(
+            let schema_generator = GAS::new(
                 key_desc_and_indices
                     .as_ref()
                     .map(|(desc, _indices)| desc.clone()),
@@ -1750,7 +1755,7 @@ pub fn plan_create_sink(
             topic,
             consistency,
             ..
-        } => kafka_sink_builder(
+        } => kafka_sink_builder::<AvroSchemaGenerator>(
             format,
             consistency,
             &mut with_options,
