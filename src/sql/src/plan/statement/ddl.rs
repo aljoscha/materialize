@@ -38,6 +38,7 @@ use dataflow_types::{
     SourceConnector, SourceDataEncoding, SourceEnvelope, Timeline,
 };
 use expr::{func, GlobalId, MirRelationExpr, TableFunc, UnaryFunc};
+use interchange::avro::cdc_v2::AvroCdcV2SchemaGenerator;
 use interchange::avro::{
     self, AvroSchemaGenerator, DebeziumDeduplicationStrategy, GenerateAvroSchema,
 };
@@ -1756,18 +1757,32 @@ pub fn plan_create_sink(
             topic,
             consistency,
             ..
-        } => kafka_sink_builder::<AvroSchemaGenerator>(
-            format,
-            consistency,
-            &mut with_options,
-            broker,
-            topic,
-            relation_key_indices,
-            key_desc_and_indices,
-            value_desc,
-            suffix_nonce,
-            &root_user_dependencies,
-        )?,
+        } => match envelope {
+            SinkEnvelope::CdcV2 => kafka_sink_builder::<AvroCdcV2SchemaGenerator>(
+                format,
+                consistency,
+                &mut with_options,
+                broker,
+                topic,
+                relation_key_indices,
+                key_desc_and_indices,
+                value_desc,
+                suffix_nonce,
+                &root_user_dependencies,
+            )?,
+            _ => kafka_sink_builder::<AvroSchemaGenerator>(
+                format,
+                consistency,
+                &mut with_options,
+                broker,
+                topic,
+                relation_key_indices,
+                key_desc_and_indices,
+                value_desc,
+                suffix_nonce,
+                &root_user_dependencies,
+            )?,
+        },
         CreateSinkConnector::AvroOcf { path } => {
             avro_ocf_sink_builder(format, path, suffix_nonce, value_desc)?
         }
