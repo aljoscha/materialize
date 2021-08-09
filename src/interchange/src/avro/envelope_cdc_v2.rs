@@ -193,6 +193,7 @@ pub fn build_schema(row_schema: serde_json::Value) -> Schema {
         "items": {
             "name" : "update",
             "type" : "record",
+            "namespace": "com.materialize.cdc",
             "fields" : [
                 {
                     "name": "data",
