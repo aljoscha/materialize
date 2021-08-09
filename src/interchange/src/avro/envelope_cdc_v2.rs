@@ -9,6 +9,7 @@
 
 //! Logic for the Avro representation of the CDCv2 protocol.
 
+use byteorder::{NetworkEndian, WriteBytesExt};
 use mz_avro::schema::{FullName, SchemaNode};
 use repr::{ColumnName, ColumnType, Diff, RelationDesc, Row, Timestamp};
 use serde_json::json;
@@ -109,7 +110,7 @@ impl AvroCdcV2Encoder {
     }
 
     /// Encodes a batch of updates as an Avro value.
-    pub fn encode_updates(&self, updates: &[(&Row, &Timestamp, &Diff)]) -> Value {
+    pub fn encode_updates(&self, updates: &[(&Row, &Timestamp, &Diff)]) -> Vec<u8> {
         let mut enc_updates = Vec::new();
         for (data, time, diff) in updates {
             let enc_data = super::encode_datums_as_avro(*data, &self.schema_generator.columns);
@@ -121,12 +122,18 @@ impl AvroCdcV2Encoder {
                 ("diff".to_string(), enc_diff),
             ]));
         }
-        Value::Union {
+        let avro_value = Value::Union {
             index: 0,
             inner: Box::new(Value::Array(enc_updates)),
             n_variants: 2,
             null_variant: None,
-        }
+        };
+
+        encode_message_unchecked(
+            self.schema_id,
+            &avro_value,
+            self.schema_generator.value_writer_schema(),
+        )
     }
 
     /// Encodes the contents of a progress statement as an Avro value.
@@ -135,7 +142,7 @@ impl AvroCdcV2Encoder {
         lower: &[Timestamp],
         upper: &[Timestamp],
         counts: &[(Timestamp, i64)],
-    ) -> Value {
+    ) -> Vec<u8> {
         let enc_lower = Value::Array(
             lower
                 .iter()
@@ -167,13 +174,37 @@ impl AvroCdcV2Encoder {
             ("counts".to_string(), enc_counts),
         ]);
 
-        Value::Union {
+        let avro_value = Value::Union {
             index: 1,
             inner: Box::new(enc_progress),
             n_variants: 2,
             null_variant: None,
-        }
+        };
+
+        encode_message_unchecked(
+            self.schema_id,
+            &avro_value,
+            self.schema_generator.value_writer_schema(),
+        )
     }
+}
+
+fn encode_avro_header(buf: &mut Vec<u8>, schema_id: i32) {
+    // The first byte is a magic byte (0) that indicates the Confluent
+    // serialization format version, and the next four bytes are a
+    // 32-bit schema ID.
+    //
+    // https://docs.confluent.io/current/schema-registry/docs/serializer-formatter.html#wire-format
+    buf.write_u8(0).expect("writing to vec cannot fail");
+    buf.write_i32::<NetworkEndian>(schema_id)
+        .expect("writing to vec cannot fail");
+}
+
+fn encode_message_unchecked(schema_id: i32, value: &Value, schema: &Schema) -> Vec<u8> {
+    let mut buf = vec![];
+    encode_avro_header(&mut buf, schema_id);
+    mz_avro::encode_unchecked(value, schema, &mut buf);
+    buf
 }
 
 #[derive(AvroDecodable)]
@@ -346,30 +377,25 @@ mod tests {
             build_row_schema_json(&crate::encode::column_names_and_types(desc), "data");
         let schema = build_schema(row_schema);
 
-        let values = vec![
+        let mut encoded = vec![
             encoder.encode_updates(&[]),
             encoder.encode_progress(&[0], &[3], &[]),
             encoder.encode_progress(&[3], &[], &[]),
         ];
-        use mz_avro::encode::encode_to_vec;
-        let mut values: Vec<_> = values
-            .into_iter()
-            .map(|v| encode_to_vec(&v, &schema))
-            .collect();
 
         let g = GeneralDeserializer {
             schema: schema.top_node(),
         };
         assert!(matches!(
-            g.deserialize(&mut &values.remove(0)[..], Decoder).unwrap(),
+            g.deserialize(&mut &encoded.remove(0)[..], Decoder).unwrap(),
             Message::Updates(_)
         ),);
         assert!(matches!(
-            g.deserialize(&mut &values.remove(0)[..], Decoder).unwrap(),
+            g.deserialize(&mut &encoded.remove(0)[..], Decoder).unwrap(),
             Message::Progress(_)
         ),);
         assert!(matches!(
-            g.deserialize(&mut &values.remove(0)[..], Decoder).unwrap(),
+            g.deserialize(&mut &encoded.remove(0)[..], Decoder).unwrap(),
             Message::Progress(_)
         ),);
     }
