@@ -168,7 +168,9 @@ def wait_metric(args: argparse.Namespace, metrics: BenchmarkMetrics, start: date
         # We aren't running query_range, so there should only be a single timestamp and point in the reponse
         if current_values:
             (ts, point) = [float(i) for i in current_values[0]['value']]
-            if point == args.expected_value:
+            # CDCv2 will also emit progress messages to the topic, so we need
+            # to be approximate here
+            if point >= args.expected_value:
                 rate = round(point / max(time_so_far, 1))
                 print(f"SUCCESS! seconds_taken={time_so_far} rows_per_sec={rate}")
                 record_results(args, metrics, start, rate)
