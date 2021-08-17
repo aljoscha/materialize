@@ -381,11 +381,14 @@ where
         let mut d_logger = BatchLogger::new(d_linked.clone(), granularity_ms);
         let m_linked = std::rc::Rc::new(EventLink::new());
         let mut m_logger = BatchLogger::new(m_linked.clone(), granularity_ms);
+        let e_linked = std::rc::Rc::new(EventLink::new());
+        let mut e_logger = BatchLogger::new(e_linked.clone(), granularity_ms);
 
         let mut t_traces = HashMap::new();
         let mut r_traces = HashMap::new();
         let mut d_traces = HashMap::new();
         let mut m_traces = HashMap::new();
+        let mut e_traces = HashMap::new();
 
         if !logging.log_logging {
             // Construct logging dataflows and endpoints before registering any.
@@ -408,6 +411,11 @@ where
                 &mut self.timely_worker,
                 logging,
                 m_linked.clone(),
+            ));
+            e_traces.extend(logging::errors::construct(
+                &mut self.timely_worker,
+                logging,
+                e_linked.clone(),
             ));
         }
 
@@ -476,6 +484,13 @@ where
             }),
         );
 
+        self.timely_worker.log_register().insert_logger(
+            "materialized/errors",
+            Logger::new(now, unix, self.timely_worker.index(), move |time, data| {
+                e_logger.publish_batch(time, data)
+            }),
+        );
+
         let errs = self
             .timely_worker
             .dataflow_named("Dataflow: logging", |scope| {
@@ -513,6 +528,11 @@ where
                 logging,
                 m_linked,
             ));
+            e_traces.extend(logging::errors::construct(
+                &mut self.timely_worker,
+                logging,
+                e_linked,
+            ));
         }
 
         // Install traces as maintained indexes
@@ -548,6 +568,14 @@ where
             self.reported_frontiers.insert(id, Antichain::from_elem(0));
             logger.log(MaterializedEvent::Frontier(id, 0, 1));
         }
+        for (log, (_, trace)) in e_traces {
+            let id = logging.active_logs[&log];
+            self.render_state
+                .traces
+                .set(id, TraceBundle::new(trace, errs.clone()));
+            self.reported_frontiers.insert(id, Antichain::from_elem(0));
+            logger.log(MaterializedEvent::Frontier(id, 0, 1));
+        }
 
         self.materialized_logger = Some(logger);
     }
@@ -565,6 +593,9 @@ where
             .log_register()
             .remove("differential/arrange");
         self.timely_worker.log_register().remove("materialized");
+        self.timely_worker
+            .log_register()
+            .remove("materialized/errors");
     }
 
     /// Draws from `dataflow_command_receiver` until shutdown.

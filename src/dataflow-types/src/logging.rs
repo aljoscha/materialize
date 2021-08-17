@@ -28,6 +28,7 @@ pub enum LogVariant {
     Timely(TimelyLog),
     Differential(DifferentialLog),
     Materialized(MaterializedLog),
+    Errors(ErrorLog),
 }
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +59,12 @@ pub enum MaterializedLog {
     PeekCurrent,
     PeekDuration,
     SourceInfo,
+}
+
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub enum ErrorLog {
+    Index,
+    Sink,
 }
 
 impl LogVariant {
@@ -235,6 +242,14 @@ impl LogVariant {
                 .with_named_column("duration_ns", ScalarType::Int64.nullable(false))
                 .with_named_column("count", ScalarType::Int64.nullable(false))
                 .with_key(vec![0, 1]),
+
+            LogVariant::Errors(ErrorLog::Index) => RelationDesc::empty()
+                .with_named_column("id", ScalarType::String.nullable(false))
+                .with_named_column("error", ScalarType::String.nullable(false)),
+
+            LogVariant::Errors(ErrorLog::Sink) => RelationDesc::empty()
+                .with_named_column("id", ScalarType::String.nullable(false))
+                .with_named_column("error", ScalarType::String.nullable(false)),
         }
     }
 
@@ -292,6 +307,8 @@ impl LogVariant {
             LogVariant::Materialized(MaterializedLog::PeekCurrent) => vec![],
             LogVariant::Materialized(MaterializedLog::SourceInfo) => vec![],
             LogVariant::Materialized(MaterializedLog::PeekDuration) => vec![],
+            LogVariant::Errors(ErrorLog::Index) => vec![],
+            LogVariant::Errors(ErrorLog::Sink) => vec![],
         }
     }
 }

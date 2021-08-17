@@ -109,7 +109,10 @@ use std::rc::Weak;
 use differential_dataflow::AsCollection;
 use persist::indexed::runtime::RuntimeClient;
 use timely::communication::Allocate;
+use timely::dataflow::channels::pact::Pipeline;
+use timely::dataflow::operators::generic::OutputHandle;
 use timely::dataflow::operators::to_stream::ToStream;
+use timely::dataflow::operators::Operator;
 use timely::dataflow::scopes::Child;
 use timely::dataflow::Scope;
 use timely::progress::Antichain;
@@ -120,9 +123,10 @@ use expr::{GlobalId, Id};
 use itertools::Itertools;
 use ore::collections::CollectionExt as _;
 use ore::now::NowFn;
-use repr::{Row, Timestamp};
+use repr::{Diff, Row, Timestamp};
 
 use crate::arrangement::manager::{TraceBundle, TraceManager};
+use crate::logging::errors::{ErrorEvent, ErrorLogger};
 use crate::metrics::Metrics;
 use crate::render::context::CollectionBundle;
 use crate::render::context::{ArrangementFlavor, Context};
@@ -196,6 +200,7 @@ pub fn build_dataflow<A: Allocate>(
     let worker_logging = timely_worker.log_register().get("timely");
     let name = format!("Dataflow: {}", &dataflow.debug_name);
     let materialized_logging = timely_worker.log_register().get("materialized");
+    let error_logging = timely_worker.log_register().get("materialized/errors");
 
     timely_worker.dataflow_core(&name, worker_logging, Box::new(()), |_, scope| {
         // The scope.clone() occurs to allow import in the region.
@@ -248,7 +253,14 @@ pub fn build_dataflow<A: Allocate>(
             // Export declared indexes.
             for (idx_id, idx, _typ) in &dataflow.index_exports {
                 let imports = dataflow.get_imports(&idx.on_id);
-                context.export_index(render_state, &mut tokens, imports, *idx_id, idx);
+                context.export_index(
+                    render_state,
+                    error_logging.clone(),
+                    &mut tokens,
+                    imports,
+                    *idx_id,
+                    idx,
+                );
             }
 
             // Export declared sinks.
@@ -256,6 +268,7 @@ pub fn build_dataflow<A: Allocate>(
                 let imports = dataflow.get_imports(&sink.from);
                 context.export_sink(
                     render_state,
+                    error_logging.clone(),
                     &mut tokens,
                     imports,
                     *sink_id,
@@ -331,6 +344,7 @@ where
     fn export_index(
         &mut self,
         render_state: &mut RenderState,
+        mut error_logging: Option<ErrorLogger>,
         tokens: &mut RelevantTokens,
         import_ids: HashSet<GlobalId>,
         idx_id: GlobalId,
@@ -356,12 +370,63 @@ where
         });
         match bundle.arrangement(&idx.keys) {
             Some(ArrangementFlavor::Local(oks, errs)) => {
+                let error_idx_id = idx_id.clone();
+                let error_op_name = format!("ForwardIndexErrors(idx_id={}", error_idx_id);
+
+                // TODO(aljoscha): factor this out into a common operator that is used both by the
+                // index rendering and sink rendering code
+                errs.as_collection(|key, _value| key.clone())
+                    .inner
+                    .unary_frontier(Pipeline, &error_op_name, |_default_cap, _info| {
+                        let mut vector = Vec::new();
+                        // TODO(aljoscha): there must be a better way than manually keeping track
+                        // of errors that we need to retract when going down. maybe?
+                        let mut reported_errors: HashMap<DataflowError, Diff> = HashMap::new();
+                        move |input, _output: &mut OutputHandle<_, (), _>| {
+                            // if we're being shut down, retract any outstanding
+                            // errors to clear the error log from errors of this
+                            // index
+                            if input.frontier().frontier().is_empty() {
+                                if let Some(error_logging) = error_logging.as_mut() {
+                                    for (error, diff) in reported_errors.drain() {
+                                        error_logging.log(ErrorEvent::IndexError(
+                                            error_idx_id,
+                                            error.clone(),
+                                            -diff,
+                                        ));
+                                    }
+                                }
+                            }
+
+                            while let Some((_time, data)) = input.next() {
+                                data.swap(&mut vector);
+
+                                for (error, _ts, diff) in vector.drain(..) {
+                                    if let Some(error_logging) = error_logging.as_mut() {
+                                        reported_errors
+                                            .entry(error.clone())
+                                            .and_modify(|existing_diff| *existing_diff += diff)
+                                            .or_insert(1);
+                                        reported_errors.retain(|_error, diff| *diff > 0);
+                                        error_logging.log(ErrorEvent::IndexError(
+                                            error_idx_id,
+                                            error.clone(),
+                                            diff,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    });
+
                 render_state.traces.set(
                     idx_id,
                     TraceBundle::new(oks.trace, errs.trace).with_drop(tokens),
                 );
             }
             Some(ArrangementFlavor::Trace(gid, _, _)) => {
+                // TODO(aljoscha): what to do with errors here?
+
                 // Duplicate of existing arrangement with id `gid`, so
                 // just create another handle to that arrangement.
                 let trace = render_state.traces.get(&gid).unwrap().clone();

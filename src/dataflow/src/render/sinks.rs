@@ -11,11 +11,14 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use differential_dataflow::operators::arrange::arrangement::ArrangeByKey;
 use differential_dataflow::{Collection, Hashable};
+use timely::dataflow::channels::pact::Pipeline;
+use timely::dataflow::operators::generic::OutputHandle;
+use timely::dataflow::operators::Operator;
 use timely::dataflow::scopes::Child;
 use timely::dataflow::Scope;
 
@@ -24,6 +27,7 @@ use expr::GlobalId;
 use interchange::envelopes::{combine_at_timestamp, dbz_format, upsert_format};
 use repr::{Datum, Diff, RelationDesc, Row, Timestamp};
 
+use crate::logging::errors::{ErrorEvent, ErrorLogger};
 use crate::render::context::Context;
 use crate::render::{RelevantTokens, RenderState};
 use crate::sink::SinkBaseMetrics;
@@ -36,6 +40,7 @@ where
     pub(crate) fn export_sink(
         &mut self,
         render_state: &mut RenderState,
+        mut error_logging: Option<ErrorLogger>,
         tokens: &mut RelevantTokens,
         import_ids: HashSet<GlobalId>,
         sink_id: GlobalId,
@@ -57,15 +62,63 @@ where
             }
         }
 
-        let (collection, _err_collection) = self
+        let (collection, err_collection) = self
             .lookup_id(expr::Id::Global(sink.from))
             .expect("Sink source collection not loaded")
             .as_collection();
 
-        let collection = apply_sink_envelope(sink, &sink_render, collection);
-
         // TODO(benesch): errors should stream out through the sink,
         // if we figure out a protocol for that.
+        // TODO(aljoscha): What to do with the sink? Should we mark it as failed? Send an error out
+        // through the sink? Should we mark the sink as "un-failed" if/when errors retract?
+        let error_sink_id = sink_id.clone();
+        let error_op_name = format!("ForwardSinkErrors(sink_id={}", error_sink_id);
+
+        // TODO(aljoscha): factor this out into a common operator that is used both by the
+        // index rendering and sink rendering code
+        err_collection
+            .inner
+            .unary_frontier(Pipeline, &error_op_name, |_default_cap, _info| {
+                let mut vector = Vec::new();
+                let mut reported_errors: HashMap<DataflowError, Diff> = HashMap::new();
+                move |input, _output: &mut OutputHandle<_, (), _>| {
+                    // if we're being shut down, retract any outstanding
+                    // errors to clear the error log from errors of this
+                    // index
+                    if input.frontier().frontier().is_empty() {
+                        if let Some(error_logging) = error_logging.as_mut() {
+                            for (error, diff) in reported_errors.drain() {
+                                error_logging.log(ErrorEvent::SinkError(
+                                    error_sink_id,
+                                    error.clone(),
+                                    -diff,
+                                ));
+                            }
+                        }
+                    }
+
+                    while let Some((_time, data)) = input.next() {
+                        data.swap(&mut vector);
+
+                        for (error, _ts, diff) in vector.drain(..) {
+                            if let Some(error_logging) = error_logging.as_mut() {
+                                reported_errors
+                                    .entry(error.clone())
+                                    .and_modify(|existing_diff| *existing_diff += diff)
+                                    .or_insert(1);
+                                reported_errors.retain(|_error, diff| *diff > 0);
+                                error_logging.log(ErrorEvent::SinkError(
+                                    error_sink_id,
+                                    error.clone(),
+                                    diff,
+                                ));
+                            }
+                        }
+                    }
+                }
+            });
+
+        let collection = apply_sink_envelope(sink, &sink_render, collection);
 
         let sink_token =
             sink_render.render_continuous_sink(render_state, sink, sink_id, collection, metrics);

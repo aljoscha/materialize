@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use lazy_static::lazy_static;
 use postgres_types::{Kind, Type};
 
-use dataflow_types::logging::{DifferentialLog, LogVariant, MaterializedLog, TimelyLog};
+use dataflow_types::logging::{DifferentialLog, ErrorLog, LogVariant, MaterializedLog, TimelyLog};
 use expr::GlobalId;
 use repr::{RelationDesc, ScalarType};
 
@@ -596,6 +596,22 @@ pub const MZ_DATAFLOW_OPERATOR_REACHABILITY: BuiltinLog = BuiltinLog {
     variant: LogVariant::Timely(TimelyLog::Reachability),
     id: GlobalId::System(3034),
     index_id: GlobalId::System(3035),
+};
+
+pub const MZ_INDEX_ERRORS: BuiltinLog = BuiltinLog {
+    name: "mz_index_errors",
+    schema: MZ_CATALOG_SCHEMA,
+    variant: LogVariant::Errors(ErrorLog::Index),
+    id: GlobalId::System(3036),
+    index_id: GlobalId::System(3037),
+};
+
+pub const MZ_SINK_ERRORS: BuiltinLog = BuiltinLog {
+    name: "mz_sink_errors",
+    schema: MZ_CATALOG_SCHEMA,
+    variant: LogVariant::Errors(ErrorLog::Sink),
+    id: GlobalId::System(3038),
+    index_id: GlobalId::System(3039),
 };
 
 lazy_static! {
@@ -1375,6 +1391,8 @@ lazy_static! {
             Builtin::Log(&MZ_MESSAGE_COUNTS),
             Builtin::Log(&MZ_KAFKA_CONSUMER_PARTITIONS),
             Builtin::Log(&MZ_KAFKA_BROKER_RTT),
+            Builtin::Log(&MZ_INDEX_ERRORS),
+            Builtin::Log(&MZ_SINK_ERRORS),
             Builtin::Table(&MZ_VIEW_KEYS),
             Builtin::Table(&MZ_VIEW_FOREIGN_KEYS),
             Builtin::Table(&MZ_KAFKA_SINKS),
