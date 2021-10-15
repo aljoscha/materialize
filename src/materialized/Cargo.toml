@@ -48,7 +48,10 @@ futures = "0.3.19"
 hex = "0.4.3"
 hyper = { version = "0.14.16", features = ["http1", "server"] }
 hyper-openssl = "0.9.1"
+tonic = "0.6"
+tonic-reflection = "0.3"
 include_dir = "0.7.2"
+ingest-model = { path = "../ingest-model" }
 itertools = "0.10.3"
 krb5-src = { version = "0.3.1", features = ["binaries"] }
 lazy_static = "1.4.0"

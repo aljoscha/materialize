@@ -26,6 +26,9 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
 
+use ingest_model::materialize_ingest;
+use ingest_model::materialize_ingest::ingest_control_server::IngestControlServer;
+
 use build_info::BuildInfo;
 use coord::LoggingConfig;
 use ore::metrics::MetricsRegistry;
@@ -35,6 +38,7 @@ use pid_file::PidFile;
 use crate::mux::Mux;
 use crate::server_metrics::Metrics;
 
+pub mod grpc;
 pub mod http;
 pub mod mux;
 pub mod server_metrics;
@@ -107,6 +111,8 @@ pub struct Config {
     // === Connection options. ===
     /// The IP address and port to listen on.
     pub listen_addr: SocketAddr,
+    /// The IP address and port to listen on for gRPC connections.
+    pub grpc_listen_addr: SocketAddr,
     /// The IP address and port to serve the "third party" metrics registry from.
     pub third_party_metrics_listen_addr: Option<SocketAddr>,
     /// TLS encryption configuration.
@@ -298,6 +304,26 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
         }
     });
 
+    let sources = grpc::CoordIngestControl::new(grpc::Config {
+        coord_client: coord_client.clone(),
+    });
+    let ingest_reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(materialize_ingest::FILE_DESCRIPTOR_SET)
+        .build()
+        .expect("failed to create gRPC reflection servicer");
+    tokio::spawn(async move {
+        let result = tonic::transport::Server::builder()
+            .add_service(IngestControlServer::new(sources))
+            .add_service(ingest_reflection)
+            .serve(config.grpc_listen_addr)
+            .await;
+
+        match result {
+            Err(e) => log::error!("Error in grpc server: {}", e),
+            _ => (),
+        }
+    });
+
     // Start telemetry reporting loop.
     if let Some(telemetry) = config.telemetry {
         let config = telemetry::Config {
@@ -312,6 +338,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
 
     Ok(Server {
         local_addr,
+        local_grpc_addr: config.grpc_listen_addr,
         _pid_file: pid_file,
         _drain_trigger: drain_trigger,
         _coord_handle: coord_handle,
@@ -322,6 +349,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
 /// A running `materialized` server.
 pub struct Server {
     local_addr: SocketAddr,
+    local_grpc_addr: SocketAddr,
     _pid_file: PidFile,
     // Drop order matters for these fields.
     _drain_trigger: oneshot::Sender<()>,
@@ -332,5 +360,8 @@ pub struct Server {
 impl Server {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+    pub fn local_grpc_addr(&self) -> SocketAddr {
+        self.local_grpc_addr
     }
 }
