@@ -3322,6 +3322,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mz-ingest-model"
+version = "0.0.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
 name = "mz-interchange"
 version = "0.0.0"
 dependencies = [

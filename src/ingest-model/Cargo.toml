@@ -1,0 +1,14 @@
+[package]
+name = "mz-ingest-model"
+description = "Abstraction for communication with a Materialized Ingest Service"
+version = "0.0.0"
+edition = "2018"
+publish = false
+
+[dependencies]
+tonic = "0.6"
+prost = "0.9"
+
+[build-dependencies]
+tonic-build = "0.6"
+

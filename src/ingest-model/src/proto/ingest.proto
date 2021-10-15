@@ -1,0 +1,18 @@
+syntax = "proto3";
+package materialize_ingest;
+
+service IngestControl {
+    rpc ListSources (ListRequest) returns (ListResponse);
+}
+
+message ListRequest {
+    string shard_id = 1;
+}
+
+message ListResponse {
+    repeated SourceDescription sources = 1;
+}
+
+message SourceDescription {
+    bytes json_encoded_source = 1;
+}
