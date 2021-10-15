@@ -14,7 +14,7 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
-use dataflow_types::PeekResponse;
+use dataflow_types::{PeekResponse, SourceDesc};
 use expr::GlobalId;
 use ore::collections::CollectionExt;
 use ore::thread::JoinOnDropHandle;
@@ -354,6 +354,14 @@ impl SessionClient {
     /// Dumps the catalog to a JSON string.
     pub async fn dump_catalog(&mut self) -> Result<String, CoordError> {
         self.send(|tx, session| Command::DumpCatalog { session, tx })
+            .await
+    }
+
+    /// Returns a list of all sources that require ingestion/persistence.
+    pub async fn list_persistent_sources(
+        &mut self,
+    ) -> Result<Vec<(GlobalId, SourceDesc)>, CoordError> {
+        self.send(|tx, session| Command::ListPersistentSources { session, tx })
             .await
     }
 

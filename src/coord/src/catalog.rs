@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use chrono::{DateTime, TimeZone, Utc};
 use dataflow_types::{
-    EnvelopePersistDesc, ExternalSourceConnector, MzOffset, SinkEnvelope, SourcePersistDesc,
+    EnvelopePersistDesc, ExternalSourceConnector, MzOffset, SinkEnvelope, SourceDesc,
+    SourcePersistDesc,
 };
 use expr::{Id, PartitionId};
 use itertools::Itertools;
@@ -2437,6 +2438,39 @@ impl Catalog {
 
     pub fn entries(&self) -> impl Iterator<Item = &CatalogEntry> {
         self.state.by_id.values()
+    }
+
+    pub fn persistent_sources(&self) -> Vec<(GlobalId, SourceDesc)> {
+        let persistent_sources = self.entries().cloned().flat_map(|entry| match entry {
+            CatalogEntry {
+                item:
+                    CatalogItem::Source(
+                        source
+                        @
+                        Source {
+                            connector:
+                                SourceConnector::External {
+                                    persist: Some(_), ..
+                                },
+                            ..
+                        },
+                    ),
+                name,
+                id,
+                ..
+            } => {
+                let source_desc = SourceDesc {
+                    name: name.to_string(),
+                    connector: source.connector.clone(),
+                    operators: None,
+                    bare_desc: source.bare_desc.clone(),
+                };
+                Some((id, source_desc))
+            }
+            _ => None,
+        });
+
+        persistent_sources.collect()
     }
 
     /// Returns all tables, views, and sources in the same schemas as a set of

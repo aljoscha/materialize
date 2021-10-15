@@ -16,7 +16,7 @@ use derivative::Derivative;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
-use dataflow_types::PeekResponse;
+use dataflow_types::{PeekResponse, SourceDesc};
 use expr::GlobalId;
 use ore::str::StrExt;
 use repr::Row;
@@ -83,6 +83,11 @@ pub enum Command {
     DumpCatalog {
         session: Session,
         tx: oneshot::Sender<Response<String>>,
+    },
+
+    ListPersistentSources {
+        session: Session,
+        tx: oneshot::Sender<Response<Vec<(GlobalId, SourceDesc)>>>,
     },
 
     CopyRows {

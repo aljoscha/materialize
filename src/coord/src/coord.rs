@@ -1229,6 +1229,15 @@ where
                 });
             }
 
+            Command::ListPersistentSources { session, tx } => {
+                let persistent_sources = self.catalog.persistent_sources();
+
+                let _ = tx.send(Response {
+                    result: Ok(persistent_sources),
+                    session,
+                });
+            }
+
             Command::CopyRows {
                 id,
                 columns,
