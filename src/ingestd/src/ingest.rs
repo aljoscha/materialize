@@ -7,33 +7,36 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::thread;
 use std::time::{Duration, Instant};
 
-use tokio::runtime::Handle as TokioHandle;
-
-use ore::thread::{JoinHandleExt as _, JoinOnDropHandle};
+use tokio::sync::oneshot;
 
 /// Serves the ingester based on the provided configuration.
 pub async fn serve(_config: Config) -> Result<Handle, anyhow::Error> {
-    let handle = TokioHandle::current();
-    let thread = thread::Builder::new()
-        .name("ingester".to_string())
-        .spawn(move || {
-            let _ingest = Ingester {};
-            handle.block_on(async {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                    println!("Ingesting...");
+    let mut update_interval = tokio::time::interval(Duration::from_millis(1000));
+    let (drain_trigger, mut drain_tripwire) = oneshot::channel();
+
+    let _ingester = Ingester {};
+
+    tokio::task::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = update_interval.tick() => {
+                    println!("Ingesting...")
+                },
+                _ = &mut drain_tripwire => {
+                    println!("Ingester got shutdown signal...");
+                    break;
                 }
-            })
-        })
-        .unwrap();
+            }
+        }
+    });
 
     let start_instant = Instant::now();
     let handle = Handle {
         start_instant,
-        _thread: thread.join_on_drop(),
+        // _thread: thread.join_on_drop(),
+        _drain_trigger: drain_trigger,
     };
 
     Ok(handle)
@@ -52,7 +55,7 @@ pub struct Ingester {}
 /// outstanding [`Client`]s for the ingester have dropped.
 pub struct Handle {
     pub(crate) start_instant: Instant,
-    pub(crate) _thread: JoinOnDropHandle<()>,
+    pub(crate) _drain_trigger: oneshot::Sender<()>,
 }
 
 impl Handle {
