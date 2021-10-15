@@ -15,6 +15,7 @@ miri-target
 **/*.rs.bk
 .netlify
 mzdata
+mz_ingest_data
 __pycache__
 .mypy_cache
 venv
