@@ -15,6 +15,7 @@ miri-target
 .mtrlz.log
 **/*.rs.bk
 mzdata
+mz_ingest_data
 __pycache__
 .mypy_cache
 venv
