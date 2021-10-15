@@ -94,9 +94,11 @@ pub struct Config {
 
     // === Connection options. ===
     /// The coordinator gRPC endpoint.
-    pub coord_addr: SocketAddr,
+    pub coord_grpc_addr: String,
     /// The IP address and port to listen on.
     pub listen_addr: SocketAddr,
+    /// The frequency at which we query new sources from the control plane.
+    pub update_interval: Duration,
 
     // === Storage options. ===
     /// The directory in which `ingestd` should store its own metadata.
@@ -124,7 +126,11 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     let listener = TcpListener::bind(&config.listen_addr).await?;
     let local_addr = listener.local_addr()?;
 
-    let ingest_handle = ingest::serve(ingest::Config {}).await?;
+    let ingest_config = ingest::Config {
+        coord_grpc_addr: config.coord_grpc_addr,
+        update_interval: config.update_interval,
+    };
+    let ingest_handle = ingest::serve(ingest_config).await?;
 
     // Register metrics.
     let mut metrics_registry = config.metrics_registry;

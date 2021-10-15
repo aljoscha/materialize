@@ -27,6 +27,7 @@ futures = "0.3.21"
 hex = "0.4.3"
 hyper = { version = "0.14.17", features = ["http1", "server"] }
 hyper-openssl = "0.9.2"
+tonic = "0.6"
 include_dir = "0.7.2"
 itertools = "0.10.3"
 krb5-src = { version = "0.3.2", features = ["binaries"] }
@@ -36,6 +37,7 @@ mz-build-info = { path = "../build-info" }
 mz-coord = { path = "../coord" }
 mz-dataflow = { path = "../dataflow" }
 mz-dataflow-types = { path = "../dataflow-types" }
+mz-expr = { path = "../expr" }
 mz-http-proxy = { path = "../http-proxy", features = ["reqwest"] }
 mz-ingest-model = { path = "../ingest-model" }
 mz-ore = { path = "../ore", features = ["task"] }

@@ -221,7 +221,10 @@ struct Args {
         value_name = "HOST:PORT",
         default_value = "[::1]:50051"
     )]
-    coord_addr: SocketAddr,
+    coord_grpc_addr: String,
+    /// How often to request new sources from the ingest control endpoint.
+    #[structopt(short, long, parse(try_from_str = mz_repr::util::parse_duration), default_value = "500ms")]
+    update_interval: Duration,
 
     // === Storage options. ===
     /// Where to store data.
@@ -558,7 +561,8 @@ swap: {swap_total}KB total, {swap_used}KB used{swap_limit}",
         logical_compaction_window: args.logical_compaction_window,
         timestamp_frequency: args.timestamp_frequency,
         listen_addr: args.listen_addr,
-        coord_addr: args.coord_addr,
+        coord_grpc_addr: args.coord_grpc_addr,
+        update_interval: args.update_interval,
         data_directory,
         experimental_mode: args.experimental,
         safe_mode: args.safe,
