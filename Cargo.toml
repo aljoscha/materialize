@@ -18,6 +18,7 @@ members = [
     "src/expr-test-util",
     "src/expr",
     "src/http-proxy",
+    "src/ingest-model",
     "src/interchange",
     "src/kafka-util",
     "src/lowertest-derive",
