@@ -38,6 +38,7 @@ use lazy_static::lazy_static;
 use sysinfo::{ProcessorExt, SystemExt};
 
 use mz_coord::{PersistConfig, PersistFileStorage, PersistStorage};
+use mz_dataflow_types::sources::AwsExternalId;
 use mz_ore::cgroup::{detect_memory_limit, MemoryLimit};
 use mz_ore::metric;
 use mz_ore::metrics::raw::IntCounterVec;
@@ -236,6 +237,13 @@ struct Args {
         default_value = "mz_ingest_data"
     )]
     data_directory: PathBuf,
+
+    // === AWS options. ===
+    /// An external ID to be supplied to all AWS AssumeRole operations.
+    ///
+    /// Details: <https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-user_externalid.html>
+    #[clap(long, value_name = "ID")]
+    aws_external_id: Option<String>,
 }
 
 /// This type is a hack to allow a dynamic default for the `--workers` argument, which depends on
@@ -564,6 +572,10 @@ swap: {swap_total}KB total, {swap_used}KB used{swap_limit}",
         coord_grpc_addr: args.coord_grpc_addr,
         update_interval: args.update_interval,
         data_directory,
+        aws_external_id: args
+            .aws_external_id
+            .map(AwsExternalId::ISwearThisCameFromACliArgOrEnvVariable)
+            .unwrap_or(AwsExternalId::NotProvided),
         experimental_mode: args.experimental,
         safe_mode: args.safe,
         introspection_frequency: args

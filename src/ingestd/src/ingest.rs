@@ -21,28 +21,41 @@ use mz_ingest_model::materialize_ingest::ingest_control_client::IngestControlCli
 use mz_ingest_model::materialize_ingest::ListRequest;
 
 /// Serves the ingester based on the provided configuration.
-pub async fn serve(config: Config) -> Result<Handle, anyhow::Error> {
+pub async fn serve<DC>(config: Config, mut dataflow_client: DC) -> Result<Handle, anyhow::Error>
+where
+    DC: mz_dataflow_types::client::Client + Send + 'static,
+{
     let mut ingester = Ingester::new(config);
 
     let mut update_interval = tokio::time::interval(ingester.config.update_interval);
 
     let (drain_trigger, mut drain_tripwire) = oneshot::channel();
-    tokio::task::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = update_interval.tick() => {
-                    let result = ingester.tick().await;
-                    if let Err(e) = result {
-                        warn!("{}", e);
-                    }
-                },
-                _ = &mut drain_tripwire => {
-                    println!("Ingester got shutdown signal...");
-                    break;
+
+    // TODO: It's not good that we "block" this "thread" here. The calling code assumes that we
+    // fire of an async task and return a handle. Instead we currently just block here. Reason is
+    // that dataflow_client.recv() returns a Future that is not Send, so we can't spawn this as a
+    // new task.
+    // tokio::task::spawn(async move {
+    loop {
+        tokio::select! {
+            // Ingester updates
+            _ = update_interval.tick() => {
+                let result = ingester.tick().await;
+                if let Err(e) = result {
+                    warn!("{}", e);
                 }
+            },
+            // Messages from the dataflow layer
+            Some(response) = dataflow_client.recv() => {
+                ingester.handle_dataflow_message(response);
+            },
+            _ = &mut drain_tripwire => {
+                println!("Ingester got shutdown signal...");
+                break;
             }
         }
-    });
+    }
+    // });
 
     let start_instant = Instant::now();
     let handle = Handle {
@@ -76,6 +89,7 @@ impl Ingester {
             active_sources: HashMap::new(),
         }
     }
+
     async fn tick(&mut self) -> Result<(), String> {
         trace!("Updating list of sources from ingest control...");
         let mut client =
@@ -107,6 +121,14 @@ impl Ingester {
         }
 
         Ok(())
+    }
+
+    fn handle_dataflow_message(&self, dataflow_response: mz_dataflow_types::client::Response) {
+        match dataflow_response {
+            msg => {
+                todo!("Got message from dataflow: {:?}", msg);
+            }
+        }
     }
 }
 

@@ -20,7 +20,9 @@ use tokio::net::TcpListener;
 use mz_build_info::BuildInfo;
 use mz_coord::LoggingConfig;
 use mz_coord::PersistConfig;
+use mz_dataflow_types::sources::AwsExternalId;
 use mz_ore::metrics::MetricsRegistry;
+use mz_ore::now::SYSTEM_TIME;
 use mz_pid_file::PidFile;
 
 use crate::server_metrics::Metrics;
@@ -104,6 +106,12 @@ pub struct Config {
     /// The directory in which `ingestd` should store its own metadata.
     pub data_directory: PathBuf,
 
+    // === AWS options. ===
+    /// An [external ID] to be supplied to all AWS AssumeRole operations.
+    ///
+    /// [external id]: https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-user_externalid.html
+    pub aws_external_id: AwsExternalId,
+
     // === Mode switches. ===
     /// Whether to permit usage of experimental features.
     pub experimental_mode: bool,
@@ -126,11 +134,25 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     let listener = TcpListener::bind(&config.listen_addr).await?;
     let local_addr = listener.local_addr()?;
 
+    // Initialize dataflow server.
+    let (dataflow_server, dataflow_client) = mz_dataflow::serve(mz_dataflow::Config {
+        workers,
+        timely_config: timely::Config {
+            communication: timely::CommunicationConfig::Process(workers),
+            worker: timely::WorkerConfig::default(),
+        },
+        experimental_mode: false,
+        now: SYSTEM_TIME.clone(),
+        metrics_registry: config.metrics_registry.clone(),
+        persister: None,
+        aws_external_id: config.aws_external_id,
+    })?;
+
     let ingest_config = ingest::Config {
         coord_grpc_addr: config.coord_grpc_addr,
         update_interval: config.update_interval,
     };
-    let ingest_handle = ingest::serve(ingest_config).await?;
+    let ingest_handle = ingest::serve(ingest_config, dataflow_client).await?;
 
     // Register metrics.
     let mut metrics_registry = config.metrics_registry;
@@ -143,6 +165,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     Ok(Server {
         local_addr,
         _pid_file: pid_file,
+        _dataflow_server: dataflow_server,
         _ingest_handle: ingest_handle,
     })
 }
@@ -151,6 +174,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
 pub struct Server {
     local_addr: SocketAddr,
     _pid_file: PidFile,
+    _dataflow_server: mz_dataflow::Server,
     _ingest_handle: ingest::Handle,
 }
 
