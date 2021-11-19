@@ -68,6 +68,7 @@ tokio-openssl = "0.6.3"
 tokio-stream = { version = "0.1.8", features = ["net"] }
 tracing = "0.1.29"
 tracing-subscriber = "0.3.5"
+transform = { path = "../transform" }
 url = "2.2.2"
 uuid = "0.8.2"
 

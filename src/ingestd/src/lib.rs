@@ -14,10 +14,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use compile_time_run::run_command_str;
-use coord::PersistConfig;
-use ore::now::SYSTEM_TIME;
 use tokio::net::TcpListener;
+use tokio::runtime::Handle as TokioHandle;
+
+use compile_time_run::run_command_str;
+use coord::{PersistConfig, Timestamper};
+use ore::now::SYSTEM_TIME;
+use ore::thread::{JoinHandleExt, JoinOnDropHandle};
 
 use build_info::BuildInfo;
 use coord::LoggingConfig;
@@ -139,11 +142,30 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
         metrics_registry: config.metrics_registry.clone(),
     })?;
 
+    let (ts_tx, ts_rx) = std::sync::mpsc::channel();
+    let (ts_command_tx, ts_command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut timestamper = Timestamper::new(
+        Duration::from_millis(10),
+        ts_command_tx,
+        ts_rx,
+        &config.metrics_registry,
+    );
+    let executor = TokioHandle::current();
+    let timestamper_thread_handle = std::thread::Builder::new()
+        .name("timestamper".to_string())
+        .spawn(move || {
+            let _executor_guard = executor.enter();
+            timestamper.run();
+        })
+        .unwrap()
+        .join_on_drop();
+
     let ingest_config = ingest::Config {
         coord_grpc_addr: config.coord_grpc_addr,
         update_interval: config.update_interval,
+        ts_tx,
     };
-    let ingest_handle = ingest::serve(ingest_config, dataflow_client).await?;
+    let ingest_handle = ingest::serve(ingest_config, dataflow_client, ts_command_rx).await?;
 
     // Register metrics.
     let mut metrics_registry = config.metrics_registry;
@@ -158,6 +180,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
         _pid_file: pid_file,
         _dataflow_server: dataflow_server,
         _ingest_handle: ingest_handle,
+        _timestamper_handle: timestamper_thread_handle,
     })
 }
 
@@ -167,6 +190,9 @@ pub struct Server {
     _pid_file: PidFile,
     _dataflow_server: dataflow::Server,
     _ingest_handle: ingest::Handle,
+    /// Handle to the timestamper thread. Drop order matters here! This must be
+    /// located after `ts_tx` (which is in the _ingest_handle).
+    _timestamper_handle: JoinOnDropHandle<()>,
 }
 
 impl Server {
