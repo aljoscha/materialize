@@ -34,17 +34,17 @@ macro_rules! coord_bail {
 
 mod client;
 mod command;
-mod coord;
 mod error;
 mod id_alloc;
 mod persistcfg;
 mod sink_connector;
 mod tail;
-mod timestamp;
 mod util;
 
 pub mod catalog;
+pub mod coord;
 pub mod session;
+pub mod timestamp;
 
 pub use crate::client::{Client, ConnClient, Handle, SessionClient};
 pub use crate::command::{Canceled, ExecuteResponse, StartupMessage, StartupResponse};
