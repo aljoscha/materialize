@@ -7,15 +7,18 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use timely::progress::Antichain;
 use tokio::sync::oneshot;
 use tracing::warn;
 use tracing::{info, trace};
 
+use mz_dataflow_types::client::{CreateSourceCommand, StorageCommand, StorageResponse};
 use mz_dataflow_types::sources::persistence::SourcePersistDesc;
 use mz_dataflow_types::sources::SourceDesc;
+use mz_dataflow_types::SourceInstanceDesc;
 use mz_expr::GlobalId;
 use mz_ingest_model::materialize_ingest::ingest_control_client::IngestControlClient;
 use mz_ingest_model::materialize_ingest::ListRequest;
@@ -40,7 +43,7 @@ where
         tokio::select! {
             // Ingester updates
             _ = update_interval.tick() => {
-                let result = ingester.tick().await;
+                let result = ingester.tick(&mut dataflow_client).await;
                 if let Err(e) = result {
                     warn!("{}", e);
                 }
@@ -90,7 +93,10 @@ impl Ingester {
         }
     }
 
-    async fn tick(&mut self) -> Result<(), String> {
+    async fn tick<DC>(&mut self, dataflow_client: &mut DC) -> Result<(), String>
+    where
+        DC: mz_dataflow_types::client::Client,
+    {
         trace!("Updating list of sources from ingest control...");
         let mut client =
             IngestControlClient::connect(format!("http://{}", self.config.coord_grpc_addr))
@@ -115,18 +121,81 @@ impl Ingester {
 
             let current_value = self.active_sources.insert(id, source_desc.clone());
 
-            if current_value.is_none() {
-                info!("New source: {:?}, persist: {:?}", source_desc, persist_desc);
+            if current_value.is_some() {
+                continue;
             }
+
+            info!("Rendering new source: {:#?}", source_desc);
+            self.render_source(id, source_desc, persist_desc, dataflow_client)
+                .await?;
         }
+
+        Ok(())
+    }
+
+    async fn render_source<DC>(
+        &mut self,
+        id: GlobalId,
+        source_desc: SourceDesc,
+        persist_desc: SourcePersistDesc,
+        dataflow_client: &mut DC,
+    ) -> Result<(), String>
+    where
+        DC: mz_dataflow_types::client::Client,
+    {
+        let debug_name = format!("source-{}", id);
+
+        // TODO: This is not the correct since!
+        let since = Antichain::from_elem(0);
+
+        // TODO: In a post-ingestd world it doesn't feel correct that we have to do both of
+        // these...
+
+        dataflow_client
+            .send(mz_dataflow_types::client::Command::Storage(
+                StorageCommand::CreateSources(vec![CreateSourceCommand {
+                    id,
+                    desc: source_desc.clone(),
+                    since,
+                    ts_bindings: Vec::new(),
+                    persist: Some(persist_desc.clone()),
+                }]),
+            ))
+            .await
+            .map_err(|e| format!("{}", e))?;
+
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            id,
+            SourceInstanceDesc {
+                description: source_desc,
+                persist: Some(persist_desc),
+                operators: None,
+            },
+        );
+
+        dataflow_client
+            .send(mz_dataflow_types::client::Command::Storage(
+                StorageCommand::RenderSources(vec![(
+                    debug_name,
+                    id,
+                    Some(Antichain::from_elem(0)),
+                    sources,
+                )]),
+            ))
+            .await
+            .map_err(|e| format!("{}", e))?;
 
         Ok(())
     }
 
     fn handle_dataflow_message(&self, dataflow_response: mz_dataflow_types::client::Response) {
         match dataflow_response {
+            mz_dataflow_types::client::Response::Storage(StorageResponse::TimestampBindings(_)) => {
+                // not interested for now...
+            }
             msg => {
-                todo!("Got message from dataflow: {:?}", msg);
+                info!("Got message from dataflow: {:?}", msg);
             }
         }
     }

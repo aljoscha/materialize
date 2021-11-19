@@ -2359,6 +2359,7 @@ dependencies = [
  "mz-prof",
  "mz-repr",
  "mz-sql",
+ "mz-transform",
  "nix",
  "num_cpus",
  "openssl",

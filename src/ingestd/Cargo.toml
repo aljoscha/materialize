@@ -47,6 +47,7 @@ mz-process-collector = { path = "../process-collector" }
 mz-prof = { path = "../prof" }
 mz-repr = { path = "../repr" }
 mz-sql = { path = "../sql" }
+mz-transform = { path = "../transform" }
 nix = "0.23.1"
 num_cpus = "1.13.1"
 openssl = { version = "0.10.38", features = ["vendored"] }
