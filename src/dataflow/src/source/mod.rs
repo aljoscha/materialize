@@ -1548,6 +1548,11 @@ fn handle_message<S: SourceReader>(
     if let Some(len) = out.len() {
         *bytes_read += len;
     }
+
+    debug!(
+        "Handling source message at timestamp {}, upstream_time_millis: {:?}, offset: {}",
+        ts, message.upstream_time_millis, offset
+    );
     let ts_cap = cap.delayed(&ts);
 
     output.session(&ts_cap).give(Ok(SourceOutput::new(
