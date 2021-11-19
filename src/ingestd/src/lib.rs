@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use compile_time_run::run_command_str;
 use coord::PersistConfig;
+use ore::now::SYSTEM_TIME;
 use tokio::net::TcpListener;
 
 use build_info::BuildInfo;
@@ -126,11 +127,23 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     let listener = TcpListener::bind(&config.listen_addr).await?;
     let local_addr = listener.local_addr()?;
 
+    // Initialize dataflow server.
+    let (dataflow_server, dataflow_client) = dataflow::serve(dataflow::Config {
+        workers,
+        timely_config: timely::Config {
+            communication: timely::CommunicationConfig::Process(workers),
+            worker: timely::WorkerConfig::default(),
+        },
+        experimental_mode: false,
+        now: SYSTEM_TIME.clone(),
+        metrics_registry: config.metrics_registry.clone(),
+    })?;
+
     let ingest_config = ingest::Config {
         coord_grpc_addr: config.coord_grpc_addr,
         update_interval: config.update_interval,
     };
-    let ingest_handle = ingest::serve(ingest_config).await?;
+    let ingest_handle = ingest::serve(ingest_config, dataflow_client).await?;
 
     // Register metrics.
     let mut metrics_registry = config.metrics_registry;
@@ -143,6 +156,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     Ok(Server {
         local_addr,
         _pid_file: pid_file,
+        _dataflow_server: dataflow_server,
         _ingest_handle: ingest_handle,
     })
 }
@@ -151,6 +165,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
 pub struct Server {
     local_addr: SocketAddr,
     _pid_file: PidFile,
+    _dataflow_server: dataflow::Server,
     _ingest_handle: ingest::Handle,
 }
 

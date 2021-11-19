@@ -20,7 +20,10 @@ use ingest_model::materialize_ingest::ingest_control_client::IngestControlClient
 use ingest_model::materialize_ingest::ListRequest;
 
 /// Serves the ingester based on the provided configuration.
-pub async fn serve(config: Config) -> Result<Handle, anyhow::Error> {
+pub async fn serve<DC>(config: Config, mut dataflow_client: DC) -> Result<Handle, anyhow::Error>
+where
+    DC: dataflow_types::client::Client + 'static,
+{
     let mut ingester = Ingester::new(config);
 
     let mut update_interval = tokio::time::interval(ingester.config.update_interval);
@@ -29,11 +32,16 @@ pub async fn serve(config: Config) -> Result<Handle, anyhow::Error> {
     tokio::task::spawn(async move {
         loop {
             tokio::select! {
+                // Ingester updates
                 _ = update_interval.tick() => {
                     let result = ingester.tick().await;
                     if let Err(e) = result {
                         log::warn!("{}", e);
                     }
+                },
+                // Messages from the dataflow layer
+                Some(response) = dataflow_client.recv() => {
+                    ingester.handle_dataflow_message(response);
                 },
                 _ = &mut drain_tripwire => {
                     println!("Ingester got shutdown signal...");
@@ -75,6 +83,7 @@ impl Ingester {
             active_sources: HashMap::new(),
         }
     }
+
     async fn tick(&mut self) -> Result<(), String> {
         log::trace!("Updating list of sources from ingest control...");
         let mut client =
@@ -106,6 +115,14 @@ impl Ingester {
         }
 
         Ok(())
+    }
+
+    fn handle_dataflow_message(&self, dataflow_response: dataflow_types::client::Response) {
+        match dataflow_response {
+            msg => {
+                todo!("Got message from dataflow: {:?}", msg);
+            }
+        }
     }
 }
 
