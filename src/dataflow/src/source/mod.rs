@@ -1873,12 +1873,22 @@ fn handle_message<S: SourceReader>(
     let ts = consistency_info.find_matching_timestamp(&partition, offset, timestamp_bindings);
     match ts {
         None => {
+            log::info!(
+                "No timestamp for source message at upstream time {:?}",
+                message.upstream_time_millis
+            );
             // We have not yet decided on a timestamp for this message,
             // we need to buffer the message
             *buffer = Some(message);
             (SourceStatus::Alive, MessageProcessing::Yielded)
         }
         Some(ts) => {
+            log::debug!(
+                "Handling source message at timestamp {}, upstream_time_millis: {:?}, offset: {}",
+                ts,
+                message.upstream_time_millis,
+                offset
+            );
             // Note: empty and null payload/keys are currently
             // treated as the same thing.
             let key = message.key;
