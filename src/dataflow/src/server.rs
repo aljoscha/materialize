@@ -949,10 +949,8 @@ where
                         .entry(id)
                         .or_insert_with(Vec::new);
                     for source in sources {
-                        if let Some(source) = source.upgrade() {
-                            if let Some(token) = &*source {
-                                token.activate();
-                            }
+                        if let Some(source) = source.as_ref() {
+                            source.activate();
                         }
                     }
                 }

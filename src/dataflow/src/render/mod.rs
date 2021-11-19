@@ -104,7 +104,6 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::rc::Weak;
 
 use differential_dataflow::AsCollection;
 use persist::indexed::runtime::RuntimeClient;
@@ -149,7 +148,7 @@ pub struct RenderState {
     /// Handles to local inputs, keyed by ID.
     pub local_inputs: HashMap<GlobalId, LocalInput>,
     /// Handles to external sources, keyed by ID.
-    pub ts_source_mapping: HashMap<GlobalId, Vec<Weak<Option<SourceToken>>>>,
+    pub ts_source_mapping: HashMap<GlobalId, Vec<Rc<Option<SourceToken>>>>,
     /// Timestamp data updates for each source.
     pub ts_histories: HashMap<GlobalId, TimestampBindingRc>,
     /// Tokens that should be dropped when a dataflow is dropped to clean up

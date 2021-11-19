@@ -630,7 +630,7 @@ where
                     .ts_source_mapping
                     .entry(orig_id)
                     .or_insert_with(Vec::new)
-                    .push(Rc::downgrade(&token));
+                    .push(token);
             }
         }
     }
