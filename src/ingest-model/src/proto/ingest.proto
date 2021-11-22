@@ -16,3 +16,28 @@ message ListResponse {
 message SourceDescription {
     bytes json_encoded_source = 1;
 }
+
+service IngestData {
+    rpc ReadSource (ReadSourceRequest) returns (stream ReadSourceResponse);
+}
+
+message ReadSourceRequest {
+    string stream_name = 1;
+}
+
+// We have to use a more sophisticated CDCv2-style protocal if we want to do
+// this for realz.
+message ReadSourceResponse {
+    oneof update {
+        SourceRecords records = 1;
+        SourceSealed sealed = 2;
+    }
+}
+
+message SourceRecords {
+    repeated bytes bincode_encoded_rows = 1;
+}
+
+message SourceSealed {
+    uint64 timestamp = 1;
+}
