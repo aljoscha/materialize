@@ -24,8 +24,10 @@ use ore::thread::{JoinHandleExt, JoinOnDropHandle};
 
 use build_info::BuildInfo;
 use coord::LoggingConfig;
+use dataflow_types::client::Client;
 use ore::metrics::MetricsRegistry;
 use pid_file::PidFile;
+use uuid::Uuid;
 
 use crate::server_metrics::Metrics;
 
@@ -115,8 +117,12 @@ pub struct Config {
     pub safe_mode: bool,
     /// The place where the server's metrics will be reported from.
     pub metrics_registry: MetricsRegistry,
+
     /// Configuration of the persistence runtime and features.
     pub persist: PersistConfig,
+
+    /// Cluster ID of this ingester, mostly relevant for persistence (or maybe not).
+    pub persist_cluster_id: String,
 }
 
 /// Start a `ingestd` server.
@@ -131,7 +137,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     let local_addr = listener.local_addr()?;
 
     // Initialize dataflow server.
-    let (dataflow_server, dataflow_client) = dataflow::serve(dataflow::Config {
+    let (dataflow_server, mut dataflow_client) = dataflow::serve(dataflow::Config {
         workers,
         timely_config: timely::Config {
             communication: timely::CommunicationConfig::Process(workers),
@@ -159,6 +165,30 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
         })
         .unwrap()
         .join_on_drop();
+
+    let cluster_id = Uuid::from_slice(&config.persist_cluster_id.as_bytes());
+    let cluster_id = match cluster_id {
+        Ok(id) => id,
+        Err(e) => panic!("Invalid cluster ID: {}", e),
+    };
+    let persist = config
+        .persist
+        .init(cluster_id, BUILD_INFO, &config.metrics_registry)
+        .await?;
+    let persister = persist.persister.clone();
+    let persister = match persister {
+        Some(persister) => persister,
+        None => panic!(
+            "Could not create persistence runtime from config {:?}.",
+            config.persist
+        ),
+    };
+
+    dataflow_client
+        .send(dataflow_types::client::Command::EnablePersistence(
+            persister,
+        ))
+        .await;
 
     let ingest_config = ingest::Config {
         coord_grpc_addr: config.coord_grpc_addr,
