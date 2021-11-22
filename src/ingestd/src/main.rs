@@ -110,6 +110,10 @@ struct Args {
     /// https://github.com/rusoto/rusoto/blob/rusoto-v0.47.0/AWS-CREDENTIALS.md.
     #[clap(long, hide = true, default_value_t)]
     persist_storage: String,
+    /// Cluster id of this cluster. Mostly relevant for persistence (maybe). MUST be 16 bytes
+    /// because we create a Uuid from this.
+    #[structopt(long, default_value = "aaaaaaaaaaaaaaaa")]
+    persist_cluster_id: String,
 
     /// Enable the --persist_storage flag. Has to be used with --experimental.
     #[structopt(long, hide = true)]
@@ -555,7 +559,8 @@ swap: {swap_total}KB total, {swap_used}KB used{swap_limit}",
             storage,
             user_table_enabled: false,
             system_table_enabled: false,
-            kafka_sources_enabled: false,
+            // Need to enable some persistence feature to make sure a runtime gets created.
+            kafka_sources_enabled: true,
             lock_info,
             min_step_interval,
             cache_size_limit,
@@ -583,6 +588,7 @@ swap: {swap_total}KB total, {swap_used}KB used{swap_limit}",
             .unwrap_or_else(|| Duration::from_secs(1)),
         metrics_registry,
         persist: persist_config,
+        persist_cluster_id: args.persist_cluster_id,
     }))?;
 
     eprintln!(

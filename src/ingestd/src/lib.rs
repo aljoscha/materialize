@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use compile_time_run::run_command_str;
 use tokio::net::TcpListener;
+use uuid::Uuid;
 
 use mz_build_info::BuildInfo;
 use mz_coord::LoggingConfig;
@@ -119,8 +120,12 @@ pub struct Config {
     pub safe_mode: bool,
     /// The place where the server's metrics will be reported from.
     pub metrics_registry: MetricsRegistry,
+
     /// Configuration of the persistence runtime and features.
     pub persist: PersistConfig,
+
+    /// Cluster ID of this ingester, mostly relevant for persistence (or maybe not).
+    pub persist_cluster_id: String,
 }
 
 /// Start a `ingestd` server.
@@ -134,6 +139,24 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     let listener = TcpListener::bind(&config.listen_addr).await?;
     let local_addr = listener.local_addr()?;
 
+    let cluster_id = Uuid::from_slice(&config.persist_cluster_id.as_bytes());
+    let cluster_id = match cluster_id {
+        Ok(id) => id,
+        Err(e) => panic!("Invalid cluster ID: {}", e),
+    };
+    let persist = config
+        .persist
+        .init(cluster_id, BUILD_INFO, &config.metrics_registry)
+        .await?;
+    let persister = persist.runtime.clone();
+    let persister = match persister {
+        Some(persister) => persister,
+        None => panic!(
+            "Could not create persistence runtime from config {:?}.",
+            config.persist
+        ),
+    };
+
     // Initialize dataflow server.
     let (dataflow_server, dataflow_client) = mz_dataflow::serve(mz_dataflow::Config {
         workers,
@@ -144,7 +167,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
         experimental_mode: false,
         now: SYSTEM_TIME.clone(),
         metrics_registry: config.metrics_registry.clone(),
-        persister: None,
+        persister: Some(persister),
         aws_external_id: config.aws_external_id,
     })?;
 
