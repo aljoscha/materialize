@@ -181,7 +181,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
 
     dataflow_client
         .send(dataflow_types::client::Command::EnablePersistence(
-            persister,
+            persister.clone(),
         ))
         .await;
 
@@ -190,6 +190,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
         coord_grpc_addr: config.coord_grpc_addr,
         update_interval: config.update_interval,
         ts_tx,
+        persister,
     };
     let ingest_handle = ingest::serve(ingest_config, dataflow_client, ts_command_rx).await?;
 

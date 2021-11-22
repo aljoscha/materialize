@@ -22,6 +22,7 @@ use ingest_model::materialize_ingest;
 use ingest_model::materialize_ingest::ingest_control_client::IngestControlClient;
 use ingest_model::materialize_ingest::ingest_data_server::IngestDataServer;
 use ingest_model::materialize_ingest::ListRequest;
+use persist::indexed::runtime::RuntimeClient;
 
 mod grpc;
 
@@ -41,7 +42,10 @@ where
     // Initialize gRPC listener
     let listener = TcpListener::bind(&config.grpc_listen_addr).await?;
     let local_grpc_addr = listener.local_addr()?;
-    let sources = grpc::PersistenceIngestData::new(grpc::Config {});
+    let grpc_config = grpc::Config {
+        persister: config.persister.clone(),
+    };
+    let sources = grpc::PersistenceIngestData::new(grpc_config);
     let ingest_reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(materialize_ingest::FILE_DESCRIPTOR_SET)
         .build()
@@ -120,6 +124,8 @@ pub struct Config {
     pub update_interval: Duration,
     /// Channel to communicate source status updates to the timestamper thread.
     pub ts_tx: std::sync::mpsc::Sender<coord::timestamp::TimestampMessage>,
+    /// Persistence client.
+    pub persister: RuntimeClient,
 }
 
 /// Ingester service.

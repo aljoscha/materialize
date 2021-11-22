@@ -14,6 +14,7 @@ askama = { version = "0.11.0", default-features = false, features = ["config", "
 async-trait = "0.1.52"
 atty = "0.2.14"
 backtrace = "0.3.63"
+bincode = "1.3.3"
 build-info = { path = "../build-info" }
 cfg-if = "1.0.0"
 chrono = { version = "0.4.0", default-features = false, features = ["std"] }
@@ -47,6 +48,8 @@ openssl = { version = "0.10.38", features = ["vendored"] }
 openssl-sys = { version = "0.9.72", features = ["vendored"] }
 ore = { path = "../ore" }
 os_info = "3.0.9"
+persist = { path = "../persist" }
+persist-types = { path = "../persist-types" }
 pid-file = { path = "../pid-file" }
 pgwire = { path = "../pgwire" }
 prof = { path = "../prof" }
