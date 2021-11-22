@@ -14,7 +14,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio::net::TcpListener;
 use tokio::runtime::Handle as TokioHandle;
 
 use compile_time_run::run_command_str;
@@ -101,8 +100,8 @@ pub struct Config {
     // === Connection options. ===
     /// The coordinator gRPC endpoint.
     pub coord_grpc_addr: SocketAddr,
-    /// The IP address and port to listen on.
-    pub listen_addr: SocketAddr,
+    /// The IP address and port to listen on for gRPC connections.
+    pub grpc_listen_addr: SocketAddr,
     /// The frequency at which we query new sources from the control plane.
     pub update_interval: Duration,
 
@@ -131,10 +130,6 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
 
     // Attempt to acquire PID file lock.
     let pid_file = PidFile::open(config.data_directory.join("ingestd.pid"))?;
-
-    // Initialize network listener.
-    let listener = TcpListener::bind(&config.listen_addr).await?;
-    let local_addr = listener.local_addr()?;
 
     // Initialize dataflow server.
     let (dataflow_server, mut dataflow_client) = dataflow::serve(dataflow::Config {
@@ -191,6 +186,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
         .await;
 
     let ingest_config = ingest::Config {
+        grpc_listen_addr: config.grpc_listen_addr,
         coord_grpc_addr: config.coord_grpc_addr,
         update_interval: config.update_interval,
         ts_tx,
@@ -206,27 +202,25 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     );
 
     Ok(Server {
-        local_addr,
         _pid_file: pid_file,
         _dataflow_server: dataflow_server,
-        _ingest_handle: ingest_handle,
+        ingest_handle,
         _timestamper_handle: timestamper_thread_handle,
     })
 }
 
 /// A running `ingestd` server.
 pub struct Server {
-    local_addr: SocketAddr,
     _pid_file: PidFile,
     _dataflow_server: dataflow::Server,
-    _ingest_handle: ingest::Handle,
+    ingest_handle: ingest::Handle,
     /// Handle to the timestamper thread. Drop order matters here! This must be
     /// located after `ts_tx` (which is in the _ingest_handle).
     _timestamper_handle: JoinOnDropHandle<()>,
 }
 
 impl Server {
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+    pub fn local_grpc_addr(&self) -> SocketAddr {
+        self.ingest_handle.local_grpc_addr
     }
 }

@@ -184,11 +184,11 @@ struct Args {
     /// The address on which to listen for connections.
     #[clap(
         long,
-        env = "MZ_INGEST_LISTEN_ADDR",
+        env = "MZ_INGEST_GRPC_LISTEN_ADDR",
         value_name = "HOST:PORT",
-        default_value = "0.0.0.0:6675"
+        default_value = "[::1]:50052"
     )]
-    listen_addr: SocketAddr,
+    grpc_listen_addr: SocketAddr,
     /// The coordinator gRPC endpoint
     #[clap(
         long,
@@ -518,7 +518,7 @@ swap: {swap_total}KB total, {swap_used}KB used{swap_limit}",
         logging,
         logical_compaction_window: args.logical_compaction_window,
         timestamp_frequency: args.timestamp_frequency,
-        listen_addr: args.listen_addr,
+        grpc_listen_addr: args.grpc_listen_addr,
         coord_grpc_addr: args.coord_grpc_addr,
         update_interval: args.update_interval,
         data_directory,
@@ -571,9 +571,9 @@ For more details, see https://materialize.com/docs/cli#experimental-mode
     }
 
     println!(
-        "ingestd {} listening on {}...",
+        "ingestd {} listening on {} (gRPC)...",
         ingestd::BUILD_INFO.human_version(),
-        server.local_addr(),
+        server.local_grpc_addr(),
     );
 
     // Block forever.

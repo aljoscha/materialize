@@ -2406,6 +2406,7 @@ dependencies = [
  "tokio-openssl",
  "tokio-stream",
  "tonic",
+ "tonic-reflection",
  "tracing",
  "tracing-subscriber",
  "transform",

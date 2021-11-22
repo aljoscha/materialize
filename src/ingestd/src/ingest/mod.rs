@@ -11,14 +11,19 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use coord::coord::Message as CoordMessage;
 use coord::timestamp::TimestampMessage;
 use dataflow_types::{DataflowDesc, SourceDesc};
 use expr::GlobalId;
+use ingest_model::materialize_ingest;
 use ingest_model::materialize_ingest::ingest_control_client::IngestControlClient;
+use ingest_model::materialize_ingest::ingest_data_server::IngestDataServer;
 use ingest_model::materialize_ingest::ListRequest;
+
+mod grpc;
 
 /// Serves the ingester based on the provided configuration.
 pub async fn serve<DC>(
@@ -29,9 +34,30 @@ pub async fn serve<DC>(
 where
     DC: dataflow_types::client::Client + 'static,
 {
-    let mut ingester = Ingester::new(config);
+    let mut ingester = Ingester::new(config.clone());
 
     let mut update_interval = tokio::time::interval(ingester.config.update_interval);
+
+    // Initialize gRPC listener
+    let listener = TcpListener::bind(&config.grpc_listen_addr).await?;
+    let local_grpc_addr = listener.local_addr()?;
+    let sources = grpc::PersistenceIngestData::new(grpc::Config {});
+    let ingest_reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(materialize_ingest::FILE_DESCRIPTOR_SET)
+        .build()
+        .expect("failed to create gRPC reflection servicer");
+    tokio::spawn(async move {
+        let result = tonic::transport::Server::builder()
+            .add_service(IngestDataServer::new(sources))
+            .add_service(ingest_reflection)
+            .serve(config.grpc_listen_addr)
+            .await;
+
+        match result {
+            Err(e) => log::error!("Error in grpc server: {}", e),
+            _ => (),
+        }
+    });
 
     let (drain_trigger, mut drain_tripwire) = oneshot::channel();
     tokio::task::spawn(async move {
@@ -75,6 +101,7 @@ where
     let start_instant = Instant::now();
     let handle = Handle {
         start_instant,
+        local_grpc_addr,
         // _thread: thread.join_on_drop(),
         _drain_trigger: drain_trigger,
     };
@@ -85,6 +112,8 @@ where
 /// Configures a ingester.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The address to listen on for gRPC connections.
+    pub grpc_listen_addr: SocketAddr,
     /// The coordinator gRPC endpoint.
     pub coord_grpc_addr: SocketAddr,
     /// The frequency at which we query new sources from the control plane.
@@ -204,6 +233,7 @@ impl Ingester {
 /// outstanding [`Client`]s for the ingester have dropped.
 pub struct Handle {
     pub(crate) start_instant: Instant,
+    pub(crate) local_grpc_addr: SocketAddr,
     pub(crate) _drain_trigger: oneshot::Sender<()>,
 }
 
