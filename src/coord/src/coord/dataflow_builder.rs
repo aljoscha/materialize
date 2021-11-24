@@ -14,6 +14,8 @@
 //! and indicate which identifiers have arrangements available. This module
 //! isolates that logic from the rest of the somewhat complicated coordinator.
 
+use dataflow_types::{DataEncoding, GrpcIngestSourceConnector, KeyEnvelope};
+
 use super::*;
 use ore::stack::maybe_grow;
 
@@ -115,16 +117,73 @@ impl<'a> DataflowBuilder<'a> {
                         );
                     }
                     CatalogItem::Source(source) => {
-                        let source_connector = dataflow_types::SourceDesc {
-                            name: entry.name().to_string(),
-                            connector: source.connector.clone(),
-                            operators: None,
-                            bare_desc: source.bare_desc.clone(),
-                        };
-
                         if source.optimized_expr.0.is_trivial_source() {
-                            dataflow.import_source(*id, source_connector, *id);
+                            log::trace!("Importing source into dataflow: {:#?}", source);
+                            // If the source is a persistent Kafka source, pull a switcharoo and
+                            // instead render an INGEST source that reads from the persisted collection
+                            // that the ingester writes for this source.
+                            match source.connector.clone() {
+                                SourceConnector::External {
+                                    connector: ExternalSourceConnector::Kafka(_),
+                                    encoding: _,
+                                    envelope: _,
+                                    consistency,
+                                    ts_frequency,
+                                    timeline,
+                                    persist: Some(persist),
+                                } => {
+                                    let ingest_connector = ExternalSourceConnector::GrpcIngest(
+                                        GrpcIngestSourceConnector {
+                                            grpc_address: "http://[::1]:50052".to_string(),
+                                            collection_name: persist.primary_stream.name.clone(),
+                                        },
+                                    );
+                                    let source_connector = SourceConnector::External {
+                                        connector: ingest_connector,
+                                        encoding: dataflow_types::SourceDataEncoding::Single(
+                                            DataEncoding::Row(source.desc.clone()),
+                                        ),
+                                        envelope: dataflow_types::SourceEnvelope::None(
+                                            KeyEnvelope::None,
+                                        ),
+                                        consistency,
+                                        ts_frequency,
+                                        timeline,
+                                        persist: None,
+                                    };
+
+                                    dataflow.import_source(
+                                        *id,
+                                        dataflow_types::SourceDesc {
+                                            name: entry.name().to_string(),
+                                            connector: source_connector,
+                                            operators: None,
+                                            bare_desc: source.bare_desc.clone(),
+                                        },
+                                        *id,
+                                    );
+                                }
+                                _ => {
+                                    dataflow.import_source(
+                                        *id,
+                                        dataflow_types::SourceDesc {
+                                            name: entry.name().to_string(),
+                                            connector: source.connector.clone(),
+                                            operators: None,
+                                            bare_desc: source.bare_desc.clone(),
+                                        },
+                                        *id,
+                                    );
+                                }
+                            }
                         } else {
+                            let source_connector = dataflow_types::SourceDesc {
+                                name: entry.name().to_string(),
+                                connector: source.connector.clone(),
+                                operators: None,
+                                bare_desc: source.bare_desc.clone(),
+                            };
+
                             // From the dataflow layer's perspective, the source transformation is just a view (across which it should be able to do whole-dataflow optimizations).
                             // Install it as such (giving the source a global transient ID by which the view/transformation can refer to it)
                             let bare_source_id = GlobalId::Transient(transient_id);
