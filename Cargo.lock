@@ -1225,6 +1225,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "async-compression",
+ "async-stream 0.3.2",
  "async-trait",
  "aws-sdk-kinesis",
  "aws-sdk-s3",
@@ -1243,7 +1244,9 @@ dependencies = [
  "expr",
  "flate2",
  "futures",
+ "futures-util",
  "globset",
+ "ingest-model",
  "inotify",
  "interchange",
  "itertools",

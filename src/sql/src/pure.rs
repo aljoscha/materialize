@@ -201,6 +201,7 @@ pub fn purify(
                     let _ = postgres_util::publication_info(&conn, &publication).await?;
                 }
                 CreateSourceConnector::PubNub { .. } => (),
+                CreateSourceConnector::GrpcIngest { .. } => (),
             }
 
             purify_source_format(
@@ -380,7 +381,7 @@ pub fn purify(
 
 async fn purify_source_format(
     format: &mut CreateSourceFormat<Raw>,
-    connector: &mut CreateSourceConnector,
+    connector: &mut CreateSourceConnector<Raw>,
     envelope: &Envelope,
     file: Option<File>,
     connector_options: &BTreeMap<String, String>,
@@ -457,7 +458,7 @@ async fn purify_source_format(
 
 async fn purify_source_format_single(
     format: &mut Format<Raw>,
-    connector: &mut CreateSourceConnector,
+    connector: &mut CreateSourceConnector<Raw>,
     envelope: &Envelope,
     file: Option<File>,
     connector_options: &BTreeMap<String, String>,
@@ -524,7 +525,7 @@ async fn purify_source_format_single(
 }
 
 async fn purify_csr_connector_proto(
-    connector: &mut CreateSourceConnector,
+    connector: &mut CreateSourceConnector<Raw>,
     csr_connector: &mut CsrConnectorProto<Raw>,
     envelope: &Envelope,
     with_options: &Vec<SqlOption<Raw>>,
@@ -575,7 +576,7 @@ async fn purify_csr_connector_proto(
 }
 
 async fn purify_csr_connector_avro(
-    connector: &mut CreateSourceConnector,
+    connector: &mut CreateSourceConnector<Raw>,
     csr_connector: &mut CsrConnectorAvro<Raw>,
     envelope: &Envelope,
     connector_options: &BTreeMap<String, String>,
@@ -622,7 +623,7 @@ async fn purify_csr_connector_avro(
 
 pub async fn purify_csv(
     file: Option<File>,
-    connector: &CreateSourceConnector,
+    connector: &CreateSourceConnector<Raw>,
     delimiter: char,
     columns: &mut CsvColumns,
 ) -> anyhow::Result<()> {

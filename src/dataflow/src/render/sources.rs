@@ -41,6 +41,7 @@ use crate::render::context::Context;
 use crate::render::{RelevantTokens, RenderState};
 use crate::server::LocalInput;
 use crate::source::metrics::SourceBaseMetrics;
+use crate::source::grpc_ingest;
 use crate::source::timestamp::{AssignedTimestamp, SourceTimestamp};
 use crate::source::{
     self, DecodeResult, FileSourceReader, KafkaSourceReader, KinesisSourceReader,
@@ -263,6 +264,17 @@ where
                     );
 
                     (ok_stream.as_collection(), capability)
+                } else if let ExternalSourceConnector::GrpcIngest(connector) = connector {
+                    let (ok_stream, err_stream, source_token) = grpc_ingest::grpc_ingest_source(
+                        render_state,
+                        scope,
+                        source_name,
+                        connector,
+                    );
+
+                    error_collections.push(err_stream.as_collection());
+
+                    (ok_stream.as_collection(), source_token)
                 } else {
                     let ((ok_source, ts_bindings, err_source), capability) = match connector {
                         ExternalSourceConnector::Kafka(_) => {
@@ -306,6 +318,7 @@ where
                             );
                             ((SourceType::ByteStream(ok), ts, err), cap)
                         }
+                        ExternalSourceConnector::GrpcIngest(_) => unreachable!(),
                         ExternalSourceConnector::Postgres(_) => unreachable!(),
                         ExternalSourceConnector::PubNub(_) => unreachable!(),
                     };

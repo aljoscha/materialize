@@ -456,7 +456,7 @@ impl_display!(DbzMode);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EnumKind)]
 #[enum_kind(ConnectorType)]
-pub enum CreateSourceConnector {
+pub enum CreateSourceConnector<T: AstInfo> {
     File {
         path: String,
         compression: Compression,
@@ -494,9 +494,14 @@ pub enum CreateSourceConnector {
         /// The PubNub channel to subscribe to
         channel: String,
     },
+    GrpcIngest {
+        grpc_address: String,
+        collection_name: String,
+        columns: Vec<ColumnDef<T>>,
+    },
 }
 
-impl AstDisplay for CreateSourceConnector {
+impl<T: AstInfo> AstDisplay for CreateSourceConnector<T> {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
         match self {
             CreateSourceConnector::File { path, compression } => {
@@ -570,10 +575,27 @@ impl AstDisplay for CreateSourceConnector {
                 f.write_str(&display::escape_single_quote_string(channel));
                 f.write_str("'");
             }
+            CreateSourceConnector::GrpcIngest {
+                collection_name,
+                grpc_address,
+                columns,
+            } => {
+                f.write_str("INGEST ");
+                f.write_str("'");
+                f.write_node(&display::escape_single_quote_string(grpc_address));
+                f.write_str("'");
+                f.write_str("NAME ");
+                f.write_str("'");
+                f.write_node(&display::escape_single_quote_string(collection_name));
+                f.write_str("'");
+                f.write_str(" (");
+                f.write_node(&display::comma_separated(columns));
+                f.write_str(")");
+            }
         }
     }
 }
-impl_display!(CreateSourceConnector);
+impl_display_t!(CreateSourceConnector);
 
 impl<T: AstInfo> From<&CreateSinkConnector<T>> for ConnectorType {
     fn from(connector: &CreateSinkConnector<T>) -> ConnectorType {

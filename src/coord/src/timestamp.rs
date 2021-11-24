@@ -702,6 +702,7 @@ impl Timestamper {
             }
             ExternalSourceConnector::Postgres(_) => None,
             ExternalSourceConnector::PubNub(_) => None,
+            ExternalSourceConnector::GrpcIngest(_) => None,
         }
     }
 
@@ -834,6 +835,7 @@ impl Timestamper {
             ExternalSourceConnector::S3(_) => None,   // BYO is not supported for s3 sources
             ExternalSourceConnector::Postgres(_) => None, // BYO is not supported for postgres sources
             ExternalSourceConnector::PubNub(_) => None,   // BYO is not supported for pubnub sources
+            ExternalSourceConnector::GrpcIngest(_) => None, // BYO is not supported for ingest sources
         }
     }
 

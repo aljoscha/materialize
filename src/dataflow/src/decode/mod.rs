@@ -405,6 +405,9 @@ fn get_decoder(
         DataEncoding::Postgres => {
             unreachable!("Postgres sources should not go through the general decoding path.")
         }
+        DataEncoding::Row(_) => {
+            unreachable!("Ingest (Row) sources should not go through the general decoding path.")
+        }
     }
 }
 

@@ -61,6 +61,7 @@ use crate::source::timestamp::TimestampBindingUpdater;
 use crate::source::timestamp::{AssignedTimestamp, SourceTimestamp};
 
 mod file;
+pub mod grpc_ingest;
 mod kafka;
 mod kinesis;
 pub(super) mod metrics;

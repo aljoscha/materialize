@@ -314,6 +314,7 @@ pub enum DataEncoding {
     Postgres,
     Bytes,
     Text,
+    Row(RelationDesc),
 }
 
 impl SourceDataEncoding {
@@ -426,6 +427,7 @@ impl DataEncoding {
                     }
                     .nullable(false),
                 ),
+            DataEncoding::Row(desc) => desc.clone(),
         })
     }
 
@@ -439,6 +441,7 @@ impl DataEncoding {
             DataEncoding::Csv(_) => "Csv",
             DataEncoding::Text => "Text",
             DataEncoding::Postgres => "Postgres",
+            DataEncoding::Row(_) => "Row",
         }
     }
 }
@@ -893,6 +896,7 @@ pub enum ExternalSourceConnector {
     S3(S3SourceConnector),
     Postgres(PostgresSourceConnector),
     PubNub(PubNubSourceConnector),
+    GrpcIngest(GrpcIngestSourceConnector),
 }
 
 impl ExternalSourceConnector {
@@ -962,6 +966,7 @@ impl ExternalSourceConnector {
             }
             Self::Postgres(_) => vec![],
             Self::PubNub(_) => vec![],
+            Self::GrpcIngest(_) => vec![],
         }
     }
 
@@ -975,6 +980,7 @@ impl ExternalSourceConnector {
             ExternalSourceConnector::S3(_) => Some("mz_record"),
             ExternalSourceConnector::Postgres(_) => None,
             ExternalSourceConnector::PubNub(_) => None,
+            ExternalSourceConnector::GrpcIngest(_) => None,
         }
     }
 
@@ -1018,7 +1024,9 @@ impl ExternalSourceConnector {
                     Vec::new()
                 }
             }
-            ExternalSourceConnector::Postgres(_) | ExternalSourceConnector::PubNub(_) => Vec::new(),
+            ExternalSourceConnector::Postgres(_)
+            | ExternalSourceConnector::PubNub(_)
+            | ExternalSourceConnector::GrpcIngest(_) => Vec::new(),
         }
     }
 
@@ -1032,6 +1040,7 @@ impl ExternalSourceConnector {
             ExternalSourceConnector::S3(_) => "s3",
             ExternalSourceConnector::Postgres(_) => "postgres",
             ExternalSourceConnector::PubNub(_) => "pubnub",
+            ExternalSourceConnector::GrpcIngest(_) => "grpc-ingest",
         }
     }
 
@@ -1051,6 +1060,7 @@ impl ExternalSourceConnector {
             ExternalSourceConnector::S3(_) => None,
             ExternalSourceConnector::Postgres(_) => None,
             ExternalSourceConnector::PubNub(_) => None,
+            ExternalSourceConnector::GrpcIngest(_) => None,
         }
     }
 }
@@ -1257,6 +1267,12 @@ pub struct PostgresSourceConnector {
 pub struct PubNubSourceConnector {
     pub subscribe_key: String,
     pub channel: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GrpcIngestSourceConnector {
+    pub grpc_address: String,
+    pub collection_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

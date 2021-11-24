@@ -896,6 +896,12 @@ where
                             );
                             None
                         }
+                        (ExternalSourceConnector::GrpcIngest(_), _) => {
+                            log::debug!(
+                                "Ingest sources do not communicate with the timestamper thread"
+                            );
+                            None
+                        }
                     }
                 } else {
                     log::debug!(

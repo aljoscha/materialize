@@ -1979,8 +1979,10 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn parse_create_source_connector(&mut self) -> Result<CreateSourceConnector, ParserError> {
-        match self.expect_one_of_keywords(&[FILE, KAFKA, KINESIS, AVRO, S3, POSTGRES, PUBNUB])? {
+    fn parse_create_source_connector(&mut self) -> Result<CreateSourceConnector<Raw>, ParserError> {
+        match self
+            .expect_one_of_keywords(&[FILE, KAFKA, KINESIS, AVRO, S3, INGEST, POSTGRES, PUBNUB])?
+        {
             PUBNUB => {
                 self.expect_keywords(&[SUBSCRIBE, KEY])?;
                 let subscribe_key = self.parse_literal_string()?;
@@ -2007,6 +2009,18 @@ impl<'a> Parser<'a> {
                     conn,
                     publication,
                     slot,
+                })
+            }
+            INGEST => {
+                let grpc_address = self.parse_literal_string()?;
+                self.expect_keyword(NAME)?;
+                let collection_name = self.parse_literal_string()?;
+                // TODO: fail if/when we have constraints
+                let (columns, _constraints) = self.parse_columns(Mandatory)?;
+                Ok(CreateSourceConnector::GrpcIngest {
+                    grpc_address,
+                    collection_name,
+                    columns,
                 })
             }
             FILE => {

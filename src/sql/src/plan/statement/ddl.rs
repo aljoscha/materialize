@@ -29,11 +29,12 @@ use reqwest::Url;
 use dataflow_types::{
     included_column_desc, provide_default_metadata, AvroEncoding, AvroOcfEncoding,
     AvroOcfSinkConnectorBuilder, BringYourOwn, ColumnSpec, Consistency, CsvEncoding, DataEncoding,
-    DebeziumMode, ExternalSourceConnector, FileSourceConnector, IncludedColumnPos,
-    KafkaSinkConnectorBuilder, KafkaSinkConnectorRetention, KafkaSinkFormat, KafkaSourceConnector,
-    KeyEnvelope, KinesisSourceConnector, PostgresSourceConnector, ProtobufEncoding,
-    PubNubSourceConnector, RegexEncoding, S3SourceConnector, SinkConnectorBuilder, SinkEnvelope,
-    SourceConnector, SourceDataEncoding, SourceEnvelope, Timeline,
+    DebeziumMode, ExternalSourceConnector, FileSourceConnector, GrpcIngestSourceConnector,
+    IncludedColumnPos, KafkaSinkConnectorBuilder, KafkaSinkConnectorRetention, KafkaSinkFormat,
+    KafkaSourceConnector, KeyEnvelope, KinesisSourceConnector, PostgresSourceConnector,
+    ProtobufEncoding, PubNubSourceConnector, RegexEncoding, S3SourceConnector,
+    SinkConnectorBuilder, SinkEnvelope, SourceConnector, SourceDataEncoding, SourceEnvelope,
+    Timeline,
 };
 use expr::{func, GlobalId, MirRelationExpr, TableFunc, UnaryFunc};
 use interchange::avro::{self, AvroSchemaGenerator, DebeziumDeduplicationStrategy};
@@ -694,6 +695,71 @@ pub fn plan_create_source(
             });
             (connector, SourceDataEncoding::Single(DataEncoding::Text))
         }
+        CreateSourceConnector::GrpcIngest {
+            grpc_address,
+            collection_name,
+            columns,
+        } => {
+            let connector = ExternalSourceConnector::GrpcIngest(GrpcIngestSourceConnector {
+                grpc_address: grpc_address.clone(),
+                collection_name: collection_name.clone(),
+            });
+
+            let names: Vec<_> = columns
+                .iter()
+                .map(|c| normalize::column_name(c.name.clone()))
+                .collect();
+
+            if let Some(dup) = names.iter().duplicates().next() {
+                bail!(
+                    "cannot CREATE SOURCE: column {} specified more than once",
+                    dup.as_str().quoted()
+                );
+            }
+
+            // Build initial relation type that handles declared data types
+            // and NOT NULL constraints.
+            let mut column_types = Vec::with_capacity(columns.len());
+            let mut defaults = Vec::with_capacity(columns.len());
+            let mut depends_on = Vec::new();
+
+            for c in columns {
+                let (aug_data_type, ids) = resolve_names_data_type(scx, c.data_type.clone())?;
+                let ty = plan::scalar_type_from_sql(scx, &aug_data_type)?;
+                let mut nullable = true;
+                let mut default = Expr::null();
+                for option in &c.options {
+                    match &option.option {
+                        ColumnOption::NotNull => nullable = false,
+                        ColumnOption::Default(expr) => {
+                            // Ensure expression can be planned and yields the correct
+                            // type.
+                            let (_, expr_depends_on) = query::plan_default_expr(scx, expr, &ty)?;
+                            depends_on.extend(expr_depends_on);
+                            default = expr.clone();
+                        }
+                        other => {
+                            bail_unsupported!(format!(
+                                "CREATE TABLE with column constraint: {}",
+                                other
+                            ))
+                        }
+                    }
+                }
+                column_types.push(ty.nullable(nullable));
+                defaults.push(default);
+                depends_on.extend(ids);
+            }
+
+            let typ = RelationType::new(column_types);
+
+            let desc = RelationDesc::new(typ, names);
+
+            (
+                connector,
+                SourceDataEncoding::Single(DataEncoding::Row(desc)),
+            )
+        }
         CreateSourceConnector::AvroOcf { path, .. } => {
             let tail = match with_options.remove("tail") {
                 None => false,
@@ -1241,7 +1307,9 @@ fn get_key_envelope(
                 // Otherwise it gets the names of the columns in the type
                 if let SourceDataEncoding::KeyValue { key, value: _ } = encoding {
                     let is_composite = match key {
-                        DataEncoding::AvroOcf { .. } | DataEncoding::Postgres => {
+                        DataEncoding::AvroOcf { .. }
+                        | DataEncoding::Postgres
+                        | DataEncoding::Row(_) => {
                             bail!("{} sources cannot use INCLUDE KEY", key.op_name())
                         }
                         DataEncoding::Bytes | DataEncoding::Text => false,
