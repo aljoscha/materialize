@@ -46,7 +46,15 @@ pub fn grpc_ingest_source<G>(
 where
     G: Scope<Timestamp = Timestamp>,
 {
+    let worker_index = scope.index();
+
     let async_stream = async_stream::try_stream! {
+        // We are reading only from worker 0. The protocol cannot yet work for multiple concurrent
+        // consumers that make up one "logical" consumer, i.e. a source with multiple instances.
+        if worker_index != 0 {
+            log::trace!("We are not worker 0, exiting...");
+            return;
+        }
         // We just loop forever. Eventually we might want to think about bubbling
         // up non-recoverable errors.
         'outer: loop {
