@@ -41,12 +41,11 @@ use crate::render::context::Context;
 use crate::render::{RelevantTokens, RenderState};
 use crate::server::LocalInput;
 use crate::source::metrics::SourceBaseMetrics;
-use crate::source::grpc_ingest;
 use crate::source::timestamp::{AssignedTimestamp, SourceTimestamp};
 use crate::source::{
-    self, DecodeResult, FileSourceReader, KafkaSourceReader, KinesisSourceReader,
-    PersistentTimestampBindingsConfig, PostgresSourceReader, PubNubSourceReader, S3SourceReader,
-    SourceConfig,
+    self, grpc_ingest, DecodeResult, FileSourceReader, KafkaSourceReader, KinesisSourceReader,
+    PartitionMetrics, PersistentTimestampBindingsConfig, PostgresSourceReader, PubNubSourceReader,
+    S3SourceReader, SourceConfig,
 };
 
 /// A type-level enum that holds one of two types of sources depending on their message type
@@ -265,11 +264,18 @@ where
 
                     (ok_stream.as_collection(), capability)
                 } else if let ExternalSourceConnector::GrpcIngest(connector) = connector {
+                    let partition_metrics = PartitionMetrics::new(
+                        base_metrics,
+                        &source_name,
+                        uid,
+                        &expr::PartitionId::None,
+                    );
                     let (ok_stream, err_stream, source_token) = grpc_ingest::grpc_ingest_source(
                         render_state,
                         scope,
                         source_name,
                         connector,
+                        partition_metrics,
                     );
 
                     error_collections.push(err_stream.as_collection());

@@ -20,6 +20,7 @@ use timely::dataflow::{Scope, Stream};
 use futures_util::Stream as FuturesStream;
 
 use crate::render::RenderState;
+use crate::source::PartitionMetrics;
 use crate::source::SourceToken;
 use dataflow_types::{
     DataflowError, DecodeError, GrpcIngestSourceConnector, SourceError, SourceErrorDetails,
@@ -36,6 +37,7 @@ pub fn grpc_ingest_source<G>(
     scope: &G,
     source_name: String,
     connector: GrpcIngestSourceConnector,
+    metrics: PartitionMetrics,
 ) -> (
     Stream<G, (Row, Timestamp, Diff)>,
     Stream<G, (DataflowError, Timestamp, Diff)>,
@@ -166,6 +168,7 @@ where
         let unpacked_value = value.unpack();
         row_packer.extend(unpacked_key);
         row_packer.extend(unpacked_value);
+        metrics.messages_ingested.inc();
         Ok((row_packer.finish_and_reuse(), ts, diff))
     });
 
