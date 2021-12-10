@@ -99,7 +99,7 @@ pub struct Config {
 
     // === Connection options. ===
     /// The coordinator gRPC endpoint.
-    pub coord_grpc_addr: SocketAddr,
+    pub coord_grpc_addr: String,
     /// The IP address and port to listen on for gRPC connections.
     pub grpc_listen_addr: SocketAddr,
     /// The frequency at which we query new sources from the control plane.

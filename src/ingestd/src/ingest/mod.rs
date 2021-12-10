@@ -119,7 +119,7 @@ pub struct Config {
     /// The address to listen on for gRPC connections.
     pub grpc_listen_addr: SocketAddr,
     /// The coordinator gRPC endpoint.
-    pub coord_grpc_addr: SocketAddr,
+    pub coord_grpc_addr: String,
     /// The frequency at which we query new sources from the control plane.
     pub update_interval: Duration,
     /// Channel to communicate source status updates to the timestamper thread.

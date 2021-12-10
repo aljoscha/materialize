@@ -196,7 +196,7 @@ struct Args {
         value_name = "HOST:PORT",
         default_value = "[::1]:50051"
     )]
-    coord_grpc_addr: SocketAddr,
+    coord_grpc_addr: String,
     /// How often to request new sources from the ingest control endpoint.
     #[structopt(short, long, parse(try_from_str = repr::util::parse_duration), default_value = "500ms")]
     update_interval: Duration,
