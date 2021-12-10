@@ -134,7 +134,7 @@ impl<'a> DataflowBuilder<'a> {
                                 } => {
                                     let ingest_connector = ExternalSourceConnector::GrpcIngest(
                                         GrpcIngestSourceConnector {
-                                            grpc_address: "http://[::1]:50052".to_string(),
+                                            grpc_address: "http://localhost:50052".to_string(),
                                             collection_name: persist.primary_stream.name.clone(),
                                         },
                                     );
