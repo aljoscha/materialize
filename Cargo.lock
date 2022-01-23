@@ -859,6 +859,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "columnation"
+version = "0.1.0"
+source = "git+https://github.com/frankmcsherry/columnation#b96e1d827bc245713211b4227e95eadb7f8cd074"
+dependencies = [
+ "paste",
+]
+
+[[package]]
 name = "compile-time-run"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5131,7 +5139,7 @@ dependencies = [
 [[package]]
 name = "timely"
 version = "0.12.0"
-source = "git+https://github.com/TimelyDataflow/timely-dataflow#1f09f660120d69f0c2534d04671b5f9d79162a39"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#2cc6bea1a791b4322241e7d17c355f96de546785"
 dependencies = [
  "abomonation",
  "abomonation_derive",
@@ -5142,6 +5150,7 @@ dependencies = [
  "serde_derive",
  "timely_bytes",
  "timely_communication",
+ "timely_container",
  "timely_logging",
 ]
 
@@ -5157,12 +5166,12 @@ dependencies = [
 [[package]]
 name = "timely_bytes"
 version = "0.12.0"
-source = "git+https://github.com/TimelyDataflow/timely-dataflow#1f09f660120d69f0c2534d04671b5f9d79162a39"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#2cc6bea1a791b4322241e7d17c355f96de546785"
 
 [[package]]
 name = "timely_communication"
 version = "0.12.0"
-source = "git+https://github.com/TimelyDataflow/timely-dataflow#1f09f660120d69f0c2534d04671b5f9d79162a39"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#2cc6bea1a791b4322241e7d17c355f96de546785"
 dependencies = [
  "abomonation",
  "abomonation_derive",
@@ -5176,9 +5185,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "timely_container"
+version = "0.12.0"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#2cc6bea1a791b4322241e7d17c355f96de546785"
+dependencies = [
+ "columnation",
+ "serde",
+]
+
+[[package]]
 name = "timely_logging"
 version = "0.12.0"
-source = "git+https://github.com/TimelyDataflow/timely-dataflow#1f09f660120d69f0c2534d04671b5f9d79162a39"
+source = "git+https://github.com/TimelyDataflow/timely-dataflow#2cc6bea1a791b4322241e7d17c355f96de546785"
 
 [[package]]
 name = "tinytemplate"
