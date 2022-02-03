@@ -32,6 +32,7 @@ use timely::progress::Timestamp as TimelyTimestamp;
 use timely::Data as TimelyData;
 use timely::PartialOrder;
 
+use crate::client::MultiWriteHandle;
 use crate::client::StreamWriteHandle;
 use crate::error::Error;
 use crate::storage::SeqNo;
@@ -45,8 +46,8 @@ pub trait Persist<G: Scope<Timestamp = u64>, K: TimelyData, V: TimelyData> {
     /// operator is holding on to capabilities as long as data belonging to their timestamp is not
     /// persisted.
     ///
-    /// Use this together with [`seal`](Seal::seal)/[`conditional_seal`](Seal::conditional_seal)
-    /// and [`await_frontier`](AwaitFrontier::await_frontier) if you want to make sure that data only
+    /// Use this together with [`seal`](Seal::seal) and
+    /// [`await_frontier`](AwaitFrontier::await_frontier) if you want to make sure that data only
     /// becomes available downstream when persisted and sealed.
     ///
     /// **Note:** If you need to also replay persisted data when restarting, concatenate the output
@@ -115,7 +116,7 @@ where
                     // We are not using the capability for the main output later, but we are
                     // holding on to it to keep the frontier from advancing because that frontier
                     // is used downstream to track how far we have persisted. This is used, for
-                    // example, by seal()/conditional_seal() operators and await_frontier().
+                    // example, by seal() operators and await_frontier().
                     pending_futures.push_back((
                         cap.delayed(cap.time()),
                         cap.retain_for_output(error_output_port),
@@ -174,38 +175,15 @@ where
 
 /// Extension trait for [`Stream`].
 pub trait Seal<G: Scope<Timestamp = u64>, D: TimelyData> {
-    /// Passes through each element of the stream and seals the given collection (the `write`
-    /// handle) when the input frontier advances.
+    /// Passes through each element of the stream and calls
+    /// [`seal_all`](MultiWriteHandle::seal_all) on the given [`MultiWriteHandle`] when the input
+    /// frontier advances.
     ///
     /// This does not wait for the seal to succeed before passing through the data. We do, however,
     /// wait for the seal to be successful before allowing the frontier to advance. In other words,
     /// this operator is holding on to capabilities as long as seals corresponding to their
     /// timestamp are not done.
-    fn seal<K, V>(&self, name: &str, write: StreamWriteHandle<K, V>) -> Stream<G, (D, u64, isize)>
-    where
-        K: Codec,
-        V: Codec;
-
-    /// Passes through each element of the stream and seals the given primary and condition
-    /// collections, respectively, when their frontier advances. The primary collection is only
-    /// sealed up to a time `t` when the condition collection has also been sealed up to `t`.
-    ///
-    /// This does not wait for the seals to succeed before passing through the data. We do,
-    /// however, wait for the seals to be successful before allowing the frontier to advance. In
-    /// other words, this operator is holding on to capabilities as long as seals corresponding to
-    /// their timestamp are not done.
-    fn conditional_seal<D2: TimelyData, K, V, K2, V2>(
-        &self,
-        name: &str,
-        condition_input: &Stream<G, (D2, u64, isize)>,
-        primary_write: StreamWriteHandle<K, V>,
-        condition_write: StreamWriteHandle<K2, V2>,
-    ) -> Stream<G, (D, u64, isize)>
-    where
-        K: Codec,
-        V: Codec,
-        K2: TimelyData + Codec,
-        V2: TimelyData + Codec;
+    fn seal(&self, name: &str, write: MultiWriteHandle) -> Stream<G, (D, u64, isize)>;
 }
 
 impl<G, D> Seal<G, D> for Stream<G, (D, u64, isize)>
@@ -213,11 +191,7 @@ where
     G: Scope<Timestamp = u64>,
     D: TimelyData,
 {
-    fn seal<K, V>(&self, name: &str, write: StreamWriteHandle<K, V>) -> Stream<G, (D, u64, isize)>
-    where
-        K: Codec,
-        V: Codec,
-    {
+    fn seal(&self, name: &str, write: MultiWriteHandle) -> Stream<G, (D, u64, isize)> {
         let operator_name = format!("seal({})", name);
         let mut seal_op = OperatorBuilder::new(operator_name.clone(), self.scope());
 
@@ -288,7 +262,7 @@ where
                             frontier_element,
                         );
 
-                        let future = write.seal(*frontier_element);
+                        let future = write.seal_all(*frontier_element);
 
                         pending_futures.push_back(SealFuture {
                             time: *frontier_element,
@@ -323,8 +297,8 @@ where
                                 e
                             );
 
-                            // Only retry this seal if there is no other pending conditional
-                            // seal at a time >= this seal's time.
+                            // Only retry this seal if there is no other pending seal at a time >=
+                            // this seal's time.
                             let retry = {
                                 let mut retry = true;
                                 let seal_ts = pending_future.time;
@@ -343,7 +317,7 @@ where
                                     pending_future.time
                                 );
 
-                                let future = write.seal(pending_future.time);
+                                let future = write.seal_all(pending_future.time);
                                 pending_futures.push_front(SealFuture {
                                     time: pending_future.time,
                                     future,
@@ -379,29 +353,6 @@ where
         });
 
         data_output_stream
-    }
-
-    fn conditional_seal<D2: TimelyData, K, V, K2, V2>(
-        &self,
-        name: &str,
-        condition_input: &Stream<G, (D2, u64, isize)>,
-        primary_write: StreamWriteHandle<K, V>,
-        condition_write: StreamWriteHandle<K2, V2>,
-    ) -> Stream<G, (D, u64, isize)>
-    where
-        K: Codec,
-        V: Codec,
-        K2: TimelyData + Codec,
-        V2: TimelyData + Codec,
-    {
-        let condition = condition_input.seal(&format!("condition_seal_{}", name), condition_write);
-
-        // Create a data dependency between `condition_ok` and `self`, so that
-        // the data in `self` is only sealed when `condition` has successfully
-        // sealed.
-        let condition = condition.flat_map(|_| None);
-        self.concat(&condition)
-            .seal(&format!("primary_seal_{}", name), primary_write)
     }
 }
 
@@ -828,6 +779,7 @@ mod tests {
         timely::execute_directly(move |worker| {
             let (mut input, probe) = worker.dataflow(|scope| {
                 let (write, _read) = p.create_or_load::<(), ()>("1");
+                let write = MultiWriteHandle::new(&write);
                 let mut input = Handle::new();
                 let ok_stream = input.to_stream(scope).seal("test", write);
                 let probe = ok_stream.probe();
@@ -857,6 +809,7 @@ mod tests {
         timely::execute_directly(move |worker| {
             let (mut input, seal_probe) = worker.dataflow(|scope| {
                 let (write, _read) = p.create_or_load::<(), ()>("primary");
+                let write = MultiWriteHandle::new(&write);
                 let mut input = Handle::new();
                 let stream = input.to_stream(scope);
 
@@ -909,6 +862,7 @@ mod tests {
         timely::execute_directly(move |worker| {
             let (mut input, mut placeholder, probe) = worker.dataflow(|scope| {
                 let (write, _read) = p.create_or_load::<(), ()>("primary");
+                let write = MultiWriteHandle::new(&write);
                 let mut input = Handle::new();
                 let stream = input.to_stream(scope);
                 // We need to create a placeholder stream to force the dataflow to stay around
@@ -958,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn conditional_seal() -> Result<(), Error> {
+    fn seal_multiple() -> Result<(), Error> {
         ore::test::init_logging();
         let mut registry = MemRegistry::new();
 
@@ -1028,12 +982,16 @@ mod tests {
                 let primary_stream = primary_input.to_stream(scope);
                 let condition_stream = condition_input.to_stream(scope);
 
-                let sealed_stream = primary_stream.conditional_seal(
-                    "test",
-                    &condition_stream,
-                    primary_write,
-                    condition_write,
-                );
+                let mut multi_write = MultiWriteHandle::new(&primary_write);
+                multi_write
+                    .add_stream(&condition_write)
+                    .expect("client known from same runtime");
+
+                // create a data dependency without sending any data, just to create an edge that
+                // ties the frontiers together.
+                let primary_stream = primary_stream.concat(&condition_stream.flat_map(|_| None));
+
+                let sealed_stream = primary_stream.seal("test", multi_write);
 
                 let seal_probe = sealed_stream.probe();
 
@@ -1103,59 +1061,56 @@ mod tests {
         let actual_seals: Vec<_> = listen_rx.try_iter().collect();
 
         // Assert that:
-        //  a) We don't seal primary when condition has not sufficiently advanced.
-        //  b) Condition is sealed before primary for the same timestamp OR
-        //     primary and condition got swapped when reading from two channels and a
-        //     primary seal at t is just before the condition seal at a time t' >= t.
-        //  c) We seal up, even when never receiving any data.
-        //  d) Seals happen in timestamp order.
+        //  a) We seal primary and condition to t before sealing either to t' > t. In practice,
+        //  this means we expect to see pairs of (Primary,Condition) or (Condition,Primary) in the
+        //  output, when chunked into 2-chunks.
+        //  b) We seal up, even when never receiving any data.
+        //  c) Seals happen in timestamp order.
         //
         // We cannot assert a specific seal ordering because the order is not deterministic.
 
-        let mut current_condition_seal = 0;
-        let mut current_primary_seal = 0;
         let mut condition_seals = vec![];
         let mut primary_seals = vec![];
-        let mut seal_pairs = vec![];
 
-        // Chunk up the list of seals into overlapping pairs so we can easily find
-        // the next seal.
-        for i in 0..actual_seals.len() - 1 {
-            seal_pairs.push((actual_seals[i], Some(actual_seals[i + 1])));
-        }
+        let seal_pairs = actual_seals.chunks(2);
 
-        seal_pairs.push((actual_seals[actual_seals.len() - 1], None));
+        for seal_pair in seal_pairs {
+            let seal_pair = match seal_pair {
+                &[seal1, seal2] => (seal1, seal2),
+                _ => unreachable!(),
+            };
 
-        for (seal, optional_next) in seal_pairs {
-            match seal {
-                Sealed::Condition(ts) => {
-                    assert!(ts >= current_condition_seal);
-                    current_condition_seal = ts;
-                    condition_seals.push(ts);
+            let (condition_ts, primary_ts) = match seal_pair {
+                (Sealed::Condition(condition_ts), Sealed::Primary(primary_ts)) => {
+                    (condition_ts, primary_ts)
                 }
-                Sealed::Primary(ts) => {
-                    assert!(ts >= current_primary_seal);
-                    if let Some(Sealed::Condition(next_condition_seal)) = optional_next {
-                        assert!(ts <= next_condition_seal);
-                    } else {
-                        assert!(ts <= current_condition_seal);
-                    };
-                    current_primary_seal = ts;
-                    primary_seals.push(ts);
+                (Sealed::Primary(primary_ts), Sealed::Condition(condition_ts)) => {
+                    (condition_ts, primary_ts)
                 }
-            }
+                (Sealed::Primary(_), Sealed::Primary(_)) => {
+                    panic!("invalid seal ordering: {:?}", actual_seals)
+                }
+                (Sealed::Condition(_), Sealed::Condition(_)) => {
+                    panic!("invalid seal ordering: {:?}", actual_seals)
+                }
+            };
+
+            assert_eq!(condition_ts, primary_ts);
+
+            condition_seals.push(condition_ts);
+            primary_seals.push(primary_ts);
         }
 
         // Check that the seal values for each collection are exactly what
         // we expect.
-        assert_eq!(condition_seals, vec![1, 2, 3, 4]);
+        assert_eq!(condition_seals, vec![1, 2, 3]);
         assert_eq!(primary_seals, vec![1, 2, 3]);
 
         Ok(())
     }
 
     #[test]
-    fn conditional_seal_frontier_advance_only_on_success() -> Result<(), Error> {
+    fn seal_multiple_frontier_advance_only_on_success() -> Result<(), Error> {
         ore::test::init_logging();
         let mut registry = MemRegistry::new();
         let mut unreliable = UnreliableHandle::default();
@@ -1170,12 +1125,16 @@ mod tests {
                 let primary_stream = primary_input.to_stream(scope);
                 let condition_stream = condition_input.to_stream(scope);
 
-                let sealed_stream = primary_stream.conditional_seal(
-                    "test",
-                    &condition_stream,
-                    primary_write,
-                    condition_write,
-                );
+                let mut multi_write = MultiWriteHandle::new(&primary_write);
+                multi_write
+                    .add_stream(&condition_write)
+                    .expect("client known from same runtime");
+
+                // Create a data dependency without sending any data, just to create an edge that
+                // ties the frontiers together.
+                let primary_stream = primary_stream.concat(&condition_stream.flat_map(|_| None));
+
+                let sealed_stream = primary_stream.seal("test", multi_write);
 
                 let seal_probe = sealed_stream.probe();
 
@@ -1214,13 +1173,13 @@ mod tests {
         Ok(())
     }
 
-    // Test using multiple workers and ensure that `conditional_seal()` doesn't block the
-    // frontier for non-active seal operators.
+    // Test using multiple workers and ensure that `seal()` doesn't block the frontier for
+    // non-active seal operators.
     //
     // A failure in this test would manifest as indefinite hanging of the test, we never see the
     // frontier advance as we expect to.
     #[test]
-    fn conditional_seal_multiple_workers() -> Result<(), Error> {
+    fn seal_multiple_multiple_workers() -> Result<(), Error> {
         let mut registry = MemRegistry::new();
         let p = registry.runtime_no_reentrance()?;
 
@@ -1233,12 +1192,16 @@ mod tests {
                 let primary_stream = primary_input.to_stream(scope);
                 let condition_stream = condition_input.to_stream(scope);
 
-                let sealed_stream = primary_stream.conditional_seal(
-                    "test",
-                    &condition_stream,
-                    primary_write,
-                    condition_write,
-                );
+                let mut multi_write = MultiWriteHandle::new(&primary_write);
+                multi_write
+                    .add_stream(&condition_write)
+                    .expect("client known from same runtime");
+
+                // Create a data dependency without sending any data, just to create an edge that
+                // ties the frontiers together.
+                let primary_stream = primary_stream.concat(&condition_stream.flat_map(|_| None));
+
+                let sealed_stream = primary_stream.seal("test", multi_write);
 
                 let seal_probe = sealed_stream.probe();
 
