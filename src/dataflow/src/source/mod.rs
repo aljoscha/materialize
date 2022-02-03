@@ -1003,11 +1003,10 @@ where
                 let starting_offsets = source_persist.get_starting_offsets(valid_bindings.iter());
 
                 tracing::debug!(
-                    "In {}, initial (restored) source offsets: {:?}. upper_bindings_seal_ts = {}, upper_data_seal_ts = {}",
+                    "In {}, initial (restored) source offsets: {:?}. upper_seal_ts = {}",
                     name,
                     starting_offsets,
-                    source_persist.config.upper_bindings_seal_ts,
-                    source_persist.config.upper_data_seal_ts,
+                    source_persist.config.upper_seal_ts,
                 );
 
                 tracing::debug!(
@@ -1066,7 +1065,7 @@ where
                     }
                 }
 
-                Ok((Some(source_persist), Some(valid_bindings), Some(retractions), persist_config.upper_bindings_seal_ts))
+                Ok((Some(source_persist), Some(valid_bindings), Some(retractions), persist_config.upper_seal_ts))
             });
 
                 match result {
@@ -1348,8 +1347,6 @@ impl SourceReaderPersistence {
         ),
         persist::error::Error,
     > {
-        assert!(self.config.upper_bindings_seal_ts >= self.config.upper_data_seal_ts);
-
         // Materialized version of bindings updates that are not beyond the common seal timestamp.
         let mut valid_bindings: HashMap<_, isize> = HashMap::new();
 
@@ -1363,7 +1360,7 @@ impl SourceReaderPersistence {
         // sealed. Thus, it represents the content of the timestamp histories at exactly that
         // point.
         for ((source_timestamp, assigned_timestamp), ts, diff) in buf.into_iter() {
-            if ts < self.config.upper_data_seal_ts {
+            if ts < self.config.upper_seal_ts {
                 *valid_bindings
                     .entry((source_timestamp.clone(), assigned_timestamp))
                     .or_default() += diff;
@@ -1466,14 +1463,8 @@ impl SourceReaderPersistence {
 /// bindings.
 #[derive(Clone)]
 pub struct PersistentTimestampBindingsConfig<ST: Codec, AT: Codec> {
-    /// The timestamp up to which which timestamp bindings have been sealed.
-    upper_bindings_seal_ts: u64,
-
-    /// The timestamp up to which which data (the updates read from the source) has been sealed.
-    ///
-    /// This can be different from `upper_bindings_seal_ts` because we seal bindings before data,
-    /// and the latter can fail after we succesfully sealed the bindings.
-    upper_data_seal_ts: u64,
+    /// The timestamp up to which all involved streams have been sealed.
+    upper_seal_ts: u64,
 
     /// [`StreamReadHandle`] for the collection that we should persist to.
     read_handle: StreamReadHandle<ST, AT>,
@@ -1485,17 +1476,12 @@ pub struct PersistentTimestampBindingsConfig<ST: Codec, AT: Codec> {
 impl<K: Codec, V: Codec> PersistentTimestampBindingsConfig<K, V> {
     /// Creates a new [`PersistentTimestampBindingsConfig`] from the given parts.
     pub fn new(
-        upper_bindings_seal_ts: u64,
-        upper_data_seal_ts: u64,
+        upper_seal_ts: u64,
         read_handle: StreamReadHandle<K, V>,
         write_handle: StreamWriteHandle<K, V>,
     ) -> Self {
-        // We always seal bindings before data.
-        assert!(upper_bindings_seal_ts >= upper_data_seal_ts);
-
         PersistentTimestampBindingsConfig {
-            upper_bindings_seal_ts,
-            upper_data_seal_ts,
+            upper_seal_ts,
             read_handle,
             write_handle,
         }
