@@ -14,13 +14,19 @@ use std::str::FromStr;
 use bytes::BufMut;
 use chrono::format::{DelayedFormat, StrftimeItems};
 use chrono::NaiveDateTime;
-use differential_dataflow::AsCollection;
+use dataflow_types::{SourceError, SourceErrorDetails};
 use differential_dataflow::Collection;
+use differential_dataflow::{AsCollection, Hashable};
+use persist::operators::replay::Replay;
+use persist::operators::stream::{Persist, RetractUnsealed};
 use persist_types::Codec;
 use serde::{Deserialize, Serialize};
-use timely::dataflow::channels::pact::Pipeline;
-use timely::dataflow::operators::Operator;
+use timely::dataflow::channels::pact::{Exchange, Pipeline};
+use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
+use timely::dataflow::operators::generic::operator;
+use timely::dataflow::operators::{Concat, Inspect, Map, OkErr, Operator};
 use timely::dataflow::{Scope, Stream};
+use timely::progress::Antichain;
 use tracing::{debug, error, info, warn};
 
 use dataflow_types::{
@@ -76,9 +82,12 @@ pub(crate) fn render<G: Scope>(
     envelope: &DebeziumEnvelope,
     input: &Stream<G, DecodeResult>,
     debug_name: String,
+    source_name: &str,
     metrics: Metrics,
     src_id: GlobalId,
     dataflow_id: usize,
+    as_of_frontier: Antichain<u64>,
+    persist_config: Option<PersistentDebeziumConfig<Result<Row, DecodeError>>>,
 ) -> Collection<G, Result<Row, DataflowError>, Diff>
 where
     G: Scope<Timestamp = Timestamp>,
@@ -148,10 +157,136 @@ where
                 .as_collection()
         }
         _ => {
-            let result_stream = render_debezium_dedup(envelope, input, debug_name);
+            let (restored_state, restore_errs) = match &persist_config {
+                Some(persist_config) => restore_dedup_state(
+                    &input.scope(),
+                    source_name,
+                    envelope,
+                    persist_config.dedup_state_read.clone(),
+                    persist_config.dedup_state_write.clone(),
+                    as_of_frontier,
+                    persist_config.upper_seal_ts,
+                ),
+                None => (
+                    operator::empty(&input.scope()),
+                    operator::empty(&input.scope()),
+                ),
+            };
+
+            restore_errs.inspect(|e| panic!("restore error: {:?}", e));
+            restored_state.inspect(|s| println!("restored state: {:?}", s));
+
+            let (result_stream, state_update_stream) =
+                render_debezium_dedup(envelope, input, debug_name);
+
+            state_update_stream.inspect(|u| println!("state update: {:?}", u));
+
+            let state_persist_errs = if let Some(persist_config) = persist_config {
+                let (_state, persist_errs) =
+                    state_update_stream.persist(source_name, persist_config.dedup_state_write);
+                persist_errs
+            } else {
+                operator::empty(&input.scope())
+            };
+
+            state_persist_errs.inspect(|e| panic!("state persist error: {:?}", e));
 
             result_stream.as_collection()
         }
+    }
+}
+
+fn restore_dedup_state<G>(
+    scope: &G,
+    source_name: &str,
+    envelope: &DebeziumEnvelope,
+    dedup_state_read: StreamReadHandle<PartitionId, DebeziumStateUpdate>,
+    dedup_state_write: StreamWriteHandle<PartitionId, DebeziumStateUpdate>,
+    as_of_frontier: Antichain<u64>,
+    upper_seal_ts: Timestamp,
+) -> (
+    Stream<G, (PartitionId, Option<DebeziumDeduplicationState>)>,
+    Stream<G, (DataflowError, u64, isize)>,
+)
+where
+    G: Scope<Timestamp = Timestamp>,
+{
+    let (state_oks, persist_errs) = {
+        let snapshot = dedup_state_read.snapshot();
+        let (restored_oks, restored_errs) =
+            scope.replay(snapshot, &as_of_frontier).ok_err(split_ok_err);
+        let (restored_upsert_oks, retract_errs) =
+            restored_oks.retract_unsealed(source_name, dedup_state_write, upper_seal_ts);
+        let combined_errs = restored_errs.concat(&retract_errs);
+        (restored_upsert_oks, combined_errs)
+    };
+
+    let operator_name = format!("restore_debezium_dedup_state({})", source_name);
+
+    let state_stream = state_oks.unary_frontier(
+        Exchange::new(
+            |((id, _update), _ts, _diff): &(
+                (PartitionId, DebeziumStateUpdate),
+                Timestamp,
+                Diff,
+            )| { id.hashed() },
+        ),
+        // Pipeline,
+        &operator_name,
+        move |default_cap, _info| {
+            let envelope = envelope.clone();
+            let mut data = vec![];
+            let mut update_stash: HashMap<PartitionId, Vec<_>> = HashMap::new();
+
+            let mut cap = Some(default_cap);
+
+            move |input, output| {
+                while let Some((_cap, refmut_data)) = input.next() {
+                    refmut_data.swap(&mut data);
+                    for ((partition_id, update), _ts, diff) in data.drain(..) {
+                        update_stash
+                            .entry(partition_id.clone())
+                            .or_default()
+                            .push((update, diff));
+                    }
+                }
+
+                // We have seen all updates. Time to re-hydrate and send along the state.
+                if input.frontier().is_empty() {
+                    let mut cap = cap.take().expect("missing capability");
+                    let mut session = output.session(&mut cap);
+                    for (partition_id, updates) in update_stash.drain() {
+                        let dedup_state =
+                            DebeziumDeduplicationState::from_updates(envelope.clone(), updates);
+
+                        session.give((partition_id, dedup_state));
+                    }
+                }
+            }
+        },
+    );
+
+    // TODO: It is not ideal that persistence errors end up in the same differential error
+    // collection as other errors because they are transient/indefinite errors that we
+    // should be treating differently. We do not, however, at the current time have to
+    // infrastructure for treating these errors differently, so we're adding them to the
+    // same error collections.
+    let source_name = source_name.to_owned();
+    let persist_errs = persist_errs.map(move |(err, ts, diff)| {
+        let source_error =
+            SourceError::new(source_name.clone(), SourceErrorDetails::Persistence(err));
+        (source_error.into(), ts, diff)
+    });
+
+    (state_stream, persist_errs)
+}
+
+fn split_ok_err<K, V>(
+    x: (Result<(K, V), String>, u64, isize),
+) -> Result<((K, V), u64, isize), (String, u64, isize)> {
+    match x {
+        (Ok(kv), ts, diff) => Ok((kv, ts, diff)),
+        (Err(err), ts, diff) => Err((err, ts, diff)),
     }
 }
 
@@ -160,20 +295,36 @@ fn render_debezium_dedup<G: Scope>(
     envelope: &DebeziumEnvelope,
     input: &Stream<G, DecodeResult>,
     debug_name: String,
-) -> Stream<G, (Result<Row, DataflowError>, Timestamp, Diff)>
+) -> (
+    Stream<G, (Result<Row, DataflowError>, Timestamp, Diff)>,
+    Stream<G, ((PartitionId, DebeziumStateUpdate), Timestamp, Diff)>,
+)
 where
     G: Scope<Timestamp = Timestamp>,
 {
     let (before_idx, after_idx) = (envelope.before_idx, envelope.after_idx);
 
-    let result_stream = input.unary(Pipeline, "envelope-debezium", move |_, _| {
+    let mut op = OperatorBuilder::new("envelope-debezium".to_string(), input.scope());
+
+    let mut input = op.new_input(input, Pipeline);
+    let (mut data_output, data_output_stream) = op.new_output();
+    let (mut state_update_output, state_update_stream) = op.new_output();
+    let state_update_port = state_update_stream.name().port;
+
+    op.build(move |_capabilities| {
         let mut dedup_state = HashMap::new();
         let envelope = envelope.clone();
         let mut data = vec![];
 
-        move |input, output| {
+        move |_frontiers| {
+            let mut data_output = data_output.activate();
+            let mut state_update_output = state_update_output.activate();
+
             while let Some((cap, refmut_data)) = input.next() {
-                let mut session = output.session(&cap);
+                let mut session = data_output.session(&cap);
+                let mut state_update_cap = cap.delayed_for_output(cap.time(), state_update_port);
+                let mut state_update_session = state_update_output.session(&mut state_update_cap);
+
                 refmut_data.swap(&mut data);
                 for result in data.drain(..) {
                     let key = match result.key.transpose() {
@@ -206,7 +357,16 @@ where
                             );
 
                             println!("Debezium state mutations: {:?}", state_mutations);
-                            s.apply_mutations(state_mutations);
+                            let state_updates = s.apply_mutations(state_mutations);
+
+                            let partition_id = result.partition.clone();
+                            let ts = *cap.time();
+                            let state_updates =
+                                state_updates.into_iter().map(move |(update, diff)| {
+                                    ((partition_id.clone(), update), ts, diff)
+                                });
+
+                            state_update_session.give_iterator(state_updates);
 
                             match res {
                                 Ok(b) => b,
@@ -240,7 +400,7 @@ where
         }
     });
 
-    result_stream
+    (data_output_stream, state_update_stream)
 }
 
 /// Track whether or not we should skip a specific debezium message
@@ -250,7 +410,7 @@ where
 /// one deduplicator per timely worker and use use timely key sharding
 /// normally. But it also means that no single deduplicator knows the
 /// highest-ever seen binlog offset.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct DebeziumDeduplicationState {
     /// Last recorded binlog position and connector offset
     ///
@@ -339,7 +499,7 @@ impl Codec for DebeziumStateUpdate {
 /// During normal (non-snapshot) operation, we deduplicate based on binlog position: (pos, row), for MySQL.
 /// During the initial snapshot, (pos, row) values are all the same, but primary keys
 /// are unique and thus we can get deduplicate based on those.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct TrackFull {
     /// binlog position to (timestamp that this binlog entry was first seen)
     seen_positions: HashMap<RowCoordinates, i64>,
@@ -358,7 +518,7 @@ struct TrackFull {
 /// `upstream_time_millis` argument to [`DebeziumDeduplicationState::should_use_record`].
 ///
 /// We throw away all tracking data after we see the first record past `end`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct TrackRange {
     /// Start pre-filling the seen data before we start trusting it
     ///
