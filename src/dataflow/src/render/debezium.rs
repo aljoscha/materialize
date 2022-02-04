@@ -29,7 +29,7 @@ use dataflow_types::{
 };
 use expr::{GlobalId, PartitionId};
 use persist::client::{StreamReadHandle, StreamWriteHandle};
-use repr::{Datum, Diff, Row};
+use repr::{Datum, Diff, Row, Timestamp};
 
 use crate::metrics::Metrics;
 use crate::source::DecodeResult;
@@ -79,11 +79,15 @@ pub(crate) fn render<G: Scope>(
     metrics: Metrics,
     src_id: GlobalId,
     dataflow_id: usize,
-) -> Collection<G, Result<Row, DataflowError>, Diff> {
-    let (before_idx, after_idx) = (envelope.before_idx, envelope.after_idx);
+) -> Collection<G, Result<Row, DataflowError>, Diff>
+where
+    G: Scope<Timestamp = Timestamp>,
+{
     match envelope.mode {
         DebeziumMode::Upsert => {
             let gauge = metrics.debezium_upsert_count_for(src_id, dataflow_id);
+            let after_idx = envelope.after_idx;
+
             input
                 .unary(Pipeline, "envelope-debezium-upsert", move |_, _| {
                     let mut current_values = HashMap::new();
@@ -143,84 +147,100 @@ pub(crate) fn render<G: Scope>(
                 })
                 .as_collection()
         }
-        _ => input
-            .unary(Pipeline, "envelope-debezium", move |_, _| {
-                let mut dedup_state = HashMap::new();
-                let envelope = envelope.clone();
-                let mut data = vec![];
+        _ => {
+            let result_stream = render_debezium_dedup(envelope, input, debug_name);
 
-                move |input, output| {
-                    while let Some((cap, refmut_data)) = input.next() {
-                        let mut session = output.session(&cap);
-                        refmut_data.swap(&mut data);
-                        for result in data.drain(..) {
-                            let key = match result.key.transpose() {
-                                Ok(key) => key,
+            result_stream.as_collection()
+        }
+    }
+}
+
+/// Renders the operators necessary for a DEBEZIUM (NON-UPSERT) envelope.
+fn render_debezium_dedup<G: Scope>(
+    envelope: &DebeziumEnvelope,
+    input: &Stream<G, DecodeResult>,
+    debug_name: String,
+) -> Stream<G, (Result<Row, DataflowError>, Timestamp, Diff)>
+where
+    G: Scope<Timestamp = Timestamp>,
+{
+    let (before_idx, after_idx) = (envelope.before_idx, envelope.after_idx);
+
+    let result_stream = input.unary(Pipeline, "envelope-debezium", move |_, _| {
+        let mut dedup_state = HashMap::new();
+        let envelope = envelope.clone();
+        let mut data = vec![];
+
+        move |input, output| {
+            while let Some((cap, refmut_data)) = input.next() {
+                let mut session = output.session(&cap);
+                refmut_data.swap(&mut data);
+                for result in data.drain(..) {
+                    let key = match result.key.transpose() {
+                        Ok(key) => key,
+                        Err(err) => {
+                            session.give((Err(err.into()), cap.time().clone(), 1));
+                            continue;
+                        }
+                    };
+                    let value = match result.value {
+                        Some(Ok(value)) => value,
+                        Some(Err(err)) => {
+                            session.give((Err(err.into()), cap.time().clone(), 1));
+                            continue;
+                        }
+                        None => continue,
+                    };
+
+                    let partition_dedup = dedup_state
+                        .entry(result.partition.clone())
+                        .or_insert_with(|| DebeziumDeduplicationState::new(envelope.clone()));
+                    let should_use = match partition_dedup {
+                        Some(ref mut s) => {
+                            let (res, state_mutations) = s.should_use_record(
+                                key,
+                                &value,
+                                result.position,
+                                result.upstream_time_millis,
+                                &debug_name,
+                            );
+
+                            println!("Debezium state mutations: {:?}", state_mutations);
+                            s.apply_mutations(state_mutations);
+
+                            match res {
+                                Ok(b) => b,
                                 Err(err) => {
                                     session.give((Err(err.into()), cap.time().clone(), 1));
                                     continue;
                                 }
-                            };
-                            let value = match result.value {
-                                Some(Ok(value)) => value,
-                                Some(Err(err)) => {
-                                    session.give((Err(err.into()), cap.time().clone(), 1));
-                                    continue;
-                                }
-                                None => continue,
-                            };
-
-                            let partition_dedup = dedup_state
-                                .entry(result.partition.clone())
-                                .or_insert_with(|| {
-                                    DebeziumDeduplicationState::new(envelope.clone())
-                                });
-                            let should_use = match partition_dedup {
-                                Some(ref mut s) => {
-                                    let (res, state_mutations) = s.should_use_record(
-                                        key,
-                                        &value,
-                                        result.position,
-                                        result.upstream_time_millis,
-                                        &debug_name,
-                                    );
-
-                                    println!("Debezium state mutations: {:?}", state_mutations);
-                                    s.apply_mutations(state_mutations);
-
-                                    match res {
-                                        Ok(b) => b,
-                                        Err(err) => {
-                                            session.give((Err(err.into()), cap.time().clone(), 1));
-                                            continue;
-                                        }
-                                    }
-                                }
-                                None => true,
-                            };
-
-                            if should_use {
-                                match value.iter().nth(before_idx).unwrap() {
-                                    Datum::List(l) => {
-                                        session.give((Ok(Row::pack(&l)), cap.time().clone(), -1))
-                                    }
-                                    Datum::Null => {}
-                                    d => panic!("type error: expected record, found {:?}", d),
-                                }
-                                match value.iter().nth(after_idx).unwrap() {
-                                    Datum::List(l) => {
-                                        session.give((Ok(Row::pack(&l)), cap.time().clone(), 1))
-                                    }
-                                    Datum::Null => {}
-                                    d => panic!("type error: expected record, found {:?}", d),
-                                }
                             }
+                        }
+                        None => true,
+                    };
+
+                    if should_use {
+                        match value.iter().nth(before_idx).unwrap() {
+                            Datum::List(l) => {
+                                session.give((Ok(Row::pack(&l)), cap.time().clone(), -1))
+                            }
+                            Datum::Null => {}
+                            d => panic!("type error: expected record, found {:?}", d),
+                        }
+                        match value.iter().nth(after_idx).unwrap() {
+                            Datum::List(l) => {
+                                session.give((Ok(Row::pack(&l)), cap.time().clone(), 1))
+                            }
+                            Datum::Null => {}
+                            d => panic!("type error: expected record, found {:?}", d),
                         }
                     }
                 }
-            })
-            .as_collection(),
-    }
+            }
+        }
+    });
+
+    result_stream
 }
 
 /// Track whether or not we should skip a specific debezium message
