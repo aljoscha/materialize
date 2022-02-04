@@ -944,8 +944,16 @@ mod tests {
         Ok(())
     }
 
+    // TODO: I could remove all the complicated channel logic, the multiple downgrades and
+    // interleaved stepping, because I don't think we can verify ordering.
+    //
+    // Verify that seal works correctly when sealing multiple streams and when using probe handles
+    // to further restrict the input frontier.
+    //
+    // NOTE: We know by construction of the MultiWriteHandle that we seal atomically, and we cannot
+    // realistically assert on the order we get from the channels.
     #[test]
-    fn seal_multiple() -> Result<(), Error> {
+    fn seal_multiple_streams() -> Result<(), Error> {
         ore::test::init_logging();
         let mut registry = MemRegistry::new();
 
@@ -1091,44 +1099,23 @@ mod tests {
         let actual_seals: Vec<_> = listen_rx.try_iter().collect();
 
         // Assert that:
-        //  a) We seal primary and condition to t before sealing either to t' > t. In practice,
-        //  this means we expect to see pairs of (Primary,Condition) or (Condition,Primary) in the
-        //  output, when chunked into 2-chunks.
-        //  b) We seal up, even when never receiving any data.
-        //  c) Seals happen in timestamp order.
+        //  a) We seal up, even when never receiving any data.
+        //  b) Seals happen in timestamp order.
         //
         // We cannot assert a specific seal ordering because the order is not deterministic.
 
         let mut condition_seals = vec![];
         let mut primary_seals = vec![];
 
-        let seal_pairs = actual_seals.chunks(2);
-
-        for seal_pair in seal_pairs {
-            let seal_pair = match seal_pair {
-                &[seal1, seal2] => (seal1, seal2),
-                _ => unreachable!(),
-            };
-
-            let (condition_ts, primary_ts) = match seal_pair {
-                (Sealed::Condition(condition_ts), Sealed::Primary(primary_ts)) => {
-                    (condition_ts, primary_ts)
+        for seal in actual_seals {
+            match seal {
+                Sealed::Primary(ts) => {
+                    primary_seals.push(ts);
                 }
-                (Sealed::Primary(primary_ts), Sealed::Condition(condition_ts)) => {
-                    (condition_ts, primary_ts)
+                Sealed::Condition(ts) => {
+                    condition_seals.push(ts);
                 }
-                (Sealed::Primary(_), Sealed::Primary(_)) => {
-                    panic!("invalid seal ordering: {:?}", actual_seals)
-                }
-                (Sealed::Condition(_), Sealed::Condition(_)) => {
-                    panic!("invalid seal ordering: {:?}", actual_seals)
-                }
-            };
-
-            assert_eq!(condition_ts, primary_ts);
-
-            condition_seals.push(condition_ts);
-            primary_seals.push(primary_ts);
+            }
         }
 
         // Check that the seal values for each collection are exactly what
@@ -1139,101 +1126,32 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn seal_multiple_frontier_advance_only_on_success() -> Result<(), Error> {
-        ore::test::init_logging();
-        let mut registry = MemRegistry::new();
-        let mut unreliable = UnreliableHandle::default();
-        let p = registry.runtime_unreliable(unreliable.clone())?;
-
-        timely::execute_directly(move |worker| {
-            let (mut primary_input, mut condition_input, seal_probe) = worker.dataflow(|scope| {
-                let (primary_write, _read) = p.create_or_load::<(), ()>("primary");
-                let (condition_write, _read) = p.create_or_load::<(), ()>("condition");
-                let mut primary_input: Handle<u64, ((), u64, isize)> = Handle::new();
-                let mut condition_input = Handle::new();
-                let primary_stream = primary_input.to_stream(scope);
-                let condition_stream = condition_input.to_stream(scope);
-
-                let mut multi_write = MultiWriteHandle::new(&primary_write);
-                multi_write
-                    .add_stream(&condition_write)
-                    .expect("client known from same runtime");
-
-                let sealed_stream =
-                    primary_stream.seal("test", vec![condition_stream.probe()], multi_write);
-
-                let seal_probe = sealed_stream.probe();
-
-                (primary_input, condition_input, seal_probe)
-            });
-
-            condition_input.send((((), ()), 0, 1));
-
-            primary_input.advance_to(1);
-            condition_input.advance_to(1);
-            while seal_probe.less_than(&1) {
-                worker.step();
-            }
-
-            unreliable.make_unavailable();
-
-            primary_input.advance_to(2);
-            condition_input.advance_to(2);
-
-            // This is the best we can do. Wait for a bit, and verify that the frontier didn't
-            // advance. Of course, we cannot rule out that the frontier might advance on the 11th
-            // step, but tests without the fix showed the test to be very unstable on this
-            for _i in 0..10 {
-                worker.step();
-            }
-            assert!(seal_probe.less_than(&2));
-
-            // After we make the runtime available again, sealing will work and the frontier will
-            // advance.
-            unreliable.make_available();
-            while seal_probe.less_than(&2) {
-                worker.step();
-            }
-        });
-
-        Ok(())
-    }
-
     // Test using multiple workers and ensure that `seal()` doesn't block the frontier for
     // non-active seal operators.
     //
     // A failure in this test would manifest as indefinite hanging of the test, we never see the
     // frontier advance as we expect to.
     #[test]
-    fn seal_multiple_multiple_workers() -> Result<(), Error> {
+    fn seal_multiple_workers() -> Result<(), Error> {
         let mut registry = MemRegistry::new();
         let p = registry.runtime_no_reentrance()?;
 
         let guards = timely::execute(Config::process(3), move |worker| {
-            let (mut primary_input, mut condition_input, seal_probe) = worker.dataflow(|scope| {
-                let (primary_write, _read) = p.create_or_load::<(), ()>("primary");
-                let (condition_write, _read) = p.create_or_load::<(), ()>("condition");
-                let mut primary_input: Handle<u64, ((), u64, isize)> = Handle::new();
-                let mut condition_input: Handle<u64, ((), u64, isize)> = Handle::new();
-                let primary_stream = primary_input.to_stream(scope);
-                let condition_stream = condition_input.to_stream(scope);
+            let (mut input, seal_probe) = worker.dataflow(|scope| {
+                let (write, _read) = p.create_or_load::<(), ()>("primary");
+                let mut input: Handle<u64, ((), u64, isize)> = Handle::new();
+                let stream = input.to_stream(scope);
 
-                let mut multi_write = MultiWriteHandle::new(&primary_write);
-                multi_write
-                    .add_stream(&condition_write)
-                    .expect("client known from same runtime");
+                let multi_write = MultiWriteHandle::new(&write);
 
-                let sealed_stream =
-                    primary_stream.seal("test", vec![condition_stream.probe()], multi_write);
+                let sealed_stream = stream.seal("test", vec![], multi_write);
 
                 let seal_probe = sealed_stream.probe();
 
-                (primary_input, condition_input, seal_probe)
+                (input, seal_probe)
             });
 
-            primary_input.advance_to(42);
-            condition_input.advance_to(42);
+            input.advance_to(42);
             while seal_probe.less_than(&42) {
                 worker.step();
             }
