@@ -9,6 +9,8 @@ rust-version = "1.58.0"
 [dependencies]
 aho-corasick = "0.7.18"
 anyhow = "1.0.52"
+bincode = "1.3.3"
+bytes = "1.1.0"
 chrono = { version = "0.4.0", default-features = false, features = ["clock", "std"] }
 csv = "1.1.6"
 dec = "0.4.8"
@@ -25,6 +27,7 @@ num = "0.4.0"
 num-iter = "0.1.42"
 ordered-float = { version = "2.10.0", features = ["serde"] }
 ore = { path = "../ore" }
+persist-types = { path = "../persist-types" }
 pdqselect = "0.1.1"
 pgrepr = { path = "../pgrepr" }
 regex = "1.5.4"

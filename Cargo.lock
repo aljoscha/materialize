@@ -1839,6 +1839,8 @@ version = "0.0.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
+ "bincode",
+ "bytes",
  "chrono",
  "csv",
  "datadriven",
@@ -1859,6 +1861,7 @@ dependencies = [
  "ore",
  "paste",
  "pdqselect",
+ "persist-types",
  "pgrepr",
  "proc-macro2",
  "regex",

@@ -11,7 +11,10 @@ use std::fmt;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Error};
+use bytes::BufMut;
 use serde::{Deserialize, Serialize};
+
+use persist_types::Codec;
 
 /// An opaque identifier for a dataflow component. In other words, identifies
 /// the target of a [`MirRelationExpr::Get`](crate::MirRelationExpr::Get).
@@ -137,6 +140,25 @@ pub enum PartitionId {
     None,
 }
 
+impl Codec for PartitionId {
+    fn codec_name() -> String {
+        "PartitionId[serde]".to_string()
+    }
+
+    fn encode<B>(&self, buf: &mut B)
+    where
+        B: BufMut,
+    {
+        let serialized = bincode::serialize(&self).unwrap();
+        buf.put(&serialized[..]);
+    }
+
+    fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
+        let deserialized: Self = bincode::deserialize(buf).map_err(|e| format!("{}", e))?;
+        Ok(deserialized)
+    }
+}
+
 impl fmt::Display for PartitionId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -166,5 +188,24 @@ impl FromStr for PartitionId {
                 Ok(PartitionId::Kafka(val))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use persist_types::Codec;
+
+    #[test]
+    fn test_partition_id_roundtrip() -> Result<(), String> {
+        let original = PartitionId::Kafka(42);
+        let mut encoded = Vec::new();
+        original.encode(&mut encoded);
+        let decoded = PartitionId::decode(&encoded)?;
+
+        assert_eq!(decoded, original);
+
+        Ok(())
     }
 }
