@@ -819,17 +819,7 @@ where
         .add_stream(&bindings_write)
         .expect("handles known to be from same persist runtime");
 
-    // Create a data dependency between `bindings_stream` and `stream`, so that their frontiers
-    // combine. This makes sure that we seal up both streams to the minimum (or meet) of their
-    // frontiers.
-    //
-    // NOTE: The alternative to this is creating a `seal()` operator that can directly take in
-    // multiple streams and combine their frontiers "by hand". This is tricky, though, because
-    // those streams have differing types, so we would have to use a Builder pattern for that
-    // operator. Might be worthwhile doing that.
-    let stream = stream.concat(&bindings_stream.flat_map(|_| None));
-
-    let sealed_stream = stream.seal(&source_name, seal_handle);
+    let sealed_stream = stream.seal(&source_name, vec![bindings_stream.probe()], seal_handle);
 
     // The compaction since of persisted sources is upper-bounded by two frontiers: a) the
     // compaction that the coordinator allows, and b) the seal frontier of the involved persistent

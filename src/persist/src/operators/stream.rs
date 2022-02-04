@@ -26,6 +26,7 @@ use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
 use timely::dataflow::operators::CapabilitySet;
 use timely::dataflow::operators::Operator;
 use timely::dataflow::operators::{Branch, Concat, Map};
+use timely::dataflow::ProbeHandle;
 use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
 use timely::progress::Timestamp as TimelyTimestamp;
@@ -176,14 +177,20 @@ where
 /// Extension trait for [`Stream`].
 pub trait Seal<G: Scope<Timestamp = u64>, D: TimelyData> {
     /// Passes through each element of the stream and calls
-    /// [`seal_all`](MultiWriteHandle::seal_all) on the given [`MultiWriteHandle`] when the input
-    /// frontier advances.
+    /// [`seal_all`](MultiWriteHandle::seal_all) on the given [`MultiWriteHandle`] when the
+    /// combined input frontier advances advances. The combined input frontier is derived by
+    /// combining the frontier of the input with the optional [`ProbeHandles`](ProbeHandle).
     ///
     /// This does not wait for the seal to succeed before passing through the data. We do, however,
     /// wait for the seal to be successful before allowing the frontier to advance. In other words,
     /// this operator is holding on to capabilities as long as seals corresponding to their
     /// timestamp are not done.
-    fn seal(&self, name: &str, write: MultiWriteHandle) -> Stream<G, (D, u64, isize)>;
+    fn seal(
+        &self,
+        name: &str,
+        additional_frontiers: Vec<ProbeHandle<u64>>,
+        write: MultiWriteHandle,
+    ) -> Stream<G, (D, u64, isize)>;
 }
 
 impl<G, D> Seal<G, D> for Stream<G, (D, u64, isize)>
@@ -191,7 +198,12 @@ where
     G: Scope<Timestamp = u64>,
     D: TimelyData,
 {
-    fn seal(&self, name: &str, write: MultiWriteHandle) -> Stream<G, (D, u64, isize)> {
+    fn seal(
+        &self,
+        name: &str,
+        additional_frontiers: Vec<ProbeHandle<u64>>,
+        write: MultiWriteHandle,
+    ) -> Stream<G, (D, u64, isize)> {
         let operator_name = format!("seal({})", name);
         let mut seal_op = OperatorBuilder::new(operator_name.clone(), self.scope());
 
@@ -211,11 +223,18 @@ where
         // workers, or to use a non-timely solution for keeping track of outstanding write
         // capabilities.
         let active_seal_operator = self.scope().index() == 0;
+
         // An activator that allows futures to re-schedule this operator when ready.
-        let activator = Arc::new(
+        let sync_activator = Arc::new(
             self.scope()
                 .sync_activator_for(&seal_op.operator_info().address[..]),
         );
+
+        // A cheaper (non-thread-safe) activator that we use to re-schedule ourselves in case the
+        // frontier as reported by the probe handles has not advances as far as the input frontier.
+        let activator = self
+            .scope()
+            .activator_for(&seal_op.operator_info().address[..]);
 
         let mut pending_futures = VecDeque::new();
 
@@ -244,6 +263,20 @@ where
 
                 let mut new_input_frontier = Antichain::new();
                 new_input_frontier.extend(frontiers[0].frontier().into_iter().cloned());
+
+                for probe_frontier in additional_frontiers.iter() {
+                    probe_frontier.with_frontier(|frontier| {
+                        new_input_frontier.extend(frontier.iter().cloned())
+                    });
+                }
+
+                if PartialOrder::less_than(&new_input_frontier.borrow(), &frontiers[0].frontier()) {
+                    // Immediately schedule again, to see if the probe frontiers to catch up.
+                    activator.activate();
+                    // TODO: This is essentially as busy loop. We could use `activate_after()`, or
+                    // not use activate at all and rely on the fact that the frontiers usually
+                    // advance to the same times because they come from a common source.
+                }
 
                 // We seal for every element in the new frontier that represents progress compared
                 // to the old frontier. Alternatively, we could always seal to the current
@@ -274,7 +307,7 @@ where
                 // Swing through all pending futures and see if they're ready. Ready futures will
                 // invoke the Activator, which will make sure that we arrive here, even when there
                 // are no changes in the input frontier or new input.
-                let waker = futures_util::task::waker_ref(&activator);
+                let waker = futures_util::task::waker_ref(&sync_activator);
                 let mut context = Context::from_waker(&waker);
 
                 while let Some(mut pending_future) = pending_futures.pop_front() {
@@ -343,7 +376,7 @@ where
                 // all the capabilities so that downstream operators and eventually the worker can
                 // shut down. We also need to clear all pending futures to make sure we never
                 // attempt to downgrade any more capabilities.
-                if input_frontier.is_empty() {
+                if frontiers[0].is_empty() {
                     cap_set.downgrade(input_frontier.iter());
                     pending_futures.clear();
                 }
@@ -781,7 +814,7 @@ mod tests {
                 let (write, _read) = p.create_or_load::<(), ()>("1");
                 let write = MultiWriteHandle::new(&write);
                 let mut input = Handle::new();
-                let ok_stream = input.to_stream(scope).seal("test", write);
+                let ok_stream = input.to_stream(scope).seal("test", vec![], write);
                 let probe = ok_stream.probe();
                 (input, probe)
             });
@@ -813,7 +846,7 @@ mod tests {
                 let mut input = Handle::new();
                 let stream = input.to_stream(scope);
 
-                let sealed_stream = stream.seal("test", write);
+                let sealed_stream = stream.seal("test", vec![], write);
 
                 let seal_probe = sealed_stream.probe();
 
@@ -870,7 +903,7 @@ mod tests {
                 let mut placeholder = Handle::new();
                 let placeholder_stream = placeholder.to_stream(scope);
 
-                let sealed_stream = stream.seal("test", write);
+                let sealed_stream = stream.seal("test", vec![], write);
 
                 let stream = placeholder_stream.concat(&sealed_stream);
                 let probe = stream.probe();
@@ -987,11 +1020,8 @@ mod tests {
                     .add_stream(&condition_write)
                     .expect("client known from same runtime");
 
-                // create a data dependency without sending any data, just to create an edge that
-                // ties the frontiers together.
-                let primary_stream = primary_stream.concat(&condition_stream.flat_map(|_| None));
-
-                let sealed_stream = primary_stream.seal("test", multi_write);
+                let sealed_stream =
+                    primary_stream.seal("test", vec![condition_stream.probe()], multi_write);
 
                 let seal_probe = sealed_stream.probe();
 
@@ -1130,11 +1160,8 @@ mod tests {
                     .add_stream(&condition_write)
                     .expect("client known from same runtime");
 
-                // Create a data dependency without sending any data, just to create an edge that
-                // ties the frontiers together.
-                let primary_stream = primary_stream.concat(&condition_stream.flat_map(|_| None));
-
-                let sealed_stream = primary_stream.seal("test", multi_write);
+                let sealed_stream =
+                    primary_stream.seal("test", vec![condition_stream.probe()], multi_write);
 
                 let seal_probe = sealed_stream.probe();
 
@@ -1197,11 +1224,8 @@ mod tests {
                     .add_stream(&condition_write)
                     .expect("client known from same runtime");
 
-                // Create a data dependency without sending any data, just to create an edge that
-                // ties the frontiers together.
-                let primary_stream = primary_stream.concat(&condition_stream.flat_map(|_| None));
-
-                let sealed_stream = primary_stream.seal("test", multi_write);
+                let sealed_stream =
+                    primary_stream.seal("test", vec![condition_stream.probe()], multi_write);
 
                 let seal_probe = sealed_stream.probe();
 
