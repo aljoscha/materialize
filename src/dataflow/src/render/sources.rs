@@ -38,6 +38,7 @@ use crate::decode::render_decode;
 use crate::decode::render_decode_delimited;
 use crate::logging::materialized::Logger;
 use crate::operator::{CollectionExt, StreamExt};
+use crate::render::debezium::{DebeziumStateUpdate, PersistentDebeziumConfig};
 use crate::render::envelope_none;
 use crate::render::envelope_none::PersistentEnvelopeNoneConfig;
 use crate::render::StorageState;
@@ -686,6 +687,9 @@ impl<K: Codec, V: Codec, ST: Codec, AT: Codec> PersistentSourceConfig<K, V, ST, 
             PersistentEnvelopeConfig::EnvelopeNone(_) => {
                 panic!("source is not an ENVELOPE UPSERT source but an ENVELOPE NONE source")
             }
+            PersistentEnvelopeConfig::Debezium(_) => {
+                panic!("source is not an ENVELOPE UPSERT source but an ENVELOPE DEBEZIUM source")
+            }
         }
     }
 
@@ -695,6 +699,22 @@ impl<K: Codec, V: Codec, ST: Codec, AT: Codec> PersistentSourceConfig<K, V, ST, 
                 panic!("source is not an ENVELOPE NONE source but an ENVELOPE UPSERT source")
             }
             PersistentEnvelopeConfig::EnvelopeNone(ref config) => config,
+            PersistentEnvelopeConfig::Debezium(_) => {
+                panic!("source is not an ENVELOPE NONE source but an ENVELOPE DEBEZIUM source")
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn debezium_config(&self) -> &PersistentDebeziumConfig<V> {
+        match self.envelope_config {
+            PersistentEnvelopeConfig::Upsert(_) => {
+                panic!("source is not an ENVELOPE DEBEZIUM source but an ENVELOPE UPSERT source")
+            }
+            PersistentEnvelopeConfig::EnvelopeNone(_) => {
+                panic!("source is not an ENVELOPE DEBEZIUM source but an ENVELOPE NONE source")
+            }
+            PersistentEnvelopeConfig::Debezium(ref config) => config,
         }
     }
 }
@@ -704,6 +724,7 @@ impl<K: Codec, V: Codec, ST: Codec, AT: Codec> PersistentSourceConfig<K, V, ST, 
 pub enum PersistentEnvelopeConfig<K: Codec, V: Codec> {
     Upsert(PersistentUpsertConfig<K, V>),
     EnvelopeNone(PersistentEnvelopeNoneConfig<V>),
+    Debezium(PersistentDebeziumConfig<V>),
 }
 
 // TODO: Now it gets really obvious how the current way of structuring the persist information is
@@ -775,6 +796,40 @@ fn get_persist_config(
             PersistentSourceConfig::new(
                 bindings_config,
                 PersistentEnvelopeConfig::EnvelopeNone(none_config),
+            )
+        }
+        EnvelopePersistDesc::Debezium { dedup_state_stream } => {
+            let (data_write, data_read) = persist_client
+                .create_or_load::<Result<Row, DecodeError>, ()>(&persist_desc.primary_stream);
+
+            let (dedup_state_write, dedup_state_read) = persist_client
+                .create_or_load::<PartitionId, DebeziumStateUpdate>(&dedup_state_stream);
+
+            let seal_ts = persist_desc.upper_seal_ts;
+
+            tracing::debug!(
+                "Persistent collections for source {}: data: {:?}, timestamp bindings: {:?}, dedup state: {:?}. Upper seal timestamp: {}.",
+                source_id,
+                persist_desc.primary_stream,
+                persist_desc.timestamp_bindings_stream,
+                dedup_state_stream,
+                seal_ts,
+            );
+
+            let bindings_config =
+                PersistentTimestampBindingsConfig::new(seal_ts, bindings_read, bindings_write);
+
+            let debezium_config = PersistentDebeziumConfig::new(
+                seal_ts,
+                data_read,
+                data_write,
+                dedup_state_read,
+                dedup_state_write,
+            );
+
+            PersistentSourceConfig::new(
+                bindings_config,
+                PersistentEnvelopeConfig::Debezium(debezium_config),
             )
         }
     }

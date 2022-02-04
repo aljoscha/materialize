@@ -19,7 +19,7 @@ use timely::progress::Timestamp;
 use build_info::BuildInfo;
 use dataflow_types::sources::{
     persistence::{EnvelopePersistDesc, SourcePersistDesc},
-    ExternalSourceConnector, SourceConnector, SourceEnvelope,
+    DebeziumEnvelope, DebeziumMode, ExternalSourceConnector, SourceConnector, SourceEnvelope,
 };
 use itertools::Itertools;
 use ore::metrics::MetricsRegistry;
@@ -364,6 +364,41 @@ impl PersisterWithConfig {
             }),
             SourceConnector::External {
                 connector: ExternalSourceConnector::Kafka(_),
+                envelope:
+                    SourceEnvelope::Debezium(DebeziumEnvelope {
+                        mode: DebeziumMode::Upsert,
+                        ..
+                    }),
+                ..
+            } => {
+                panic!("Kafka Source persistence not yet implemented for DEBEZIUM UPSERT");
+            }
+            SourceConnector::External {
+                connector: ExternalSourceConnector::Kafka(_),
+                envelope:
+                    SourceEnvelope::Debezium(DebeziumEnvelope {
+                        mode:
+                            DebeziumMode::None
+                            | DebeziumMode::Ordered(_)
+                            | DebeziumMode::Full(_)
+                            | DebeziumMode::FullInRange { .. },
+                        ..
+                    }),
+                ..
+            } => {
+                let dedup_state_stream = format!("{}-debezium-dedup", name_prefix);
+                let result = Some(SerializedSourcePersistDetails {
+                    primary_stream,
+                    timestamp_bindings_stream,
+                    envelope_details: crate::catalog::SerializedEnvelopePersistDetails::Debezium {
+                        dedup_state_stream,
+                    },
+                });
+
+                result
+            }
+            SourceConnector::External {
+                connector: ExternalSourceConnector::Kafka(_),
                 envelope,
                 ..
             } => {
@@ -392,6 +427,17 @@ impl PersisterWithConfig {
         };
 
         let details = persist_details.as_ref().map(|serialized_details| {
+            // TODO: We might want to add (or change) a get_description() that allows getting the
+            // descriptions for a batch of IDs in one go instead of getting them all separately. It
+            // shouldn't be an issue right now, though.
+            let (primary_stream, primary_since, primary_upper) =
+                stream_desc_from_name(serialized_details.primary_stream.clone(), runtime)?;
+            let (timestamp_bindings_stream, timestamp_bindings_since, timestamp_bindings_upper) =
+                stream_desc_from_name(
+                    serialized_details.timestamp_bindings_stream.clone(),
+                    runtime,
+                )?;
+
             let envelope_desc = match connector {
                 SourceConnector::External {
                     envelope: SourceEnvelope::Upsert(_),
@@ -415,6 +461,38 @@ impl PersisterWithConfig {
                     EnvelopePersistDesc::None
                 }
 
+                SourceConnector::External {
+                    envelope: SourceEnvelope::Debezium(_),
+                    ..
+                } => {
+                    let dedup_state_stream =
+                        if let SerializedEnvelopePersistDetails::Debezium { dedup_state_stream } =
+                            serialized_details.envelope_details.clone()
+                        {
+                            dedup_state_stream
+                        } else {
+                            panic!(
+                                "unexpected envelope persist details: {:?}",
+                                serialized_details.envelope_details
+                            );
+                        };
+
+                    let (dedup_state_stream, state_since, state_upper) =
+                        stream_desc_from_name(dedup_state_stream, runtime)?;
+
+                    // Assert invariants!
+                    assert_eq!(
+                        primary_since, state_since,
+                        "the since of all involved streams must be the same"
+                    );
+                    assert_eq!(
+                        primary_upper, state_upper,
+                        "the upper of all involved streams must be the same"
+                    );
+
+                    EnvelopePersistDesc::Debezium { dedup_state_stream }
+                }
+
                 SourceConnector::External { envelope, .. } => {
                     return Err(format!("unsupported envelope: {:?}", envelope).into());
                 }
@@ -427,17 +505,6 @@ impl PersisterWithConfig {
                     .into());
                 }
             };
-
-            // TODO: We might want to add (or change) a get_description() that allows getting the
-            // descriptions for a batch of IDs in one go instead of getting them all separately. It
-            // shouldn't be an issue right now, though.
-            let (primary_stream, primary_since, primary_upper) =
-                stream_desc_from_name(serialized_details.primary_stream.clone(), runtime)?;
-            let (timestamp_bindings_stream, timestamp_bindings_since, timestamp_bindings_upper) =
-                stream_desc_from_name(
-                    serialized_details.timestamp_bindings_stream.clone(),
-                    runtime,
-                )?;
 
             // Assert invariants!
             assert_eq!(

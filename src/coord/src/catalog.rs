@@ -2514,6 +2514,7 @@ pub struct SerializedSourcePersistDetails {
 pub enum SerializedEnvelopePersistDetails {
     Upsert,
     None,
+    Debezium { dedup_state_stream: String },
 }
 
 impl From<SourcePersistDesc> for SerializedSourcePersistDetails {
@@ -2531,6 +2532,9 @@ impl From<EnvelopePersistDesc> for SerializedEnvelopePersistDetails {
         match persist_desc {
             EnvelopePersistDesc::Upsert => SerializedEnvelopePersistDetails::Upsert,
             EnvelopePersistDesc::None => SerializedEnvelopePersistDetails::None,
+            EnvelopePersistDesc::Debezium { dedup_state_stream } => {
+                SerializedEnvelopePersistDetails::Debezium { dedup_state_stream }
+            }
         }
     }
 }

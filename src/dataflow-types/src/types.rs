@@ -621,6 +621,7 @@ pub mod sources {
         pub enum EnvelopePersistDesc {
             Upsert,
             None,
+            Debezium { dedup_state_stream: String },
         }
 
         /// Structure wrapping a timestamp update from a source

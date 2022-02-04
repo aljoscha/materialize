@@ -27,11 +27,50 @@ use dataflow_types::{
     sources::{DebeziumDedupProjection, DebeziumEnvelope, DebeziumMode, DebeziumSourceProjection},
     DataflowError, DecodeError,
 };
-use expr::GlobalId;
+use expr::{GlobalId, PartitionId};
+use persist::client::{StreamReadHandle, StreamWriteHandle};
 use repr::{Datum, Diff, Row};
 
 use crate::metrics::Metrics;
 use crate::source::DecodeResult;
+
+/// Persist configuration for `ENVELOPE DEBEZIUM` (no upsert) sources.
+#[derive(Debug, Clone)]
+pub struct PersistentDebeziumConfig<V: Codec> {
+    /// The timestamp up to which which data should be read when restoring.
+    pub upper_seal_ts: u64,
+
+    /// [`StreamReadHandle`] for the collection that we should persist to.
+    pub data_read: StreamReadHandle<V, ()>,
+
+    /// [`StreamWriteHandle`] for the collection that we should persist to.
+    pub data_write: StreamWriteHandle<V, ()>,
+
+    /// [`StreamReadHandle`] for the collection that we should persist to.
+    pub dedup_state_read: StreamReadHandle<PartitionId, DebeziumStateUpdate>,
+
+    /// [`StreamWriteHandle`] for the collection that we should persist to.
+    pub dedup_state_write: StreamWriteHandle<PartitionId, DebeziumStateUpdate>,
+}
+
+impl<V: Codec> PersistentDebeziumConfig<V> {
+    /// Creates a new [`PersistendDebeziumConfig`] from the given parts.
+    pub fn new(
+        upper_seal_ts: u64,
+        data_read: StreamReadHandle<V, ()>,
+        data_write: StreamWriteHandle<V, ()>,
+        dedup_state_read: StreamReadHandle<PartitionId, DebeziumStateUpdate>,
+        dedup_state_write: StreamWriteHandle<PartitionId, DebeziumStateUpdate>,
+    ) -> Self {
+        PersistentDebeziumConfig {
+            upper_seal_ts,
+            data_read,
+            data_write,
+            dedup_state_read,
+            dedup_state_write,
+        }
+    }
+}
 
 pub(crate) fn render<G: Scope>(
     envelope: &DebeziumEnvelope,
