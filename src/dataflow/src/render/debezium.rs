@@ -11,10 +11,13 @@ use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
+use bytes::BufMut;
 use chrono::format::{DelayedFormat, StrftimeItems};
 use chrono::NaiveDateTime;
 use differential_dataflow::AsCollection;
 use differential_dataflow::Collection;
+use persist_types::Codec;
+use serde::{Deserialize, Serialize};
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::Operator;
 use timely::dataflow::{Scope, Stream};
@@ -254,6 +257,25 @@ impl Default for DebeziumStateUpdate {
     }
 }
 
+impl Codec for DebeziumStateUpdate {
+    fn codec_name() -> String {
+        "DebeziumStateUpdate[serde]".to_string()
+    }
+
+    fn encode<B>(&self, buf: &mut B)
+    where
+        B: BufMut,
+    {
+        let serialized = bincode::serialize(&self).unwrap();
+        buf.put(&serialized[..]);
+    }
+
+    fn decode<'a>(buf: &'a [u8]) -> Result<Self, String> {
+        let deserialized: Self = bincode::deserialize(buf).map_err(|e| format!("{}", e))?;
+        Ok(deserialized)
+    }
+}
+
 /// If we need to deal with debezium possibly going back after it hasn't seen things.
 /// During normal (non-snapshot) operation, we deduplicate based on binlog position: (pos, row), for MySQL.
 /// During the initial snapshot, (pos, row) values are all the same, but primary keys
@@ -342,7 +364,7 @@ impl TrackFull {
 }
 
 /// See <https://rusanu.com/2012/01/17/what-is-an-lsn-log-sequence-number/>
-#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct SqlServerLsn {
     file_seq_num: u32,
     log_block_offset: u32,
@@ -375,7 +397,7 @@ impl FromStr for SqlServerLsn {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum RowCoordinates {
     MySql {
         file: i64,
@@ -1296,5 +1318,41 @@ mod tests {
         assert_eq!(reconstructed_state.messages_processed, 3);
         let track_full = reconstructed_state.full.as_mut().unwrap();
         assert_eq!(track_full.seen_snapshot_keys.len(), 2);
+    }
+
+    #[test]
+    fn debezium_state_update_roundtrip_smoketest() -> Result<(), String> {
+        let original = DebeziumStateUpdate {
+            num_messages_processed: 22,
+            last_position_and_offset: Some((
+                RowCoordinates::Postgres {
+                    last_commit_lsn: None,
+                    lsn: 3,
+                    total_order: None,
+                },
+                Some(13),
+            )),
+            max_seen_time: 18,
+            seen_position: Some((
+                RowCoordinates::Postgres {
+                    last_commit_lsn: None,
+                    lsn: 3,
+                    total_order: None,
+                },
+                14,
+            )),
+            started: true,
+            padding_started: false,
+            seen_snapshot_key: Some(Row::pack_slice(&[Datum::Int64(52)])),
+            filename_to_index: Some(("hello".to_string(), 1)),
+        };
+
+        let mut encoded = Vec::new();
+        original.encode(&mut encoded);
+        let decoded = DebeziumStateUpdate::decode(&encoded)?;
+
+        assert_eq!(decoded, original);
+
+        Ok(())
     }
 }
