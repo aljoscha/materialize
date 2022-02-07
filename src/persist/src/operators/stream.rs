@@ -1101,19 +1101,29 @@ mod tests {
         // Assert that:
         //  a) We seal up, even when never receiving any data.
         //  b) Seals happen in timestamp order.
+        //  c) If we seal any of the involved streams to `t` we must seal all streams to `t`.
         //
         // We cannot assert a specific seal ordering because the order is not deterministic.
 
         let mut condition_seals = vec![];
         let mut primary_seals = vec![];
 
-        for seal in actual_seals {
+        let mut latest_condition_seal = 0;
+        let mut latest_primary_seal = 0;
+
+        for seal in actual_seals.iter() {
             match seal {
                 Sealed::Primary(ts) => {
-                    primary_seals.push(ts);
+                    primary_seals.push(*ts);
+                    assert!(*ts >= latest_primary_seal);
+                    latest_primary_seal = *ts;
+                    assert!(actual_seals.contains(&Sealed::Condition(*ts)));
                 }
                 Sealed::Condition(ts) => {
-                    condition_seals.push(ts);
+                    condition_seals.push(*ts);
+                    assert!(*ts >= latest_condition_seal);
+                    latest_condition_seal = *ts;
+                    assert!(actual_seals.contains(&Sealed::Primary(*ts)));
                 }
             }
         }
