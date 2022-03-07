@@ -24,6 +24,7 @@ use tracing::trace;
 
 use crate::logging::LoggingConfig;
 use crate::{
+    sources,
     sources::{MzOffset, SourceDesc},
     DataflowDescription, PeekResponse, SourceInstanceDesc, TailResponse, Update,
 };
@@ -141,6 +142,9 @@ pub struct CreateSourceCommand<T> {
     pub since: Antichain<T>,
     /// Any previously stored timestamp bindings
     pub ts_bindings: Vec<(PartitionId, T, crate::sources::MzOffset)>,
+    /// A description of how to persist the source. The ingester is expected to write incoming
+    /// source data to a persistent collection from which the compute layer can then read.
+    pub persist: Option<sources::persistence::SourcePersistDesc<T>>,
 }
 
 /// Commands related to the ingress and egress of collections.

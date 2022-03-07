@@ -454,12 +454,12 @@ impl Coordinator {
                 // using a single dataflow, we have to make sure the rebuild process re-runs
                 // the same multiple-build dataflow.
                 CatalogItem::Source(source) => {
-                    let since_ts = self
+                    let persist = self
                         .persister
                         .load_source_persist_desc(&source)
-                        .map_err(CoordError::Persistence)?
-                        .map(|p| p.since_ts)
-                        .unwrap_or(0);
+                        .map_err(CoordError::Persistence)?;
+
+                    let since_ts = persist.as_ref().map(|p| p.since_ts).unwrap_or(0);
 
                     // Re-announce the source description.
                     let source_description = self
@@ -480,6 +480,7 @@ impl Coordinator {
                             desc: source_description,
                             since: Antichain::from_elem(since_ts),
                             ts_bindings,
+                            persist,
                         }])
                         .await
                         .unwrap();
@@ -514,6 +515,7 @@ impl Coordinator {
                             desc: source_description,
                             since: Antichain::from_elem(since_ts),
                             ts_bindings: vec![],
+                            persist: None,
                         }])
                         .await
                         .unwrap();
@@ -1952,6 +1954,7 @@ impl Coordinator {
                         desc: source_description,
                         since: Antichain::from_elem(since_ts),
                         ts_bindings: vec![],
+                        persist: None,
                     }])
                     .await
                     .unwrap();
@@ -2037,11 +2040,21 @@ impl Coordinator {
                         .load_timestamp_bindings(source_id)
                         .expect("loading timestamps from coordinator cannot fail");
 
+                    let source = self.catalog.get_by_id(&source_id).source().ok_or_else(|| {
+                        CoordError::Internal(format!("ID {} unexpectedly not a source", source_id))
+                    })?;
+
+                    let persist = self
+                        .persister
+                        .load_source_persist_desc(source)
+                        .map_err(CoordError::Persistence)?;
+
                     source_descriptions.push(CreateSourceCommand {
                         id: source_id,
                         desc: description,
                         since: Antichain::from_elem(since_ts),
                         ts_bindings,
+                        persist,
                     });
                 }
 
