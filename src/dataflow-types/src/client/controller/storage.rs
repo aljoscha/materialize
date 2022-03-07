@@ -25,6 +25,7 @@ use timely::progress::{Antichain, ChangeBatch, Timestamp};
 
 use crate::client::controller::ReadPolicy;
 use crate::client::{Client, Command, CreateSourceCommand, StorageCommand};
+use crate::sources;
 use crate::sources::SourceDesc;
 use crate::Update;
 use mz_expr::GlobalId;
@@ -111,7 +112,11 @@ impl<'a, C: Client<T>, T: Timestamp + Lattice> StorageController<'a, C, T> {
         }
         // Install collection state for each bound source.
         for binding in bindings.iter() {
-            let collection = CollectionState::new(binding.desc.clone(), binding.since.clone());
+            let collection = CollectionState::new(
+                binding.desc.clone(),
+                binding.persist.clone(),
+                binding.since.clone(),
+            );
             self.storage.collections.insert(binding.id, collection);
         }
 
@@ -326,6 +331,11 @@ pub struct CollectionState<T> {
     /// Description with which the source was created, and its initial `since`.
     pub(super) description: (crate::sources::SourceDesc, Antichain<T>),
 
+    // TODO: This might (is!) not the right place to put this, but is convenient now. Maybe...
+    /// A description of how to persist the source. The ingester is expected to write incoming
+    /// source data to a persistent collection from which the compute layer can then read.
+    pub persist: Option<sources::persistence::SourcePersistDesc<T>>,
+
     /// Accumulation of read capabilities for the collection.
     ///
     /// This accumulation will always contain `self.implied_capability`, but may also contain
@@ -346,11 +356,16 @@ pub struct CollectionState<T> {
 
 impl<T: Timestamp> CollectionState<T> {
     /// Creates a new collection state, with an initial read policy valid from `since`.
-    pub fn new(description: SourceDesc, since: Antichain<T>) -> Self {
+    pub fn new(
+        description: SourceDesc,
+        persist: Option<sources::persistence::SourcePersistDesc<T>>,
+        since: Antichain<T>,
+    ) -> Self {
         let mut read_capabilities = MutableAntichain::new();
         read_capabilities.update_iter(since.iter().map(|time| (time.clone(), 1)));
         Self {
             description: (description, since.clone()),
+            persist,
             read_capabilities,
             implied_capability: since.clone(),
             read_policy: ReadPolicy::ValidFrom(since),
