@@ -2691,6 +2691,7 @@ dependencies = [
  "mz-dataflowd",
  "mz-frontegg-auth",
  "mz-http-proxy",
+ "mz-ingest-model",
  "mz-kafka-util",
  "mz-ore",
  "mz-pgrepr",
@@ -2731,6 +2732,8 @@ dependencies = [
  "tokio-openssl",
  "tokio-postgres",
  "tokio-stream",
+ "tonic",
+ "tonic-reflection",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -6045,6 +6048,21 @@ dependencies = [
  "prost-build",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tonic-reflection"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "228cc5aa5d3e6e0624b5f756a7558038ee86428d1d58d8c6e551b389b12cf355"
+dependencies = [
+ "bytes",
+ "prost",
+ "prost-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]

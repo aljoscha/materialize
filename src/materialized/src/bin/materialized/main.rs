@@ -258,6 +258,14 @@ struct Args {
         default_value = "0.0.0.0:6875"
     )]
     listen_addr: SocketAddr,
+    /// The address on which to listen for gRPC connections.
+    #[structopt(
+        long,
+        env = "MZ_GRPC_LISTEN_ADDR",
+        value_name = "HOST:PORT",
+        default_value = "[::1]:50051"
+    )]
+    grpc_listen_addr: SocketAddr,
     /// How stringently to demand TLS authentication and encryption.
     ///
     /// If set to "disable", then materialized rejects HTTP and PostgreSQL
@@ -814,6 +822,7 @@ dataflow workers: {workers}",
         logical_compaction_window: args.logical_compaction_window,
         timestamp_frequency: args.timestamp_frequency,
         listen_addr: args.listen_addr,
+        grpc_listen_addr: args.grpc_listen_addr,
         third_party_metrics_listen_addr: args.third_party_metrics_listen_addr,
         tls,
         frontegg,
@@ -886,9 +895,10 @@ For more details, see https://materialize.com/docs/cli#experimental-mode
     }
 
     println!(
-        "materialized {} listening on {}...",
+        "materialized {} listening on {} and {} (gRPC)...",
         materialized::BUILD_INFO.human_version(),
         server.local_addr(),
+        server.local_grpc_addr(),
     );
 
     // Block forever.

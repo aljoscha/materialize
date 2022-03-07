@@ -48,6 +48,8 @@ hex = "0.4.3"
 http = "0.2.6"
 hyper = { version = "0.14.17", features = ["http1", "server"] }
 hyper-openssl = "0.9.2"
+tonic = "0.6"
+tonic-reflection = "0.3"
 include_dir = "0.7.2"
 itertools = "0.10.3"
 krb5-src = { version = "0.3.2", features = ["binaries"] }
@@ -60,6 +62,7 @@ mz-dataflow-types = { path = "../dataflow-types" }
 mz-dataflowd = { path = "../dataflowd" }
 mz-frontegg-auth = { path = "../frontegg-auth" }
 mz-http-proxy = { path = "../http-proxy", features = ["reqwest"] }
+mz-ingest-model = { path = "../ingest-model" }
 mz-ore = { path = "../ore", features = ["task"] }
 mz-pgwire = { path = "../pgwire" }
 mz-pid-file = { path = "../pid-file" }

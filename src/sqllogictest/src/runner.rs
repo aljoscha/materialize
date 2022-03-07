@@ -553,6 +553,7 @@ impl Runner {
             data_directory: temp_dir.path().to_path_buf(),
             aws_external_id: AwsExternalId::NotProvided,
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            grpc_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             tls: None,
             frontegg: None,
             experimental_mode: true,
