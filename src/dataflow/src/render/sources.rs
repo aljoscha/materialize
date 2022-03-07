@@ -685,7 +685,7 @@ where
                 .ts_source_mapping
                 .entry(src_id)
                 .or_insert_with(Vec::new)
-                .push(Rc::downgrade(&source_token));
+                .push(Rc::clone(&source_token));
 
             needed_tokens.push(source_token);
 
