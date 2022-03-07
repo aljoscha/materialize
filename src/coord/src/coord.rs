@@ -1277,6 +1277,32 @@ impl Coordinator {
                 let _ = tx.send(Response { result, session });
             }
 
+            Command::ListPersistentSources { session, tx } => {
+                // let persistent_sources = self.catalog.persistent_sources();
+                let storage = self.dataflow_client.storage();
+                let collections = storage.collections();
+
+                let result = collections
+                    .filter(|(_id, collection)| collection.persist.is_some())
+                    .map(|(id, collection)| {
+                        (
+                            id.clone(),
+                            collection.description.clone().0,
+                            collection
+                                .persist
+                                .as_ref()
+                                .expect("missing persist description")
+                                .clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                let _ = tx.send(Response {
+                    result: Ok(result),
+                    session,
+                });
+            }
+
             Command::Terminate { mut session } => {
                 self.handle_terminate(&mut session).await;
             }

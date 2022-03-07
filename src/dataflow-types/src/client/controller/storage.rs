@@ -78,6 +78,9 @@ impl<'a, C: Client<T>, T: Timestamp + Lattice> StorageController<'a, C, T> {
             .get(&id)
             .ok_or(StorageError::IdentifierMissing(id))
     }
+    pub fn collections(&self) -> impl Iterator<Item = (&GlobalId, &CollectionState<T>)> {
+        self.storage.collections.iter()
+    }
     /// Create the sources described in the individual CreateSourceCommand commands.
     ///
     /// Each command carries the source id, the  source description, an initial `since` read
@@ -329,7 +332,7 @@ impl<'a, C: Client<T>, T: Timestamp + Lattice> StorageController<'a, C, T> {
 /// State maintained about individual collections.
 pub struct CollectionState<T> {
     /// Description with which the source was created, and its initial `since`.
-    pub(super) description: (crate::sources::SourceDesc, Antichain<T>),
+    pub description: (crate::sources::SourceDesc, Antichain<T>),
 
     // TODO: This might (is!) not the right place to put this, but is convenient now. Maybe...
     /// A description of how to persist the source. The ingester is expected to write incoming

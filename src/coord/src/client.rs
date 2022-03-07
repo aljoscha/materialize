@@ -11,6 +11,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
+use mz_dataflow_types::sources::persistence::SourcePersistDesc;
+use mz_dataflow_types::sources::SourceDesc;
 use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
@@ -483,6 +485,14 @@ impl SessionClient {
             })
         }
         Ok(SimpleExecuteResponse { results })
+    }
+
+    /// Returns a list of all sources that require ingestion/persistence.
+    pub async fn list_persistent_sources(
+        &mut self,
+    ) -> Result<Vec<(GlobalId, SourceDesc, SourcePersistDesc)>, CoordError> {
+        self.send(|tx, session| Command::ListPersistentSources { session, tx })
+            .await
     }
 
     /// Terminates this client session.

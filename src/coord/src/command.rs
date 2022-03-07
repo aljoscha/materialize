@@ -13,6 +13,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use derivative::Derivative;
+use mz_dataflow_types::sources::persistence::SourcePersistDesc;
+use mz_dataflow_types::sources::SourceDesc;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
@@ -92,6 +94,11 @@ pub enum Command {
         rows: Vec<Row>,
         session: Session,
         tx: oneshot::Sender<Response<ExecuteResponse>>,
+    },
+
+    ListPersistentSources {
+        session: Session,
+        tx: oneshot::Sender<Response<Vec<(GlobalId, SourceDesc, SourcePersistDesc)>>>,
     },
 
     Terminate {
