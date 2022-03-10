@@ -91,6 +91,10 @@ where
                                     "replaying persisted data: snapshot since ({:?}) is beyond expected as_of ({:?})",
                                     snapshot_since, as_of_frontier
                                 ))));
+                            panic!(
+                                    "replaying persisted data: snapshot since ({:?}) is beyond expected as_of ({:?})",
+                                    snapshot_since, as_of_frontier
+                                );
                         }
                         Ok((snapshot_since, snapshot_iter)) => {
                             // NB: This `idx` from enumerate resets back to 0
