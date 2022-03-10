@@ -17,28 +17,26 @@ use std::time::Duration;
 use timely::progress::Timestamp;
 
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use tokio::runtime::Runtime as TokioRuntime;
+use url::Url;
+use uuid::Uuid;
+
 use mz_build_info::BuildInfo;
 use mz_dataflow_types::sources::{
     persistence::{EnvelopePersistDesc, SourcePersistDesc},
     ExternalSourceConnector, SourceConnector, SourceEnvelope,
 };
+use mz_expr::GlobalId;
 use mz_ore::metrics::MetricsRegistry;
+use mz_persist::client::{MultiWriteHandle, RuntimeClient, StreamWriteHandle};
 use mz_persist::error::{Error, ErrorLog};
+use mz_persist::file::FileBlob;
 use mz_persist::indexed::encoding::Id as PersistId;
+use mz_persist::runtime::{self, RuntimeConfig};
 use mz_persist::s3::{S3Blob, S3BlobConfig};
 use mz_persist::storage::{Blob, LockInfo};
 use mz_repr::Row;
-use serde::Serialize;
-use tokio::runtime::Runtime as TokioRuntime;
-use url::Url;
-
-use mz_expr::GlobalId;
-use mz_persist::client::{MultiWriteHandle, RuntimeClient, StreamWriteHandle};
-use mz_persist::file::FileBlob;
-use mz_persist::runtime::{self, RuntimeConfig};
-use uuid::Uuid;
-
-use crate::catalog::{self, SerializedEnvelopePersistDetails, SerializedSourcePersistDetails};
 
 #[derive(Clone, Debug)]
 pub enum PersistStorage {
@@ -259,22 +257,18 @@ impl PersisterWithConfig {
     }
 
     /// Adds the given table to the set of tables managed by the persister.
-    pub fn add_table(&mut self, id: GlobalId, table: &catalog::Table) -> Result<(), Error> {
-        let stream_name = match &table.persist_name {
-            Some(x) => x.clone(),
-            None => return Ok(()),
-        };
+    pub fn add_table(&mut self, id: GlobalId, persist_name: &str) -> Result<(), Error> {
         let persister = match self.runtime.as_ref() {
             Some(x) => x,
             None => return Ok(()),
         };
-        let (write_handle, _) = persister.create_or_load(&stream_name);
+        let (write_handle, _) = persister.create_or_load(persist_name);
 
-        let description = persister.get_description(&stream_name);
+        let description = persister.get_description(persist_name);
         let description = match description {
             Ok(description) => description,
             Err(e) => {
-                let error_string = format!("Reading description for {}: {}", stream_name, e);
+                let error_string = format!("Reading description for {}: {}", persist_name, e);
                 return Err(Error::String(error_string));
             }
         };
@@ -288,7 +282,7 @@ impl PersisterWithConfig {
         })?;
 
         let details = TablePersistDetails {
-            stream_name,
+            stream_name: persist_name.to_string(),
             // We need to get the stream_id now because we cannot get it later since most methods
             // in the coordinator/catalog aren't fallible.
             stream_id: write_handle.stream_id()?,
@@ -351,7 +345,7 @@ impl PersisterWithConfig {
             } => Some(SerializedSourcePersistDetails {
                 primary_stream,
                 timestamp_bindings_stream,
-                envelope_details: crate::catalog::SerializedEnvelopePersistDetails::Upsert,
+                envelope_details: SerializedEnvelopePersistDetails::Upsert,
             }),
             SourceConnector::External {
                 connector: ExternalSourceConnector::Kafka(_),
@@ -360,7 +354,7 @@ impl PersisterWithConfig {
             } => Some(SerializedSourcePersistDetails {
                 primary_stream,
                 timestamp_bindings_stream,
-                envelope_details: crate::catalog::SerializedEnvelopePersistDetails::None,
+                envelope_details: SerializedEnvelopePersistDetails::None,
             }),
             SourceConnector::External {
                 connector: ExternalSourceConnector::Kafka(_),
@@ -380,11 +374,8 @@ impl PersisterWithConfig {
     /// reflects current frontier information.
     pub fn load_source_persist_desc(
         &self,
-        catalog::Source {
-            connector,
-            persist_details,
-            ..
-        }: &catalog::Source,
+        connector: &SourceConnector,
+        persist_details: &Option<SerializedSourcePersistDetails>,
     ) -> Result<Option<SourcePersistDesc>, Error> {
         let runtime = match self.runtime.as_ref() {
             Some(x) => x,
@@ -512,4 +503,46 @@ pub struct TablePersistDetails {
     pub since_ts: u64,
     #[serde(skip)]
     pub write_handle: StreamWriteHandle<Row, ()>,
+}
+
+/// Serialized source persistence details. See `SourcePersistDesc` for an explanation of the
+/// fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedSourcePersistDetails {
+    /// Name of the primary persisted stream of this source. This is what a consumer of the
+    /// persisted data would be interested in while the secondary stream(s) of the source are an
+    /// internal implementation detail.
+    pub primary_stream: String,
+
+    /// Persisted stream of timestamp bindings.
+    pub timestamp_bindings_stream: String,
+
+    /// Any additional details that we need to make the envelope logic stateful.
+    pub envelope_details: SerializedEnvelopePersistDetails,
+}
+
+/// See `EnvelopePersistDesc` for an explanation of the fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SerializedEnvelopePersistDetails {
+    Upsert,
+    None,
+}
+
+impl From<SourcePersistDesc> for SerializedSourcePersistDetails {
+    fn from(source_persist_desc: SourcePersistDesc) -> Self {
+        SerializedSourcePersistDetails {
+            primary_stream: source_persist_desc.primary_stream,
+            timestamp_bindings_stream: source_persist_desc.timestamp_bindings_stream,
+            envelope_details: source_persist_desc.envelope_desc.into(),
+        }
+    }
+}
+
+impl From<EnvelopePersistDesc> for SerializedEnvelopePersistDetails {
+    fn from(persist_desc: EnvelopePersistDesc) -> Self {
+        match persist_desc {
+            EnvelopePersistDesc::Upsert => SerializedEnvelopePersistDetails::Upsert,
+            EnvelopePersistDesc::None => SerializedEnvelopePersistDetails::None,
+        }
+    }
 }

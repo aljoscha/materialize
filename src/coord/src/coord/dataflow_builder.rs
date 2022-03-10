@@ -167,7 +167,7 @@ impl<'a> DataflowBuilder<'a, mz_repr::Timestamp> {
 
                         let persist_desc = self
                             .persister
-                            .load_source_persist_desc(&source)
+                            .load_source_persist_desc(&source.connector, &source.persist_details)
                             .map_err(CoordError::Persistence)?;
 
                         dataflow.import_source(*id, source_description, persist_desc);
