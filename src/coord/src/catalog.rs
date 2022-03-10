@@ -27,7 +27,6 @@ use mz_build_info::DUMMY_BUILD_INFO;
 use mz_dataflow_types::client::{ComputeInstanceId, DEFAULT_COMPUTE_INSTANCE_ID};
 use mz_dataflow_types::logging::LoggingConfig as DataflowLoggingConfig;
 use mz_dataflow_types::sinks::{SinkConnector, SinkConnectorBuilder, SinkEnvelope};
-use mz_dataflow_types::sources::persistence::{EnvelopePersistDesc, SourcePersistDesc};
 use mz_dataflow_types::sources::{
     AwsExternalId, ExternalSourceConnector, MzOffset, SourceConnector, Timeline,
 };
@@ -57,7 +56,7 @@ use crate::catalog::builtin::{
     Builtin, BUILTINS, BUILTIN_ROLES, FIRST_SYSTEM_INDEX_ID, MZ_CATALOG_SCHEMA, MZ_INTERNAL_SCHEMA,
     MZ_TEMP_SCHEMA, PG_CATALOG_SCHEMA,
 };
-use crate::persistcfg::PersistConfig;
+use crate::persistcfg::{PersistConfig, SerializedSourcePersistDetails};
 use crate::session::{PreparedStatement, Session};
 use crate::CoordError;
 
@@ -2313,48 +2312,6 @@ enum SerializedCatalogItem {
         table_persist_name: Option<String>,
         source_persist_details: Option<SerializedSourcePersistDetails>,
     },
-}
-
-/// Serialized source persistence details. See `SourcePersistDesc` for an explanation of the
-/// fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SerializedSourcePersistDetails {
-    /// Name of the primary persisted stream of this source. This is what a consumer of the
-    /// persisted data would be interested in while the secondary stream(s) of the source are an
-    /// internal implementation detail.
-    pub primary_stream: String,
-
-    /// Persisted stream of timestamp bindings.
-    pub timestamp_bindings_stream: String,
-
-    /// Any additional details that we need to make the envelope logic stateful.
-    pub envelope_details: SerializedEnvelopePersistDetails,
-}
-
-/// See `EnvelopePersistDesc` for an explanation of the fields.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SerializedEnvelopePersistDetails {
-    Upsert,
-    None,
-}
-
-impl From<SourcePersistDesc> for SerializedSourcePersistDetails {
-    fn from(source_persist_desc: SourcePersistDesc) -> Self {
-        SerializedSourcePersistDetails {
-            primary_stream: source_persist_desc.primary_stream,
-            timestamp_bindings_stream: source_persist_desc.timestamp_bindings_stream,
-            envelope_details: source_persist_desc.envelope_desc.into(),
-        }
-    }
-}
-
-impl From<EnvelopePersistDesc> for SerializedEnvelopePersistDetails {
-    fn from(persist_desc: EnvelopePersistDesc) -> Self {
-        match persist_desc {
-            EnvelopePersistDesc::Upsert => SerializedEnvelopePersistDetails::Upsert,
-            EnvelopePersistDesc::None => SerializedEnvelopePersistDetails::None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -477,7 +477,7 @@ impl Coordinator {
                 CatalogItem::Source(source) => {
                     let persist = self
                         .persister
-                        .load_source_persist_desc(&source)
+                        .load_source_persist_desc(&source.connector, &source.persist_details)
                         .map_err(CoordError::Persistence)?;
 
                     let since_ts = persist.as_ref().map(|p| p.since_ts).unwrap_or(0);
@@ -512,9 +512,11 @@ impl Coordinator {
                     .await;
                 }
                 CatalogItem::Table(table) => {
-                    self.persister
-                        .add_table(entry.id(), &table)
-                        .map_err(CoordError::Persistence)?;
+                    if let Some(persist_name) = table.persist_name.as_ref() {
+                        self.persister
+                            .add_table(entry.id(), persist_name)
+                            .map_err(CoordError::Persistence)?;
+                    }
 
                     let since_ts = self
                         .persister
@@ -2001,9 +2003,12 @@ impl Coordinator {
         match self.catalog_transact(ops).await {
             Ok(()) => {
                 // Determine the initial validity for the table.
-                self.persister
-                    .add_table(table_id, &table)
-                    .map_err(CoordError::Persistence)?;
+                if let Some(persist_name) = table.persist_name.as_ref() {
+                    self.persister
+                        .add_table(table_id, persist_name)
+                        .map_err(CoordError::Persistence)?;
+                }
+
                 let since_ts = self
                     .persister
                     .table_details
@@ -2084,7 +2089,7 @@ impl Coordinator {
                         })?;
                         let since_ts = self
                             .persister
-                            .load_source_persist_desc(&source)
+                            .load_source_persist_desc(&source.connector, &source.persist_details)
                             .map_err(CoordError::Persistence)?
                             .map(|p| p.since_ts)
                             .unwrap_or(0);
@@ -2116,7 +2121,7 @@ impl Coordinator {
 
                     let persist = self
                         .persister
-                        .load_source_persist_desc(source)
+                        .load_source_persist_desc(&source.connector, &source.persist_details)
                         .map_err(CoordError::Persistence)?;
 
                     source_descriptions.push(CreateSourceCommand {
