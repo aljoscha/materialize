@@ -194,10 +194,9 @@ impl CoordError {
                 let source_name = match source_type {
                     RematerializedSourceType::Postgres => "Postgres",
                     RematerializedSourceType::S3 => "S3 with SQS notification ",
-                    RematerializedSourceType::PersistedSource => "Persisted",
                 };
                 Some(format!(
-                    "{} sources can be materialized by only one set of indexes at a time. \
+                    "{} sources can be materialized by only one set of indexes at a time.\
                      The following indexes have already materialized this source:\n    {}",
                     source_name,
                     existing_indexes.join("\n    ")))
@@ -261,13 +260,6 @@ impl CoordError {
                 let doc_page = match source_type {
                     RematerializedSourceType::Postgres => "postgres",
                     RematerializedSourceType::S3 => "text-s3",
-                    RematerializedSourceType::PersistedSource => {
-                        // TODO: Make this more helpful once we have documentation for persisted
-                        // sources.
-                        return Some(
-                            "Either create one materialization and base more views on that, or create another source to base this materialization upon.".to_string(),
-                        );
-                    }
                 };
                 Some(format!(
                     "See the documentation at https://materialize.com/docs/sql/create-source/{}",
@@ -460,7 +452,6 @@ impl Error for CoordError {}
 pub enum RematerializedSourceType {
     Postgres,
     S3,
-    PersistedSource,
 }
 
 impl RematerializedSourceType {
@@ -469,12 +460,8 @@ impl RematerializedSourceType {
     /// # Panics
     ///
     /// If the source is of a type that is allowed to be rematerialized
-    pub fn for_source(source: &catalog::Source) -> RematerializedSourceType {
-        if source.persist_details.is_some() {
-            return RematerializedSourceType::PersistedSource;
-        }
-
-        match &source.connector {
+    pub fn for_connector(connector: &SourceConnector) -> RematerializedSourceType {
+        match &connector {
             SourceConnector::External { connector, .. } => match connector {
                 ExternalSourceConnector::S3(_) => RematerializedSourceType::S3,
                 ExternalSourceConnector::Postgres(_) => RematerializedSourceType::Postgres,

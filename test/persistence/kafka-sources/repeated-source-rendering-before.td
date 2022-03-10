@@ -37,10 +37,6 @@ $ kafka-ingest format=avro topic=re-created schema=${schema} publish=true repeat
 > SELECT SUM(CAST(statistics->'topics'->'testdrive-re-created-${testdrive.seed}'->'partitions'->'0'->'msgs' AS INT)) FROM mz_kafka_source_statistics;
 10
 
-# Verify that we cannot create multiple materializations of a persisted source.
-! CREATE MATERIALIZED VIEW a_view_second_materialization AS SELECT * FROM re_created;
-contains:Cannot re-materialize source re_created
-
 > DROP VIEW a_view;
 
 > CREATE MATERIALIZED VIEW a_view AS SELECT * FROM re_created;
