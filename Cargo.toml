@@ -29,6 +29,7 @@ members = [
     "src/mzcloud-cli",
     "src/ore",
     "src/persist-types",
+    "src/persist-util",
     "src/persist",
     "src/pgcopy",
     "src/pgrepr",

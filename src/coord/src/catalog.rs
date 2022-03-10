@@ -35,6 +35,7 @@ use mz_expr::{ExprHumanizer, GlobalId, MirScalarExpr, OptimizedMirRelationExpr};
 use mz_ore::collections::CollectionExt;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::{to_datetime, EpochMillis, NowFn};
+use mz_persist_util::persistcfg::{PersistConfig, SerializedSourcePersistDetails};
 use mz_pgrepr::oid::FIRST_USER_OID;
 use mz_repr::Timestamp;
 use mz_repr::{RelationDesc, ScalarType};
@@ -56,7 +57,6 @@ use crate::catalog::builtin::{
     Builtin, BUILTINS, BUILTIN_ROLES, FIRST_SYSTEM_INDEX_ID, MZ_CATALOG_SCHEMA, MZ_INTERNAL_SCHEMA,
     MZ_TEMP_SCHEMA, PG_CATALOG_SCHEMA,
 };
-use crate::persistcfg::{PersistConfig, SerializedSourcePersistDetails};
 use crate::session::{PreparedStatement, Session};
 use crate::CoordError;
 
