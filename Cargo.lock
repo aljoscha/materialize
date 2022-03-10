@@ -3051,6 +3051,7 @@ dependencies = [
  "mz-kafka-util",
  "mz-ore",
  "mz-persist",
+ "mz-persist-util",
  "mz-pgrepr",
  "mz-postgres-util",
  "mz-repr",
@@ -3568,6 +3569,24 @@ name = "mz-persist-types"
 version = "0.0.0"
 dependencies = [
  "bytes",
+]
+
+[[package]]
+name = "mz-persist-util"
+version = "0.0.0"
+dependencies = [
+ "itertools",
+ "mz-build-info",
+ "mz-dataflow-types",
+ "mz-expr",
+ "mz-ore",
+ "mz-persist",
+ "mz-repr",
+ "serde",
+ "timely",
+ "tokio",
+ "url",
+ "uuid",
 ]
 
 [[package]]

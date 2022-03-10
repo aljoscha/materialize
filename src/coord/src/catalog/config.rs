@@ -12,10 +12,10 @@ use std::time::Duration;
 use mz_build_info::BuildInfo;
 use mz_dataflow_types::sources::AwsExternalId;
 use mz_ore::metrics::MetricsRegistry;
+use mz_persist_util::persistcfg::PersisterWithConfig;
 use mz_sql::plan::ComputeInstanceIntrospectionConfig;
 
 use crate::catalog::storage;
-use crate::persistcfg::PersisterWithConfig;
 
 /// Configures a catalog.
 #[derive(Debug)]

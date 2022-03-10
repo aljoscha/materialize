@@ -29,6 +29,7 @@ members = [
     "src/ore",
     "src/persist-client",
     "src/persist-types",
+    "src/persist-util",
     "src/persist",
     "src/pgcopy",
     "src/pgrepr",

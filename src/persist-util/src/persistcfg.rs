@@ -9,6 +9,8 @@
 
 //! Materialize-specific persistence configuration.
 
+#![allow(missing_docs)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;

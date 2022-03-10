@@ -1,0 +1,21 @@
+[package]
+name = "mz-persist-util"
+description = "Utils for configuring and launching a persist runtime."
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.59.0"
+publish = false
+
+[dependencies]
+itertools = "0.10.3"
+mz-build-info = { path = "../build-info" }
+mz-dataflow-types = { path = "../dataflow-types" }
+mz-expr = { path = "../expr" }
+mz-ore = { path = "../ore", features = ["task"] }
+mz-persist = { path = "../persist" }
+mz-repr = { path = "../repr" }
+serde = { version = "1.0.136", features = ["derive"] }
+timely = { git = "https://github.com/TimelyDataflow/timely-dataflow", default-features = false, features = ["bincode"] }
+tokio = { version = "1.17.0", features = ["fs", "rt", "sync"] }
+url = { version = "2.2.2", features = ["serde"] }
+uuid = { version = "0.8.2", features = ["serde", "v4"] }

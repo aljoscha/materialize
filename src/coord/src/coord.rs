@@ -112,6 +112,7 @@ use mz_ore::retry::Retry;
 use mz_ore::soft_assert_eq;
 use mz_ore::task;
 use mz_ore::thread::JoinHandleExt;
+use mz_persist_util::persistcfg::PersisterWithConfig;
 use mz_repr::adt::interval::Interval;
 use mz_repr::adt::numeric::{Numeric, NumericMaxScale};
 use mz_repr::{Datum, Diff, RelationDesc, RelationType, Row, RowArena, ScalarType, Timestamp};
@@ -149,7 +150,6 @@ use crate::command::{
 use crate::coord::dataflow_builder::ExprPrepStyle;
 use crate::coord::id_bundle::CollectionIdBundle;
 use crate::error::CoordError;
-use crate::persistcfg::PersisterWithConfig;
 use crate::session::{
     EndTransactionAction, PreparedStatement, Session, Transaction, TransactionOps,
     TransactionStatus, WriteOp,
