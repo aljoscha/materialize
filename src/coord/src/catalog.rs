@@ -415,6 +415,7 @@ impl CatalogState {
                     _ => Unknown,
                 },
                 SourceConnector::Local { .. } => Volatile,
+                SourceConnector::Persistence { .. } => Nonvolatile,
             },
             CatalogItem::Index(_) | CatalogItem::View(_) | CatalogItem::Sink(_) => {
                 // Volatility follows trinary logic like SQL. If even one

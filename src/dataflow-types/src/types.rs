@@ -379,6 +379,8 @@ pub mod sources {
     use mz_kafka_util::KafkaAddrs;
     use mz_repr::{ColumnType, RelationDesc, RelationType, ScalarType};
 
+    use self::persistence::SourcePersistDesc;
+
     // Types and traits related to the *decoding* of data for sources.
     pub mod encoding {
         use anyhow::Context;
@@ -1157,6 +1159,12 @@ pub mod sources {
             timeline: Timeline,
         },
 
+        /// A source that subscribes to a persistent collection.
+        Persistence {
+            timeline: Timeline,
+            persist_desc: SourcePersistDesc,
+        },
+
         /// A local "source" is either fed by a local input handle, or by reading from a
         /// `persisted_source()`. For non-persisted sources, values that are to be inserted
         /// are sent from the coordinator and pushed into the handle on a worker.
@@ -1206,6 +1214,7 @@ pub mod sources {
         pub fn name(&self) -> &'static str {
             match self {
                 SourceConnector::External { connector, .. } => connector.name(),
+                SourceConnector::Persistence { .. } => "persistence",
                 SourceConnector::Local { .. } => "local",
             }
         }
@@ -1213,6 +1222,7 @@ pub mod sources {
         pub fn timeline(&self) -> Timeline {
             match self {
                 SourceConnector::External { timeline, .. } => timeline.clone(),
+                SourceConnector::Persistence { timeline, .. } => timeline.clone(),
                 SourceConnector::Local { timeline, .. } => timeline.clone(),
             }
         }

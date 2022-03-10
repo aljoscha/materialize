@@ -1588,6 +1588,9 @@ pub fn plan_create_views(
                 SourceConnector::Local { .. } => {
                     bail!("cannot generate views from local sources")
                 }
+                SourceConnector::Persistence { .. } => {
+                    bail!("cannot generate views from persistence/storage sources")
+                }
             }
         }
     }

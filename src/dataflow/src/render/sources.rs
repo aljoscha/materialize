@@ -23,7 +23,7 @@ use timely::dataflow::operators::ActivateCapability;
 use timely::dataflow::operators::{Concat, Map, OkErr, Probe, UnorderedInput};
 use timely::dataflow::{ProbeHandle, Scope, Stream};
 use timely::progress::Antichain;
-use tracing::debug;
+use tracing::{debug, info};
 
 use mz_dataflow_types::sources::{encoding::*, persistence::*, *};
 use mz_dataflow_types::*;
@@ -227,6 +227,55 @@ where
             });
 
             ((table.ok_collection, table.err_collection), capability)
+        }
+
+        SourceConnector::Persistence { persist_desc, .. } => {
+            info!("Replaying persistent source {:?}", src_id);
+
+            let persist = storage_state
+                .persist
+                .as_mut()
+                .expect("missing persist runtime");
+
+            match persist_desc.envelope_desc {
+                mz_dataflow_types::sources::persistence::EnvelopePersistDesc::Upsert => {
+                    todo!(
+                        "replaying an ENVELOPE UPSERT source from persistence not yet implemented"
+                    )
+                }
+                mz_dataflow_types::sources::persistence::EnvelopePersistDesc::None => {
+                    let stream_name = persist_desc.primary_stream;
+
+                    let (_write, read) =
+                        persist.create_or_load::<Result<Row, DecodeError>, ()>(&stream_name);
+
+                    let (persist_ok_stream, persist_err_stream) = scope
+                        .persisted_source(read, &Antichain::from_elem(persist_desc.since_ts))
+                        .ok_err(|x| match x {
+                            (Ok(kv), ts, diff) => Ok((kv, ts, diff)),
+                            (Err(err), ts, diff) => Err((err, ts, diff)),
+                        });
+
+                    let (persist_ok_stream, decode_err_stream) =
+                        persist_ok_stream.ok_err(|((row, ()), ts, diff)| match row {
+                            Ok(row) => Ok((row, ts, diff)),
+                            Err(e) => Err((e.into(), ts, diff)),
+                        });
+
+                    let persist_err_collection = persist_err_stream
+                        .map(move |(err, ts, diff)| {
+                            let err = SourceError::new(uid, SourceErrorDetails::Persistence(err));
+                            (err.into(), ts, diff)
+                        })
+                        .concat(&decode_err_stream)
+                        .as_collection();
+
+                    (
+                        (persist_ok_stream.as_collection(), persist_err_collection),
+                        Rc::new(()),
+                    )
+                }
+            }
         }
 
         SourceConnector::External {
@@ -903,12 +952,31 @@ where
 pub struct PersistedSourceManager {
     /// Handles that allow setting the compaction frontier for a persisted source.
     compaction_handles: HashMap<GlobalId, Weak<BoundedCompactionHandle>>,
+
+    /// Tokens for rendered sources that we need to keep alive.
+    tokens: HashMap<GlobalId, Rc<dyn Any>>,
 }
 
 impl PersistedSourceManager {
     pub fn new() -> Self {
         PersistedSourceManager {
             compaction_handles: HashMap::new(),
+            tokens: HashMap::new(),
+        }
+    }
+
+    /// Stashes the given token under the given id.
+    pub fn add_token(&mut self, source_id: &GlobalId, token: Rc<dyn Any>) {
+        let previous = self.tokens.insert(source_id.clone(), Rc::clone(&token));
+
+        match previous {
+            Some(_token) => {
+                panic!(
+                    "cannot have multiple rendered instances for persisted source {}",
+                    source_id
+                );
+            }
+            None => (), // All good!
         }
     }
 
@@ -969,7 +1037,7 @@ impl PersistedSourceManager {
 
     /// Removes the maintained state for source `id`.
     pub fn del_source(&mut self, id: &GlobalId) -> bool {
-        self.compaction_handles.remove(&id).is_some()
+        self.compaction_handles.remove(&id).is_some() && self.tokens.remove(&id).is_some()
     }
 }
 
