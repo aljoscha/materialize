@@ -152,7 +152,7 @@ pub(crate) fn import_source<G>(
     SourceInstanceDesc {
         description: src,
         operators: mut linear_operators,
-        persist,
+        persist: persist_desc,
     }: SourceInstanceDesc,
     storage_state: &mut crate::server::StorageState,
     scope: &mut G,
@@ -240,8 +240,12 @@ where
             // whose contents will be concatenated and inserted along the collection.
             let mut error_collections = Vec::<Collection<_, _, Diff>>::new();
 
-            let source_persist_config = match (persist, storage_state.persist.as_mut()) {
-                (Some(persist_desc), Some(persist)) => {
+            let source_persist_config = match persist_desc {
+                Some(persist_desc) => {
+                    let persist = storage_state
+                        .persist
+                        .as_mut()
+                        .expect("missing persist runtime");
                     Some(get_persist_config(&uid, persist_desc, persist))
                 }
                 _ => None,
