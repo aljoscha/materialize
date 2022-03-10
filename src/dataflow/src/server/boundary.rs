@@ -126,12 +126,23 @@ mod event_link {
 
     use differential_dataflow::AsCollection;
     use differential_dataflow::Collection;
+    use mz_dataflow_types::DecodeError;
+    use mz_dataflow_types::SourceError;
+    use mz_dataflow_types::SourceErrorDetails;
+    use mz_expr::SourceInstanceId;
     use timely::dataflow::operators::capture::EventLink;
+    use timely::dataflow::operators::Concat;
+    use timely::dataflow::operators::Map;
+    use timely::dataflow::operators::OkErr;
     use timely::dataflow::Scope;
+    use timely::progress::Antichain;
+    use tracing::info;
 
     use mz_dataflow_types::DataflowError;
     use mz_dataflow_types::SourceInstanceKey;
     use mz_expr::GlobalId;
+    use mz_persist::client::RuntimeClient;
+    use mz_persist::operators::source::PersistedSource;
     use mz_repr::{Diff, Row};
 
     use crate::activator::RcActivator;
@@ -144,14 +155,16 @@ mod event_link {
     pub struct EventLinkBoundary {
         send: BTreeMap<SourceInstanceKey, crossbeam_channel::Sender<SourceBoundary>>,
         recv: BTreeMap<SourceInstanceKey, crossbeam_channel::Receiver<SourceBoundary>>,
+        persist: Option<RuntimeClient>,
     }
 
     impl EventLinkBoundary {
         /// Create a new boundary, initializing the state to be empty.
-        pub fn new() -> Self {
+        pub fn new(persist: Option<RuntimeClient>) -> Self {
             Self {
                 send: BTreeMap::new(),
                 recv: BTreeMap::new(),
+                persist,
             }
         }
     }
@@ -197,33 +210,86 @@ mod event_link {
             Collection<G, DataflowError, Diff>,
             Rc<dyn Any>,
         ) {
-            // Ensure that a channel pair exists.
-            if !self.send.contains_key(&id) {
-                let (send, recv) = crossbeam_channel::unbounded();
-                self.send.insert(id.clone(), send);
-                self.recv.insert(id.clone(), recv);
+            if let Some(persist_desc) = id.persist.clone() {
+                info!("Replaying persistent source {:?}", id);
+
+                let persist = self.persist.as_mut().expect("missing persist runtime");
+
+                match persist_desc.envelope_desc {
+                    mz_dataflow_types::sources::persistence::EnvelopePersistDesc::Upsert => {
+                        todo!("envelope UPSERT replay not yet implemented")
+                    }
+                    mz_dataflow_types::sources::persistence::EnvelopePersistDesc::None => {
+                        let stream_name = persist_desc.primary_stream;
+
+                        let (_write, read) =
+                            persist.create_or_load::<Result<Row, DecodeError>, ()>(&stream_name);
+
+                        let (persist_ok_stream, persist_err_stream) = scope
+                            .persisted_source(read, &Antichain::from_elem(persist_desc.since_ts))
+                            .ok_err(|x| match x {
+                                (Ok(kv), ts, diff) => Ok((kv, ts, diff)),
+                                (Err(err), ts, diff) => Err((err, ts, diff)),
+                            });
+
+                        let (persist_ok_stream, decode_err_stream) =
+                            persist_ok_stream.ok_err(|((row, ()), ts, diff)| match row {
+                                Ok(row) => Ok((row, ts, diff)),
+                                Err(e) => Err((e.into(), ts, diff)),
+                            });
+
+                        let source_instance_id = SourceInstanceId {
+                            source_id: id.identifier.clone(),
+                            dataflow_id: 0,
+                        };
+
+                        let persist_err_collection = persist_err_stream
+                            .map(move |(err, ts, diff)| {
+                                let err = SourceError::new(
+                                    source_instance_id.clone(),
+                                    SourceErrorDetails::Persistence(err),
+                                );
+                                (err.into(), ts, diff)
+                            })
+                            .concat(&decode_err_stream)
+                            .as_collection();
+
+                        (
+                            persist_ok_stream.as_collection(),
+                            persist_err_collection,
+                            Rc::new(()),
+                        )
+                    }
+                }
+            } else {
+                // Ensure that a channel pair exists.
+                if !self.send.contains_key(&id) {
+                    let (send, recv) = crossbeam_channel::unbounded();
+                    self.send.insert(id.clone(), send);
+                    self.recv.insert(id.clone(), recv);
+                }
+
+                let source = self.recv[&id].recv().expect("Unable to acquire source");
+
+                let ok = Some(source.ok.inner)
+                    .mz_replay(
+                        scope,
+                        &format!("{name}-ok"),
+                        Duration::MAX,
+                        source.ok.activator,
+                    )
+                    .as_collection();
+                let err = Some(source.err.inner)
+                    .mz_replay(
+                        scope,
+                        &format!("{name}-err"),
+                        Duration::MAX,
+                        source.err.activator,
+                    )
+                    .as_collection();
+
+                (ok, err, source.token)
             }
-
-            let source = self.recv[&id].recv().expect("Unable to acquire source");
-
-            let ok = Some(source.ok.inner)
-                .mz_replay(
-                    scope,
-                    &format!("{name}-ok"),
-                    Duration::MAX,
-                    source.ok.activator,
-                )
-                .as_collection();
-            let err = Some(source.err.inner)
-                .mz_replay(
-                    scope,
-                    &format!("{name}-err"),
-                    Duration::MAX,
-                    source.err.activator,
-                )
-                .as_collection();
-
-            (ok, err, source.token)
         }
     }
 

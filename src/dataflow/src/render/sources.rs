@@ -900,12 +900,31 @@ where
 pub struct PersistedSourceManager {
     /// Handles that allow setting the compaction frontier for a persisted source.
     compaction_handles: HashMap<GlobalId, Weak<BoundedCompactionHandle>>,
+
+    /// Tokens for rendered sources that we need to keep alive.
+    tokens: HashMap<GlobalId, Rc<dyn Any>>,
 }
 
 impl PersistedSourceManager {
     pub fn new() -> Self {
         PersistedSourceManager {
             compaction_handles: HashMap::new(),
+            tokens: HashMap::new(),
+        }
+    }
+
+    /// Stashes the given token under the given id.
+    pub fn add_token(&mut self, source_id: &GlobalId, token: Rc<dyn Any>) {
+        let previous = self.tokens.insert(source_id.clone(), Rc::clone(&token));
+
+        match previous {
+            Some(_token) => {
+                panic!(
+                    "cannot have multiple rendered instances for persisted source {}",
+                    source_id
+                );
+            }
+            None => (), // All good!
         }
     }
 
@@ -966,7 +985,7 @@ impl PersistedSourceManager {
 
     /// Removes the maintained state for source `id`.
     pub fn del_source(&mut self, id: &GlobalId) -> bool {
-        self.compaction_handles.remove(&id).is_some()
+        self.compaction_handles.remove(&id).is_some() && self.tokens.remove(&id).is_some()
     }
 }
 

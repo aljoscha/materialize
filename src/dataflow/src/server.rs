@@ -90,8 +90,9 @@ pub struct Server {
 ///
 /// It uses the default [EventLinkBoundary] to host both compute and storage dataflows.
 pub fn serve(config: Config) -> Result<(Server, LocalClient), anyhow::Error> {
-    serve_boundary(config, |_| {
-        let boundary = Rc::new(RefCell::new(EventLinkBoundary::new()));
+    let persist = config.persister.clone();
+    serve_boundary(config, move |_| {
+        let boundary = Rc::new(RefCell::new(EventLinkBoundary::new(persist.clone())));
         (Rc::clone(&boundary), boundary)
     })
 }

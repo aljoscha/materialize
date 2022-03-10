@@ -3,6 +3,7 @@
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::{Rc, Weak};
@@ -15,14 +16,14 @@ use timely::progress::frontier::Antichain;
 use timely::progress::ChangeBatch;
 use timely::worker::Worker as TimelyWorker;
 use tokio::sync::mpsc;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use mz_dataflow_types::client::{
     CreateSourceCommand, Response, StorageCommand, StorageResponse, TimestampBindingFeedback,
 };
 use mz_dataflow_types::sources::AwsExternalId;
 use mz_dataflow_types::sources::{ExternalSourceConnector, SourceConnector};
-use mz_dataflow_types::SourceInstanceDesc;
+use mz_dataflow_types::{SourceInstanceDesc, SourceInstanceKey};
 use mz_expr::{GlobalId, PartitionId};
 use mz_ore::now::NowFn;
 use mz_persist::client::RuntimeClient;
@@ -207,7 +208,7 @@ impl<'a, A: Allocate, B: StorageCapture> ActiveStorageState<'a, A, B> {
 
                     self.storage_state
                         .source_descriptions
-                        .insert(source.id, source.desc);
+                        .insert(source.id, source.desc.clone());
 
                     // Initialize shared frontier tracking.
                     use timely::progress::Timestamp;
@@ -222,6 +223,45 @@ impl<'a, A: Allocate, B: StorageCapture> ActiveStorageState<'a, A, B> {
                         source.id,
                         Antichain::from_elem(mz_repr::Timestamp::minimum()),
                     );
+
+                    if source.persist.is_some() {
+                        if source.id.is_user() {
+                            info!("rendering persisted source: {:?}", source);
+                        }
+                        let source_instance_desc = SourceInstanceDesc {
+                            description: source.desc,
+                            operators: None,
+                            persist: source.persist.clone(),
+                        };
+                        let mut source_descs = BTreeMap::new();
+                        source_descs.insert(source.id, source_instance_desc.clone());
+
+                        let debug_name = format!("persistent-source-{}", source.id);
+
+                        // We need to capture the source token in order to keep the source
+                        // alive.
+                        let mut token_capture = PersistentSourceCapture::new();
+
+                        crate::render::build_storage_dataflow(
+                            self.timely_worker,
+                            &mut self.storage_state,
+                            &debug_name,
+                            Some(source.since.clone()),
+                            source_descs,
+                            source.id,
+                            &mut token_capture,
+                        );
+
+                        let source_instance_key = source_instance_desc.with_id(source.id);
+                        let source_token = token_capture
+                            .tokens
+                            .remove(&source_instance_key)
+                            .expect("missing captured source token");
+
+                        self.storage_state
+                            .persisted_sources
+                            .add_token(&source.id, source_token);
+                    }
                 }
             }
             StorageCommand::RenderSources(sources) => self.build_storage_dataflow(sources),
@@ -351,13 +391,19 @@ impl<'a, A: Allocate, B: StorageCapture> ActiveStorageState<'a, A, B> {
             BTreeMap<GlobalId, SourceInstanceDesc>,
         )>,
     ) {
-        for (debug_name, dataflow_id, as_of, source_imports) in dataflows {
+        for (debug_name, dataflow_id, as_of, mut source_imports) in dataflows {
             for (source_id, instance) in source_imports.iter() {
                 assert_eq!(
                     self.storage_state.source_descriptions[source_id],
                     instance.description
                 );
             }
+
+            // We only need to render non-persisted sources. Persisted sources are rendered in
+            // STORAGE when they're created and consuming from them requires subscribing to their
+            // backing persistent collection.
+            source_imports.retain(|_id, source| source.persist.is_none());
+
             crate::render::build_storage_dataflow(
                 self.timely_worker,
                 &mut self.storage_state,
@@ -478,5 +524,34 @@ impl<'a, A: Allocate, B: StorageCapture> ActiveStorageState<'a, A, B> {
         // Ignore send errors because the coordinator is free to ignore our
         // responses. This happens during shutdown.
         let _ = self.response_tx.send(Response::Storage(response));
+    }
+}
+
+/// Helper that keeps only the token of captured sources. For persisted sources we're only
+/// interested in that, because we need it to keep the rendered source alive. Subscribing to the
+/// source works through different "channels".
+struct PersistentSourceCapture {
+    tokens: BTreeMap<SourceInstanceKey, Rc<dyn Any>>,
+}
+
+impl PersistentSourceCapture {
+    fn new() -> Self {
+        PersistentSourceCapture {
+            tokens: BTreeMap::new(),
+        }
+    }
+}
+
+impl StorageCapture for PersistentSourceCapture {
+    fn capture<G: timely::dataflow::Scope<Timestamp = mz_repr::Timestamp>>(
+        &mut self,
+        id: SourceInstanceKey,
+        _ok: differential_dataflow::Collection<G, Row, Diff>,
+        _err: differential_dataflow::Collection<G, mz_dataflow_types::DataflowError, Diff>,
+        token: Rc<dyn Any>,
+        _name: &str,
+        _dataflow_id: GlobalId,
+    ) {
+        self.tokens.insert(id, token);
     }
 }
