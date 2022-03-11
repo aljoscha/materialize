@@ -17,15 +17,42 @@
 use anyhow::anyhow;
 use anyhow::Context;
 use async_trait::async_trait;
+use compile_time_run::run_command_str;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use std::collections::HashMap;
+use tracing::trace;
 
+use mz_build_info::BuildInfo;
 use mz_dataflow_types::client::{
     partitioned::Partitioned, Client, Command, ComputeCommand, ComputeInstanceId, InstanceConfig,
     Response,
 };
-use tracing::trace;
+
+#[allow(missing_docs)]
+pub const BUILD_INFO: BuildInfo = BuildInfo {
+    version: env!("CARGO_PKG_VERSION"),
+    sha: run_command_str!(
+        "sh",
+        "-c",
+        r#"if [ -n "$MZ_DEV_BUILD_SHA" ]; then
+            echo "$MZ_DEV_BUILD_SHA"
+        else
+            # Unfortunately we need to suppress error messages from `git`, as
+            # run_command_str will display no error message at all if we print
+            # more than one line of output to stderr.
+            git rev-parse --verify HEAD 2>/dev/null || {
+                printf "error: unable to determine Git SHA; " >&2
+                printf "either build from working Git clone " >&2
+                printf "(see https://materialize.com/docs/install/#build-from-source), " >&2
+                printf "or specify SHA manually by setting MZ_DEV_BUILD_SHA environment variable" >&2
+                exit 1
+            }
+        fi"#
+    ),
+    time: run_command_str!("date", "-u", "+%Y-%m-%dT%H:%M:%SZ"),
+    target_triple: env!("TARGET_TRIPLE"),
+};
 
 /// A convenience type for compatibility.
 pub struct RemoteClient {

@@ -3216,16 +3216,23 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "compile-time-run",
  "futures",
+ "mz-build-info",
  "mz-dataflow",
  "mz-dataflow-types",
  "mz-ore",
+ "mz-persist",
+ "mz-persist-util",
+ "mz-repr",
+ "num_cpus",
  "timely",
  "tokio",
  "tokio-serde",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
