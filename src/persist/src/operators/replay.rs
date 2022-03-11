@@ -14,7 +14,7 @@ use timely::dataflow::operators::generic::operator;
 use timely::dataflow::operators::Map;
 use timely::dataflow::{Scope, Stream};
 use timely::progress::Antichain;
-use timely::{Data as TimelyData, PartialOrder};
+use timely::Data as TimelyData;
 
 use crate::client::DecodedSnapshot;
 use crate::error::Error;
@@ -61,12 +61,10 @@ where
         // between all the workers.
         let active_worker = self.index() == 0;
 
-        let as_of_frontier = as_of_frontier.clone();
+        let _as_of_frontier = as_of_frontier.clone();
 
-        let result_stream: Stream<G, Result<((K, V), u64, i64), Error>> = operator::source(
-            self,
-            "Replay",
-            move |cap, info| {
+        let result_stream: Stream<G, Result<((K, V), u64, i64), Error>> =
+            operator::source(self, "Replay", move |cap, info| {
                 let activator = self.activator_for(&info.address[..]);
                 let mut snapshot_cap = if active_worker {
                     Some((snapshot.map(|s| (s.since(), s.into_iter())), cap))
@@ -84,18 +82,18 @@ where
                     let mut session = output.session(&cap);
 
                     match snapshot {
-                        Ok((snapshot_since, _))
-                            if PartialOrder::less_than(&as_of_frontier, &snapshot_since) =>
-                        {
-                            session.give(Err(Error::String(format!(
-                                    "replaying persisted data: snapshot since ({:?}) is beyond expected as_of ({:?})",
-                                    snapshot_since, as_of_frontier
-                                ))));
-                            panic!(
-                                    "replaying persisted data: snapshot since ({:?}) is beyond expected as_of ({:?})",
-                                    snapshot_since, as_of_frontier
-                                );
-                        }
+                        // Ok((snapshot_since, _))
+                        //     if PartialOrder::less_than(&as_of_frontier, &snapshot_since) =>
+                        // {
+                        // session.give(Err(Error::String(format!(
+                        //         "replaying persisted data: snapshot since ({:?}) is beyond expected as_of ({:?})",
+                        //         snapshot_since, as_of_frontier
+                        //     ))));
+                        // panic!(
+                        //         "replaying persisted data: snapshot since ({:?}) is beyond expected as_of ({:?})",
+                        //         snapshot_since, as_of_frontier
+                        //     );
+                        // }
                         Ok((snapshot_since, snapshot_iter)) => {
                             // NB: This `idx` from enumerate resets back to 0
                             // each time the operator is run.
@@ -129,8 +127,7 @@ where
                         activator.activate();
                     }
                 }
-            },
-        );
+            });
         result_stream.map(|x| {
             match x {
                 Ok((kv, ts, diff)) => (Ok(kv), ts, diff),
