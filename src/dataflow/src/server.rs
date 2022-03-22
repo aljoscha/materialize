@@ -20,6 +20,7 @@ use anyhow::anyhow;
 use crossbeam_channel::TryRecvError;
 use differential_dataflow::trace::cursor::Cursor;
 use differential_dataflow::trace::TraceReader;
+use mz_persist_util::persistcfg::PersisterWithConfig;
 use timely::communication::initialize::WorkerGuards;
 use timely::communication::Allocate;
 use timely::dataflow::operators::unordered_input::UnorderedHandle;
@@ -75,8 +76,8 @@ pub struct Config {
     pub now: NowFn,
     /// Metrics registry through which dataflow metrics will be reported.
     pub metrics_registry: MetricsRegistry,
-    /// A handle to a persistence runtime, if persistence is enabled.
-    pub persister: Option<mz_persist::client::RuntimeClient>,
+    /// A runtime for the `persist` crate alongside its configuration.
+    pub persister: PersisterWithConfig,
     /// An external ID to use for all AWS AssumeRole operations.
     pub aws_external_id: AwsExternalId,
 }

@@ -31,6 +31,7 @@ use tracing::{error, trace};
 use uuid::Uuid;
 
 use crate::logging::LoggingConfig;
+use crate::sources::persistence::SourcePersistDesc;
 use crate::{
     sources,
     sources::{MzOffset, SourceDesc},
@@ -168,8 +169,6 @@ pub struct CreateSourceCommand<T> {
     pub id: GlobalId,
     /// The source description
     pub desc: SourceDesc,
-    /// The initial `since` frontier
-    pub since: Antichain<T>,
     /// Any previously stored timestamp bindings
     pub ts_bindings: Vec<(PartitionId, T, crate::sources::MzOffset)>,
     /// A description of how to persist the source. The ingester is expected to write incoming
@@ -393,6 +392,13 @@ pub enum StorageResponse<T = mz_repr::Timestamp> {
     /// Timestamp bindings and prior and new frontiers for those bindings for all
     /// sources
     TimestampBindings(TimestampBindingFeedback<T>),
+    /// A requested source was successfully created.
+    SourceCreated {
+        id: GlobalId,
+        desc: SourceDesc,
+        persist: Option<SourcePersistDesc<T>>,
+        since: Antichain<T>,
+    },
 }
 
 /// A client to a running dataflow server.
@@ -960,6 +966,22 @@ pub mod partitioned {
                         .into_iter(),
                     )
                 }
+                // TODO(aljoscha): Consolidate responses from potentially multiple storage
+                // instances. For now, we can only have one compute instance.
+                Response::Storage(StorageResponse::SourceCreated {
+                    id,
+                    desc,
+                    persist,
+                    since,
+                }) => Box::new(
+                    Some(Response::Storage(StorageResponse::SourceCreated {
+                        id,
+                        desc,
+                        persist,
+                        since,
+                    }))
+                    .into_iter(),
+                ),
                 Response::Compute(ComputeResponse::PeekResponse(uuid, response), instance) => {
                     // Incorporate new peek responses; awaiting all responses.
                     let entry = self

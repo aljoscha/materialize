@@ -100,7 +100,7 @@ where
     // For persisted sources, the coordinator only writes new values to a persistent
     // stream. These values will then "show up" here because we read from the same
     // persistent stream.
-    let (ok_stream, err_collection) = match (&mut storage_state.persist, persisted_name) {
+    let (ok_stream, err_collection) = match (&mut storage_state.persist.runtime, persisted_name) {
         (Some(persist), Some(stream_name)) => {
             let (_write, read) = persist.create_or_load(&stream_name);
             let (persist_ok_stream, persist_err_stream) = scope
@@ -234,6 +234,7 @@ where
 
             let persist = storage_state
                 .persist
+                .runtime
                 .as_mut()
                 .expect("missing persist runtime");
 
@@ -296,6 +297,7 @@ where
                 Some(persist_desc) => {
                     let persist = storage_state
                         .persist
+                        .runtime
                         .as_mut()
                         .expect("missing persist runtime");
                     Some(get_persist_config(&uid, persist_desc, persist))

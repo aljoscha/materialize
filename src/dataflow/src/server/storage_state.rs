@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::Collection;
+use mz_persist_util::persistcfg::PersisterWithConfig;
 use timely::communication::Allocate;
 use timely::order::PartialOrder;
 use timely::progress::frontier::Antichain;
@@ -27,7 +28,6 @@ use mz_dataflow_types::sources::{ExternalSourceConnector, SourceConnector};
 use mz_dataflow_types::{SourceInstanceArguments, SourceInstanceDesc};
 use mz_expr::{GlobalId, PartitionId};
 use mz_ore::now::NowFn;
-use mz_persist::client::RuntimeClient;
 use mz_repr::{Diff, Row, Timestamp};
 
 use crate::metrics::Metrics;
@@ -70,8 +70,8 @@ pub struct StorageState {
     pub persisted_sources: PersistedSourceManager,
     /// Metrics reported by all dataflows.
     pub unspecified_metrics: Metrics,
-    /// Handle to the persistence runtime. None if disabled.
-    pub persist: Option<RuntimeClient>,
+    /// A runtime for the `persist` crate alongside its configuration.
+    pub persist: PersisterWithConfig,
     /// Tracks the conditional write frontiers we have reported.
     pub reported_frontiers: HashMap<GlobalId, Antichain<Timestamp>>,
     /// Tracks the last time we sent binding durability info over `response_tx`.
@@ -206,8 +206,8 @@ impl<'a, A: Allocate, B: StorageCapture> ActiveStorageState<'a, A, B> {
                         Antichain::from_elem(mz_repr::Timestamp::minimum()),
                     );
 
-                    match &source.desc.connector {
-                        SourceConnector::Local { .. } => {
+                    let since_ts = match &source.desc.connector {
+                        SourceConnector::Local { persisted_name, .. } => {
                             self.storage_state.table_state.insert(
                                 source.id,
                                 TableState {
@@ -218,6 +218,26 @@ impl<'a, A: Allocate, B: StorageCapture> ActiveStorageState<'a, A, B> {
                                     inputs: vec![],
                                 },
                             );
+
+                            if let Some(persist_name) = persisted_name {
+                                self.storage_state
+                                    .persist
+                                    .add_table(source.id, persist_name)
+                                    .expect("could not add persistent table");
+                            }
+
+                            // TODO(aljoscha): minimum() seems wrong here. The coordinator was
+                            // previously using it's local write timestamp but we don't have access
+                            // to that in STORAGE.
+                            let since_ts = self
+                                .storage_state
+                                .persist
+                                .table_details
+                                .get(&source.id)
+                                .map(|td| td.since_ts)
+                                .unwrap_or_else(|| Timestamp::minimum());
+
+                            since_ts
                         }
                         SourceConnector::Persistence { .. } => {
                             panic!("got a description for a persistent source replay, this should not happen");
@@ -232,7 +252,7 @@ impl<'a, A: Allocate, B: StorageCapture> ActiveStorageState<'a, A, B> {
                                     persist: source.persist.clone(),
                                 };
                                 let source_instance_desc = SourceInstanceDesc {
-                                    description: source.desc,
+                                    description: source.desc.clone(),
                                     arguments: source_args,
                                 };
                                 let mut source_descs = BTreeMap::new();
@@ -247,11 +267,31 @@ impl<'a, A: Allocate, B: StorageCapture> ActiveStorageState<'a, A, B> {
                                 // TODO: Is it correct to just mint a new Uuid here?
                                 let instance_id = uuid::Uuid::new_v4();
 
+                                // TODO(aljoscha): We're doing a serde cycle here to re-initialize
+                                // the persist details. We shouldn't do that in the long run, when
+                                // there is no more persist runtime in the coordinator itself.
+                                let persist = self
+                                    .storage_state
+                                    .persist
+                                    .load_source_persist_desc(
+                                        &source.desc.connector,
+                                        &source
+                                            .persist
+                                            .as_ref()
+                                            .map(|details| details.clone().into()),
+                                    )
+                                    .expect("could not load source persistence details");
+
+                                let since_ts = persist
+                                    .as_ref()
+                                    .map(|p| p.since_ts)
+                                    .unwrap_or_else(Timestamp::minimum);
+
                                 crate::render::build_storage_dataflow(
                                     self.timely_worker,
                                     &mut self.storage_state,
                                     &debug_name,
-                                    Some(source.since.clone()),
+                                    Some(Antichain::from_elem(since_ts)),
                                     source_descs,
                                     instance_id,
                                     &mut token_capture,
@@ -265,9 +305,20 @@ impl<'a, A: Allocate, B: StorageCapture> ActiveStorageState<'a, A, B> {
                                 self.storage_state
                                     .persisted_sources
                                     .add_token(&source.id, source_token);
+
+                                since_ts
+                            } else {
+                                Timestamp::minimum()
                             }
                         }
-                    }
+                    };
+
+                    self.send_storage_response(StorageResponse::SourceCreated {
+                        id: source.id,
+                        desc: source.desc,
+                        persist: source.persist,
+                        since: Antichain::from_elem(since_ts),
+                    });
                 }
             }
             StorageCommand::RenderSources(sources) => self.build_storage_dataflow(sources),

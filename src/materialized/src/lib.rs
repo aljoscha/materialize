@@ -297,7 +297,7 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
         experimental_mode: config.experimental_mode,
         now: config.now.clone(),
         metrics_registry: config.metrics_registry.clone(),
-        persister: persister.runtime.clone(),
+        persister: persister.clone(),
         aws_external_id: config.aws_external_id.clone(),
     };
     let (dataflow_server, dataflow_controller) = match config.storage {

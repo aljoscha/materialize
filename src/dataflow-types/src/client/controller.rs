@@ -29,6 +29,7 @@ use futures::StreamExt;
 use timely::progress::frontier::{Antichain, AntichainRef};
 use timely::progress::Timestamp;
 use tokio_stream::StreamMap;
+use tracing::debug;
 
 use crate::client::{
     ComputeClient, ComputeCommand, ComputeInstanceId, ComputeResponse, ComputeWrapperClient,
@@ -175,6 +176,22 @@ where
                     self.storage_mut()
                         .update_write_frontiers(&feedback.changes)
                         .await;
+                }
+                Response::Storage(StorageResponse::SourceCreated {
+                    id,
+                    desc,
+                    persist,
+                    since,
+                }) => {
+                    debug!("Created source {:?}", id);
+
+                    // Install collection state for the indicated source, it is now valid to use in
+                    // queries at times beyond the initial `since` frontier. The collection also
+                    // has a read capability at this frontier, which will need to be repeatedly
+                    // downgraded with `allow_compaction()` to permit compaction.
+                    let collection =
+                        storage::CollectionState::new(desc.clone(), persist.clone(), since.clone());
+                    self.storage.collections.insert(id.clone(), collection);
                 }
                 _ => {}
             }

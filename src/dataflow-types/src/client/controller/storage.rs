@@ -99,11 +99,6 @@ impl<'a, T: Timestamp + Lattice> StorageControllerMut<'a, T> {
     ///
     /// Each command carries the source id, the  source description, an initial `since` read
     /// validity frontier, and initial timestamp bindings.
-    ///
-    /// This command installs collection state for the indicated sources, and the are
-    /// now valid to use in queries at times beyond the initial `since` frontiers. Each
-    /// collection also acquires a read capability at this frontier, which will need to
-    /// be repeatedly downgraded with `allow_compaction()` to permit compaction.
     pub async fn create_sources(
         &mut self,
         mut bindings: Vec<CreateSourceCommand<T>>,
@@ -121,20 +116,11 @@ impl<'a, T: Timestamp + Lattice> StorageControllerMut<'a, T> {
         }
         for binding in bindings.iter() {
             if let Ok(collection) = self.as_ref().collection(binding.id) {
-                let (ref desc, ref since) = collection.description;
-                if (desc, since) != (&binding.desc, &binding.since) {
+                let (ref desc, ref _since) = collection.description;
+                if desc != &binding.desc {
                     Err(StorageError::SourceIdReused(binding.id))?
                 }
             }
-        }
-        // Install collection state for each bound source.
-        for binding in bindings.iter() {
-            let collection = CollectionState::new(
-                binding.desc.clone(),
-                binding.persist.clone(),
-                binding.since.clone(),
-            );
-            self.storage.collections.insert(binding.id, collection);
         }
 
         self.storage

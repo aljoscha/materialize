@@ -482,11 +482,6 @@ impl Coordinator {
                         .load_source_persist_desc(&source.connector, &source.persist_details)
                         .map_err(CoordError::Persistence)?;
 
-                    let since_ts = persist
-                        .as_ref()
-                        .map(|p| p.since_ts)
-                        .unwrap_or_else(Timestamp::minimum);
-
                     // Re-announce the source description.
                     let source_description = self
                         .catalog
@@ -504,7 +499,6 @@ impl Coordinator {
                         .create_sources(vec![CreateSourceCommand {
                             id: entry.id(),
                             desc: source_description,
-                            since: Antichain::from_elem(since_ts),
                             ts_bindings,
                             persist,
                         }])
@@ -523,13 +517,6 @@ impl Coordinator {
                             .map_err(CoordError::Persistence)?;
                     }
 
-                    let since_ts = self
-                        .persister
-                        .table_details
-                        .get(&entry.id())
-                        .map(|td| td.since_ts)
-                        .unwrap_or_else(|| self.get_local_write_ts());
-
                     // Re-announce the source description.
                     let source_description = self
                         .catalog
@@ -541,7 +528,6 @@ impl Coordinator {
                         .create_sources(vec![CreateSourceCommand {
                             id: entry.id(),
                             desc: source_description,
-                            since: Antichain::from_elem(since_ts),
                             ts_bindings: vec![],
                             persist: None,
                         }])
@@ -912,6 +898,14 @@ impl Coordinator {
                 if !source_since_updates.is_empty() {
                     self.persisted_table_allow_compaction(&source_since_updates);
                 }
+            }
+            DataflowResponse::Storage(StorageResponse::SourceCreated {
+                id: _,
+                desc: _,
+                persist: _,
+                since: _,
+            }) => {
+                // Nothing to do for us...
             }
         }
     }
@@ -2069,13 +2063,6 @@ impl Coordinator {
                         .map_err(CoordError::Persistence)?;
                 }
 
-                let since_ts = self
-                    .persister
-                    .table_details
-                    .get(&table_id)
-                    .map(|td| td.since_ts)
-                    .unwrap_or_else(|| self.get_local_write_ts());
-
                 // Announce the creation of the table source.
                 let source_description = self
                     .catalog
@@ -2087,7 +2074,6 @@ impl Coordinator {
                     .create_sources(vec![CreateSourceCommand {
                         id: table_id,
                         desc: source_description,
-                        since: Antichain::from_elem(since_ts),
                         ts_bindings: vec![],
                         persist: None,
                     }])
@@ -2184,15 +2170,6 @@ impl Coordinator {
                 // inform the timestamper and dataflow workers of its existence before
                 // shipping any dataflows that depend on its existence.
 
-                // Ask persistence if it has a since timestamps for any
-                // of the new sources.
-                let since_ts = self
-                    .persister
-                    .load_source_persist_desc(&source.connector, &source.persist_details)
-                    .map_err(CoordError::Persistence)?
-                    .map(|p| p.since_ts)
-                    .unwrap_or_else(Timestamp::minimum);
-
                 let ts_bindings = self
                     .catalog
                     .load_timestamp_bindings(source_id)
@@ -2216,7 +2193,6 @@ impl Coordinator {
                             .state()
                             .source_description_for(source_id)
                             .unwrap(),
-                        since: Antichain::from_elem(since_ts),
                         ts_bindings,
                         persist,
                     }])

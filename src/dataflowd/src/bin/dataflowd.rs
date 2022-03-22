@@ -351,7 +351,9 @@ async fn run(args: Args, async_runtime: Arc<TokioRuntime>) -> Result<(), anyhow:
         Ok(id) => id,
         Err(e) => panic!("Invalid reentrance ID: {}", e),
     };
-    let persister = persist_config.init(reentrance_id, mz_dataflowd::BUILD_INFO, &metrics_registry).await?;
+    let persister = persist_config
+        .init(reentrance_id, mz_dataflowd::BUILD_INFO, &metrics_registry)
+        .await?;
 
     info!("about to bind to {:?}", args.listen_addr);
     let listener = TcpListener::bind(args.listen_addr).await?;
@@ -367,7 +369,7 @@ async fn run(args: Args, async_runtime: Arc<TokioRuntime>) -> Result<(), anyhow:
         experimental_mode: false,
         metrics_registry: MetricsRegistry::new(),
         now: SYSTEM_TIME.clone(),
-        persister: persister.runtime,
+        persister,
         aws_external_id: args
             .aws_external_id
             .map(AwsExternalId::ISwearThisCameFromACliArgOrEnvVariable)
