@@ -230,8 +230,14 @@ pub fn build_compute_dataflow<A: Allocate>(
                     let is_metadata = dataflow
                         .objects_to_build
                         .iter()
-                        .any(|x| is_metadata_plan(&x.plan, &mz_expr::Id::Global(*source_id)));
+                        .any(|x| is_metadata_plan(&x.plan, source_id));
                     tracing::info!("WIP source {} is_metadata={}", source_id, is_metadata);
+
+                    let global_source_id = match source_id {
+                        Id::Local(_id) => unreachable!("sources can't be local"),
+                        Id::Global(id) => id,
+                        Id::PersistMetadata(id) => id,
+                    };
 
                     let (mut ok_stream, err_stream, token) = if is_metadata {
                         let (rows, token) = persist_metadata(
@@ -283,7 +289,7 @@ pub fn build_compute_dataflow<A: Allocate>(
                         // `dataflow.as_of`. `persist_source` is documented to provide this guarantee.
                         persist_source::persist_source(
                             inner,
-                            *source_id,
+                            *global_source_id,
                             Arc::clone(&compute_state.persist_clients),
                             source.storage_metadata.clone(),
                             dataflow.as_of.clone(),
@@ -305,7 +311,8 @@ pub fn build_compute_dataflow<A: Allocate>(
                     // possible.
                     if let Some(logger) = compute_state.compute_logger.clone() {
                         let export_ids = dataflow.export_ids().collect();
-                        ok_stream = ok_stream.log_import_frontiers(logger, *source_id, export_ids);
+                        ok_stream =
+                            ok_stream.log_import_frontiers(logger, *global_source_id, export_ids);
                     }
 
                     let (oks, errs) = (
@@ -313,10 +320,10 @@ pub fn build_compute_dataflow<A: Allocate>(
                         err_stream.as_collection().leave_region().leave_region(),
                     );
 
-                    imported_sources.push((mz_expr::Id::Global(*source_id), (oks, errs)));
+                    imported_sources.push((*source_id, (oks, errs)));
 
                     // Associate returned tokens with the source identifier.
-                    tokens.insert(*source_id, token);
+                    tokens.insert(*global_source_id, token);
                 });
             }
         });

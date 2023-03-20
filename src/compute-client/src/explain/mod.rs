@@ -14,7 +14,7 @@ pub(crate) mod text;
 use std::collections::BTreeMap;
 
 use mz_expr::explain::{enforce_linear_chains, ExplainContext, ExplainMultiPlan};
-use mz_expr::{MirRelationExpr, OptimizedMirRelationExpr};
+use mz_expr::{Id, MirRelationExpr, OptimizedMirRelationExpr};
 use mz_repr::explain::{AnnotatedPlan, Explain, ExplainError, UnsupportedFormat};
 
 use crate::plan::Plan;
@@ -64,10 +64,16 @@ impl<'a> DataflowDescription<Plan> {
             .source_imports
             .iter_mut()
             .filter_map(|(id, (source_desc, _))| {
+                let global_source_id = match id {
+                    Id::Local(_id) => unreachable!("sources can't be local"),
+                    Id::Global(id) => id,
+                    Id::PersistMetadata(id) => id,
+                };
+
                 source_desc.arguments.operators.as_ref().map(|op| {
                     let id = context
                         .humanizer
-                        .humanize_id(*id)
+                        .humanize_id(*global_source_id)
                         .unwrap_or_else(|| id.to_string());
                     (id, op)
                 })
@@ -133,9 +139,15 @@ impl<'a> DataflowDescription<OptimizedMirRelationExpr> {
             .iter_mut()
             .filter_map(|(id, (source_desc, _))| {
                 source_desc.arguments.operators.as_ref().map(|op| {
+                    let global_source_id = match id {
+                        Id::Local(_id) => unreachable!("sources can't be local"),
+                        Id::Global(id) => id,
+                        Id::PersistMetadata(id) => id,
+                    };
+
                     let id = context
                         .humanizer
-                        .humanize_id(*id)
+                        .humanize_id(*global_source_id)
                         .unwrap_or_else(|| id.to_string());
                     (id, op)
                 })

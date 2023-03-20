@@ -5272,7 +5272,7 @@ impl<'a> QueryContext<'a> {
                 let desc = persist_metadata::BATCHES_DESC.clone();
 
                 let expr = HirRelationExpr::Get {
-                    id: Id::Global(item.id()),
+                    id: Id::PersistMetadata(item.id()),
                     typ: desc.typ().clone(),
                     variant: CollectionVariant::PersistMetadata,
                 };

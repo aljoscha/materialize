@@ -20,7 +20,7 @@ use mz_compute_client::types::dataflows::DataflowDescription;
 use mz_expr::explain::{
     enforce_linear_chains, ExplainContext, ExplainMultiPlan, ExplainSinglePlan,
 };
-use mz_expr::{MirRelationExpr, OptimizedMirRelationExpr};
+use mz_expr::{Id, MirRelationExpr, OptimizedMirRelationExpr};
 use mz_repr::explain::{Explain, ExplainError, UnsupportedFormat};
 use mz_transform::attribute::annotate_plan;
 use mz_transform::normalize_lets::normalize_lets;
@@ -126,10 +126,16 @@ impl<'a> Explainable<'a, DataflowDescription<OptimizedMirRelationExpr>> {
             .source_imports
             .iter_mut()
             .filter_map(|(id, (source_desc, _))| {
+                let global_source_id = match id {
+                    Id::Local(_id) => unreachable!("sources can't be local"),
+                    Id::Global(id) => id,
+                    Id::PersistMetadata(id) => id,
+                };
+
                 source_desc.arguments.operators.as_ref().map(|op| {
                     let id = context
                         .humanizer
-                        .humanize_id(*id)
+                        .humanize_id(*global_source_id)
                         .unwrap_or_else(|| id.to_string());
                     (id, op)
                 })

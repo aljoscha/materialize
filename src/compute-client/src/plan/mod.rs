@@ -1623,7 +1623,7 @@ This is not expected to cause incorrect results, but could indicate a performanc
         }
         for id in desc.source_imports.keys() {
             arrangements
-                .entry(Id::Global(*id))
+                .entry(*id)
                 .or_insert_with(AvailableCollections::new_raw);
         }
         // Build each object in order, registering the arrangements it forms.
@@ -1661,7 +1661,7 @@ This is not expected to cause incorrect results, but could indicate a performanc
                 let mut todo = vec![&mut build_desc.plan];
                 while let Some(expression) = todo.pop() {
                     if let Plan::Get { id, plan, .. } = expression {
-                        if *id == mz_expr::Id::Global(*source_id) {
+                        if *id == *source_id {
                             match plan {
                                 GetPlan::Collection(mfp) => mfps.push(mfp),
                                 GetPlan::PassArrangements => {
@@ -1678,12 +1678,21 @@ This is not expected to cause incorrect results, but could indicate a performanc
                 }
             }
 
+            let global_source_id = match source_id {
+                Id::Local(_id) => unreachable!("sources can't be local"),
+                Id::Global(id) => id,
+                Id::PersistMetadata(id) => id,
+            };
+
             // Direct exports of sources are possible, and prevent pushdown.
             identity_present |= dataflow
                 .index_exports
                 .values()
-                .any(|(x, _)| x.on_id == *source_id);
-            identity_present |= dataflow.sink_exports.values().any(|x| x.from == *source_id);
+                .any(|(x, _)| x.on_id == *global_source_id);
+            identity_present |= dataflow
+                .sink_exports
+                .values()
+                .any(|x| x.from == *global_source_id);
 
             if !identity_present && !mfps.is_empty() {
                 // Extract a common prefix `MapFilterProject` from `mfps`.
@@ -1919,6 +1928,9 @@ impl<T> CollectionPlan for Plan<T> {
                 plan: _,
             } => match id {
                 Id::Global(id) => {
+                    out.insert(*id);
+                }
+                Id::PersistMetadata(id) => {
                     out.insert(*id);
                 }
                 Id::Local(_) => (),

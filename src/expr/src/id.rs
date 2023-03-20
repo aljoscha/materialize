@@ -42,6 +42,9 @@ pub enum Id {
     /// An identifier that refers to a global dataflow.
     #[proptest(value = "Id::Global(GlobalId::System(2))")]
     Global(GlobalId),
+    // #[proptest(value = "Id::PersistData(GlobalId::System(2))")]
+    // PersistData(GlobalId),
+    PersistMetadata(GlobalId),
 }
 
 impl fmt::Display for Id {
@@ -49,6 +52,7 @@ impl fmt::Display for Id {
         match self {
             Id::Local(id) => id.fmt(f),
             Id::Global(id) => id.fmt(f),
+            Id::PersistMetadata(id) => id.fmt(f),
         }
     }
 }
@@ -59,6 +63,7 @@ impl RustType<ProtoId> for Id {
             kind: Some(match self {
                 Id::Global(g) => proto_id::Kind::Global(g.into_proto()),
                 Id::Local(l) => proto_id::Kind::Local(l.into_proto()),
+                Id::PersistMetadata(g) => proto_id::Kind::PersistMetadata(g.into_proto()),
             }),
         }
     }
@@ -67,6 +72,7 @@ impl RustType<ProtoId> for Id {
         match proto.kind {
             Some(proto_id::Kind::Global(x)) => Ok(Id::Global(x.into_rust()?)),
             Some(proto_id::Kind::Local(x)) => Ok(Id::Local(x.into_rust()?)),
+            Some(proto_id::Kind::PersistMetadata(x)) => Ok(Id::PersistMetadata(x.into_rust()?)),
             None => Err(TryFromProtoError::missing_field("ProtoId::kind")),
         }
     }

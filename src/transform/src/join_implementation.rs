@@ -372,6 +372,7 @@ mod index_map {
         pub fn get(&self, id: Id) -> Box<dyn Iterator<Item = &[MirScalarExpr]> + '_> {
             match id {
                 Id::Global(id) => self.global.indexes_on(id),
+                Id::PersistMetadata(id) => panic!("unexpected Id::PersistMetadata({id})"),
                 Id::Local(id) => Box::new(
                     self.local
                         .get(&id)

@@ -226,6 +226,11 @@ impl Coordinator {
         let storage_ids = dataflow
             .source_imports
             .keys()
+            .map(|id| match id {
+                Id::Local(_) => panic!("sources can't be local"),
+                Id::Global(id) => id,
+                Id::PersistMetadata(id) => id,
+            })
             .copied()
             .collect::<BTreeSet<_>>();
         let compute_ids = dataflow
@@ -335,11 +340,11 @@ impl<'a> DataflowBuilder<'a, mz_repr::Timestamp> {
                 let entry = self.catalog.get_entry(id);
                 match entry.item() {
                     CatalogItem::Table(table) => {
-                        dataflow.import_source(*id, table.desc.typ().clone(), false);
+                        dataflow.import_source(Id::Global(*id), table.desc.typ().clone(), false);
                     }
                     CatalogItem::Source(source) => {
                         dataflow.import_source(
-                            *id,
+                            Id::Global(*id),
                             source.desc.typ().clone(),
                             self.monotonic_source(source),
                         );
@@ -350,10 +355,18 @@ impl<'a> DataflowBuilder<'a, mz_repr::Timestamp> {
                     }
                     CatalogItem::MaterializedView(mview) => {
                         let monotonic = self.monotonic_view(*id);
-                        dataflow.import_source(*id, mview.desc.typ().clone(), monotonic);
+                        dataflow.import_source(
+                            Id::Global(*id),
+                            mview.desc.typ().clone(),
+                            monotonic,
+                        );
                     }
                     CatalogItem::Log(log) => {
-                        dataflow.import_source(*id, log.variant.desc().typ().clone(), false);
+                        dataflow.import_source(
+                            Id::Global(*id),
+                            log.variant.desc().typ().clone(),
+                            false,
+                        );
                     }
                     _ => unreachable!(),
                 }

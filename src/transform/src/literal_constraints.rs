@@ -63,10 +63,18 @@ impl LiteralConstraints {
         let mut mfp = MapFilterProject::extract_non_errors_from_expr_mut(relation);
         relation.try_visit_mut_children(|e| self.action(e, indexes))?;
 
-        if let MirRelationExpr::Get {
-            id: Id::Global(id), ..
-        } = *relation
-        {
+        let global_id = match *relation {
+            MirRelationExpr::Get {
+                id: Id::Global(id), ..
+            } => Some(id),
+            MirRelationExpr::Get {
+                id: Id::PersistMetadata(id),
+                ..
+            } => Some(id),
+            _ => None,
+        };
+
+        if let Some(id) = global_id {
             let orig_mfp = mfp.clone();
 
             // Preparation for the literal constraints detection.

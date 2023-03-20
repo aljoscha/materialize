@@ -323,6 +323,13 @@ impl MirRelationExpr {
                             .unwrap_or_else(|| id.to_string());
                         write!(f, "{}Get {}", ctx.indent, humanized_id)?;
                     }
+                    Id::PersistMetadata(id) => {
+                        let humanized_id = ctx
+                            .humanizer
+                            .humanize_id(*id)
+                            .unwrap_or_else(|| id.to_string());
+                        write!(f, "{}Get(PersistMetadata) {}", ctx.indent, humanized_id)?;
+                    }
                 }
                 self.fmt_attributes(f, ctx)?;
             }
@@ -416,6 +423,7 @@ impl MirRelationExpr {
                                 Get { id, .. } => match id {
                                     Id::Local(lid) => Some(lid.to_string()),
                                     Id::Global(gid) => Some(global_id_name(gid)),
+                                    Id::PersistMetadata(gid) => Some(global_id_name(gid)),
                                 },
                                 ArrangeBy { input, .. } => dig_name_from_expr(h, input),
                                 Join {

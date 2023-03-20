@@ -81,6 +81,10 @@ impl DisplayText<PlanRenderingContext<'_, Plan>> for Plan {
                         .humanizer
                         .humanize_id(*id)
                         .unwrap_or_else(|| id.to_string()),
+                    Id::PersistMetadata(id) => ctx
+                        .humanizer
+                        .humanize_id(*id)
+                        .unwrap_or_else(|| id.to_string()),
                 };
                 // Render plan-specific fields.
                 use crate::plan::GetPlan;

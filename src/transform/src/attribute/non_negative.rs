@@ -63,6 +63,9 @@ impl Attribute for NonNegative {
                 Id::Global(_) => {
                     self.results.push(true);
                 }
+                Id::PersistMetadata(_) => {
+                    self.results.push(true);
+                }
             },
             Let {
                 value: _, body: _, ..

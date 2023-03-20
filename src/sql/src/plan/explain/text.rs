@@ -143,6 +143,13 @@ impl HirRelationExpr {
                         .unwrap_or_else(|| id.to_string());
                     writeln!(f, "{}Get {}", ctx.indent, humanized_id)?;
                 }
+                Id::PersistMetadata(id) => {
+                    let humanized_id = ctx
+                        .humanizer
+                        .humanize_id(*id)
+                        .unwrap_or_else(|| id.to_string());
+                    writeln!(f, "{}Get(PersistMetadata) {}", ctx.indent, humanized_id)?;
+                }
             },
             Project { outputs, input } => {
                 let outputs = Indices(outputs);

@@ -17,7 +17,7 @@ use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use timely::progress::Antichain;
 
-use mz_expr::{CollectionPlan, MirRelationExpr, MirScalarExpr, OptimizedMirRelationExpr};
+use mz_expr::{CollectionPlan, Id, MirRelationExpr, MirScalarExpr, OptimizedMirRelationExpr};
 use mz_proto::{IntoRustIfSome, ProtoMapEntry, ProtoType, RustType, TryFromProtoError};
 use mz_repr::{GlobalId, RelationType};
 use mz_storage_client::controller::CollectionMetadata;
@@ -40,7 +40,7 @@ include!(concat!(
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DataflowDescription<P, S: 'static = (), T = mz_repr::Timestamp> {
     /// Sources instantiations made available to the dataflow pair with monotonicity information.
-    pub source_imports: BTreeMap<GlobalId, (SourceInstanceDesc<S>, bool)>,
+    pub source_imports: BTreeMap<Id, (SourceInstanceDesc<S>, bool)>,
     /// Indexes made available to the dataflow.
     /// (id of new index, description of index, relationtype of base source/view, monotonic)
     pub index_imports: BTreeMap<GlobalId, (IndexDesc, RelationType, bool)>,
@@ -99,7 +99,7 @@ impl<T> DataflowDescription<OptimizedMirRelationExpr, (), T> {
     }
 
     /// Imports a source and makes it available as `id`.
-    pub fn import_source(&mut self, id: GlobalId, typ: RelationType, monotonic: bool) {
+    pub fn import_source(&mut self, id: Id, typ: RelationType, monotonic: bool) {
         // Import the source with no linear operators applied to it.
         // They may be populated by whole-dataflow optimization.
         self.source_imports.insert(
@@ -148,7 +148,10 @@ impl<T> DataflowDescription<OptimizedMirRelationExpr, (), T> {
     /// Returns true iff `id` is already imported.
     pub fn is_imported(&self, id: &GlobalId) -> bool {
         self.objects_to_build.iter().any(|bd| &bd.id == id)
-            || self.source_imports.keys().any(|i| i == id)
+            || self
+                .source_imports
+                .keys()
+                .any(|i| *i == Id::Global(*id) || *i == Id::PersistMetadata(*id))
     }
 
     /// Assigns the `as_of` frontier to the supplied argument.
@@ -181,7 +184,7 @@ impl<T> DataflowDescription<OptimizedMirRelationExpr, (), T> {
     /// The number of columns associated with an identifier in the dataflow.
     pub fn arity_of(&self, id: &GlobalId) -> usize {
         for (source_id, (source, _monotonic)) in self.source_imports.iter() {
-            if source_id == id {
+            if *source_id == Id::Global(*id) || *source_id == Id::PersistMetadata(*id) {
                 return source.typ.arity();
             }
         }
@@ -201,7 +204,8 @@ impl<T> DataflowDescription<OptimizedMirRelationExpr, (), T> {
 
 impl<P, S, T> DataflowDescription<P, S, T>
 where
-    P: CollectionPlan,
+    P: CollectionPlan + std::fmt::Debug,
+    S: std::fmt::Debug,
 {
     /// Identifiers of exported objects (indexes and sinks).
     pub fn export_ids(&self) -> impl Iterator<Item = GlobalId> + '_ {
@@ -229,9 +233,12 @@ where
     /// Panics if `id` is not present in `objects_to_build` exactly once.
     pub fn build_desc(&self, id: GlobalId) -> &BuildDesc<P> {
         let mut builds = self.objects_to_build.iter().filter(|build| build.id == id);
-        let build = builds
-            .next()
-            .unwrap_or_else(|| panic!("object to build id {id} unexpectedly missing"));
+        let build = builds.next().unwrap_or_else(|| {
+            panic!(
+                "object to build id {id} unexpectedly missing, have: {:#?}, source_imports: {:#?}",
+                self.objects_to_build, self.source_imports
+            )
+        });
         assert!(builds.next().is_none());
         build
     }
@@ -254,11 +261,20 @@ where
     /// This method is safe for mutually recursive view defintions.
     pub fn depends_on_into(&self, collection_id: GlobalId, out: &mut BTreeSet<GlobalId>) {
         out.insert(collection_id);
-        if self.source_imports.contains_key(&collection_id) {
+        if self.source_imports.contains_key(&Id::Global(collection_id))
+            || self
+                .source_imports
+                .contains_key(&Id::PersistMetadata(collection_id))
+        {
             // The collection is provided by an imported source. Report the
             // dependency on the source.
             out.insert(collection_id);
             return;
+        } else {
+            tracing::info!(
+                "NOT A SOURCE {collection_id}, source_imports: {:#?}",
+                self.source_imports
+            );
         }
 
         // NOTE(benesch): we're not smart enough here to know *which* index
@@ -344,13 +360,8 @@ impl RustType<ProtoDataflowDescription>
     }
 }
 
-impl ProtoMapEntry<GlobalId, (SourceInstanceDesc<CollectionMetadata>, bool)> for ProtoSourceImport {
-    fn from_rust<'a>(
-        entry: (
-            &'a GlobalId,
-            &'a (SourceInstanceDesc<CollectionMetadata>, bool),
-        ),
-    ) -> Self {
+impl ProtoMapEntry<Id, (SourceInstanceDesc<CollectionMetadata>, bool)> for ProtoSourceImport {
+    fn from_rust<'a>(entry: (&'a Id, &'a (SourceInstanceDesc<CollectionMetadata>, bool))) -> Self {
         ProtoSourceImport {
             id: Some(entry.0.into_proto()),
             source_instance_desc: Some(entry.1 .0.into_proto()),
@@ -360,7 +371,7 @@ impl ProtoMapEntry<GlobalId, (SourceInstanceDesc<CollectionMetadata>, bool)> for
 
     fn into_rust(
         self,
-    ) -> Result<(GlobalId, (SourceInstanceDesc<CollectionMetadata>, bool)), TryFromProtoError> {
+    ) -> Result<(Id, (SourceInstanceDesc<CollectionMetadata>, bool)), TryFromProtoError> {
         Ok((
             self.id.into_rust_if_some("ProtoSourceImport::id")?,
             (
@@ -483,10 +494,10 @@ proptest::prop_compose! {
     }
 }
 
-fn any_source_import(
-) -> impl Strategy<Value = (GlobalId, (SourceInstanceDesc<CollectionMetadata>, bool))> {
+fn any_source_import() -> impl Strategy<Value = (Id, (SourceInstanceDesc<CollectionMetadata>, bool))>
+{
     (
-        any::<GlobalId>(),
+        any::<Id>(),
         any::<(SourceInstanceDesc<CollectionMetadata>, bool)>(),
     )
 }

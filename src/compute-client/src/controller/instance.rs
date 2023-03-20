@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use mz_build_info::BuildInfo;
 use mz_cluster_client::client::ClusterStartupEpoch;
-use mz_expr::RowSetFinishing;
+use mz_expr::{Id, RowSetFinishing};
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_repr::{GlobalId, Row};
 use mz_storage_client::controller::{ReadPolicy, StorageController};
@@ -527,17 +527,23 @@ where
 
             // Validate sources have `since.less_equal(as_of)`.
             for source_id in dataflow.source_imports.keys() {
+                let global_source_id = match source_id {
+                    Id::Local(_id) => unreachable!("sources can't be local"),
+                    Id::Global(id) => id,
+                    Id::PersistMetadata(id) => id,
+                };
+
                 let since = &self
                     .storage_controller
-                    .collection(*source_id)
-                    .map_err(|_| DataflowCreationError::CollectionMissing(*source_id))?
+                    .collection(*global_source_id)
+                    .map_err(|_| DataflowCreationError::CollectionMissing(*global_source_id))?
                     .read_capabilities
                     .frontier();
                 if !(timely::order::PartialOrder::less_equal(since, &as_of.borrow())) {
-                    Err(DataflowCreationError::SinceViolation(*source_id))?;
+                    Err(DataflowCreationError::SinceViolation(*global_source_id))?;
                 }
 
-                storage_dependencies.push(*source_id);
+                storage_dependencies.push(*global_source_id);
             }
 
             // Validate indexes have `since.less_equal(as_of)`.
@@ -621,10 +627,16 @@ where
         for d in dataflows {
             let mut source_imports = BTreeMap::new();
             for (id, (si, monotonic)) in d.source_imports {
+                let global_source_id = match id {
+                    Id::Local(_id) => unreachable!("sources can't be local"),
+                    Id::Global(id) => id,
+                    Id::PersistMetadata(id) => id,
+                };
+
                 let collection = self
                     .storage_controller
-                    .collection(id)
-                    .map_err(|_| DataflowCreationError::CollectionMissing(id))?;
+                    .collection(global_source_id)
+                    .map_err(|_| DataflowCreationError::CollectionMissing(global_source_id))?;
                 let desc = SourceInstanceDesc {
                     storage_metadata: collection.collection_metadata.clone(),
                     arguments: si.arguments,
