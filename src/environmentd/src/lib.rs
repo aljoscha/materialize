@@ -96,6 +96,7 @@ use rand::seq::SliceRandom;
 use tokio::sync::oneshot;
 use tower_http::cors::AllowOrigin;
 
+use mz_adapter::catalog::durable_coord_state::DurableCoordState;
 use mz_adapter::catalog::storage::BootstrapArgs;
 use mz_adapter::catalog::ClusterReplicaSizeMap;
 use mz_adapter::config::{system_parameter_sync, SystemParameterBackend, SystemParameterFrontend};
@@ -109,6 +110,7 @@ use mz_ore::now::NowFn;
 use mz_ore::task;
 use mz_ore::tracing::TracingHandle;
 use mz_persist_client::usage::StorageUsageClient;
+use mz_persist_client::PersistClient;
 use mz_secrets::SecretsController;
 use mz_sql::catalog::EnvironmentId;
 use mz_storage_client::types::connections::ConnectionContext;
@@ -304,8 +306,16 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     let envd_epoch = stash
         .epoch()
         .expect("a real environmentd should always have an epoch number");
+    let persist_client = config
+        .controller
+        .persist_clients
+        .open(config.controller.persist_location.clone())
+        .await
+        .context("opening storage usage client")?;
+    let coord_state = DurableCoordState::new(PersistClient::COORD_LOG_SHARD, persist_client).await;
     let adapter_storage = mz_adapter::catalog::storage::Connection::open(
         stash,
+        coord_state,
         config.now.clone(),
         &BootstrapArgs {
             default_cluster_replica_size: config.bootstrap_default_cluster_replica_size,

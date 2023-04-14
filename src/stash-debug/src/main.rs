@@ -296,7 +296,6 @@ impl Usage {
                 dump_col!(catalog::COLLECTION_SCHEMA);
                 dump_col!(catalog::COLLECTION_ITEM);
                 dump_col!(catalog::COLLECTION_ROLE);
-                dump_col!(catalog::COLLECTION_TIMESTAMP);
                 dump_col!(catalog::COLLECTION_SYSTEM_CONFIGURATION);
                 dump_col!(catalog::COLLECTION_AUDIT_LOG);
                 dump_col!(catalog::COLLECTION_STORAGE_USAGE);
@@ -355,7 +354,6 @@ impl Usage {
                 edit_col!(catalog::COLLECTION_SCHEMA);
                 edit_col!(catalog::COLLECTION_ITEM);
                 edit_col!(catalog::COLLECTION_ROLE);
-                edit_col!(catalog::COLLECTION_TIMESTAMP);
                 edit_col!(catalog::COLLECTION_SYSTEM_CONFIGURATION);
                 edit_col!(catalog::COLLECTION_AUDIT_LOG);
                 edit_col!(catalog::COLLECTION_STORAGE_USAGE);
@@ -377,6 +375,7 @@ impl Usage {
         let now = SYSTEM_TIME.clone();
         let storage = mz_adapter::catalog::storage::Connection::open(
             stash,
+            todo!("thread persist client for coord state"),
             now.clone(),
             &BootstrapArgs {
                 default_cluster_replica_size: "1".into(),

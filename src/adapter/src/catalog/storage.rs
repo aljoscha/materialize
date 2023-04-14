@@ -16,6 +16,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use itertools::{max, Itertools};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use mz_audit_log::{
     EventDetails, EventType, EventV1, ObjectType, VersionedEvent, VersionedStorageUsage,
@@ -51,6 +52,7 @@ use crate::catalog::{SerializedReplicaConfig, DEFAULT_CLUSTER_REPLICA_NAME};
 use crate::coord::timeline;
 
 use super::{SerializedCatalogItem, SerializedReplicaLocation, SerializedReplicaLogging};
+use crate::catalog::durable_coord_state::DurableCoordState;
 
 const USER_VERSION: &str = "user_version";
 
@@ -770,6 +772,7 @@ pub struct BootstrapArgs {
 #[derive(Debug)]
 pub struct Connection {
     stash: Stash,
+    durable_state: DurableCoordState,
     boot_ts: mz_repr::Timestamp,
 }
 
@@ -777,6 +780,7 @@ impl Connection {
     #[tracing::instrument(name = "storage::open", level = "info", skip_all)]
     pub async fn open(
         mut stash: Stash,
+        mut durable_state: DurableCoordState,
         now: NowFn,
         bootstrap_args: &BootstrapArgs,
     ) -> Result<Connection, Error> {
@@ -804,12 +808,17 @@ impl Connection {
         //
         // This time is usually the current system time, but with protection
         // against backwards time jumps, even across restarts.
-        let previous_now_ts = try_get_persisted_timestamp(&mut stash, &Timeline::EpochMilliseconds)
-            .await?
-            .unwrap_or(mz_repr::Timestamp::MIN);
+        let previous_now_ts =
+            try_get_persisted_timestamp(&mut durable_state, &Timeline::EpochMilliseconds)
+                .await?
+                .unwrap_or(mz_repr::Timestamp::MIN);
         let boot_ts = timeline::monotonic_now(now, previous_now_ts);
 
-        let mut conn = Connection { stash, boot_ts };
+        let mut conn = Connection {
+            stash,
+            durable_state,
+            boot_ts,
+        };
 
         if !conn.stash.is_readonly() {
             // IMPORTANT: we durably record the new timestamp before using it.
@@ -1245,12 +1254,14 @@ impl Connection {
     pub async fn get_all_persisted_timestamps(
         &mut self,
     ) -> Result<BTreeMap<Timeline, mz_repr::Timestamp>, Error> {
-        Ok(COLLECTION_TIMESTAMP
-            .peek_one(&mut self.stash)
-            .await?
+        self.durable_state.sync_to_recent_upper().await;
+
+        let timestamps = self
+            .durable_state
+            .get_all_timestamps()
             .into_iter()
-            .map(|(k, v)| (k.id.parse().expect("invalid timeline persisted"), v.ts))
-            .collect())
+            .collect();
+        Ok(timestamps)
     }
 
     /// Persist new global timestamp for a timeline to disk.
@@ -1260,18 +1271,33 @@ impl Connection {
         timeline: &Timeline,
         timestamp: mz_repr::Timestamp,
     ) -> Result<(), Error> {
-        let key = TimestampKey {
-            id: timeline.to_string(),
-        };
-        let (prev, next) = COLLECTION_TIMESTAMP
-            .upsert_key(&mut self.stash, key, move |_| {
-                Ok::<_, Error>(TimestampValue { ts: timestamp })
-            })
-            .await??;
-        if let Some(prev) = prev {
-            assert!(next >= prev, "global timestamp must always go up");
+        // TODO(aljoscha): Add assertion to make sure timestamps always go up!
+        loop {
+            let updates = self
+                .durable_state
+                .prepare_upsert_timestamp(timeline.clone(), timestamp);
+
+            let res = self.durable_state.commit_updates(updates).await;
+
+            match res {
+                Ok(()) => return Ok(()),
+                Err(upper_error) => {
+                    debug!("upper mismatch while persisting timestamp: {}", upper_error);
+                }
+            }
+
+            self.durable_state.sync_to_recent_upper().await;
+            let recent_timestamp = self.durable_state.get_timestamp(timeline);
+            if let Some(recent_timestamp) = recent_timestamp {
+                if recent_timestamp >= timestamp {
+                    debug!(
+                        "someone already persisted a higher timestamp: {} >= {}",
+                        recent_timestamp, timestamp
+                    );
+                    return Ok(());
+                }
+            }
         }
-        Ok(())
     }
 
     pub async fn transaction<'a>(&'a mut self) -> Result<Transaction<'a>, Error> {
@@ -1291,18 +1317,16 @@ impl Connection {
 ///
 /// Returns `None` if no persisted timestamp for the specified timeline exists.
 async fn try_get_persisted_timestamp(
-    stash: &mut Stash,
+    durable_state: &mut DurableCoordState,
     timeline: &Timeline,
 ) -> Result<Option<mz_repr::Timestamp>, Error>
 where
 {
-    let key = TimestampKey {
-        id: timeline.to_string(),
-    };
-    Ok(COLLECTION_TIMESTAMP
-        .peek_key_one(stash, key)
-        .await?
-        .map(|v| v.ts))
+    durable_state.sync_to_recent_upper().await;
+
+    let timestamp = durable_state.get_timestamp(timeline);
+
+    Ok(timestamp)
 }
 
 #[tracing::instrument(name = "storage::transaction", level = "debug", skip_all)]
@@ -1318,7 +1342,6 @@ pub async fn transaction<'a>(stash: &'a mut Stash) -> Result<Transaction<'a>, Er
         id_allocator,
         configs,
         settings,
-        timestamps,
         system_gid_mapping,
         system_configurations,
     ) = stash
@@ -1339,7 +1362,6 @@ pub async fn transaction<'a>(stash: &'a mut Stash) -> Result<Transaction<'a>, Er
                     tx.peek_one(tx.collection(COLLECTION_ID_ALLOC.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_CONFIG.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_SETTING.name()).await?),
-                    tx.peek_one(tx.collection(COLLECTION_TIMESTAMP.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_SYSTEM_GID_MAPPING.name()).await?),
                     tx.peek_one(
                         tx.collection(COLLECTION_SYSTEM_CONFIGURATION.name())
@@ -1366,7 +1388,6 @@ pub async fn transaction<'a>(stash: &'a mut Stash) -> Result<Transaction<'a>, Er
         id_allocator: TableTransaction::new(id_allocator, |_a, _b| false),
         configs: TableTransaction::new(configs, |_a, _b| false),
         settings: TableTransaction::new(settings, |_a, _b| false),
-        timestamps: TableTransaction::new(timestamps, |_a, _b| false),
         system_gid_mapping: TableTransaction::new(system_gid_mapping, |_a, _b| false),
         system_configurations: TableTransaction::new(system_configurations, |_a, _b| false),
         audit_log_updates: Vec::new(),
@@ -1387,7 +1408,6 @@ pub struct Transaction<'a> {
     id_allocator: TableTransaction<IdAllocKey, IdAllocValue>,
     configs: TableTransaction<String, ConfigValue>,
     settings: TableTransaction<SettingKey, SettingValue>,
-    timestamps: TableTransaction<TimestampKey, TimestampValue>,
     system_gid_mapping: TableTransaction<GidMappingKey, GidMappingValue>,
     system_configurations: TableTransaction<ServerConfigurationKey, ServerConfigurationValue>,
     // Don't make this a table transaction so that it's not read into the stash
@@ -2045,13 +2065,8 @@ impl<'a> Transaction<'a> {
         self.system_configurations.delete(|_k, _v| true);
     }
 
-    pub fn remove_timestamp(&mut self, timeline: Timeline) {
-        let timeline_str = timeline.to_string();
-        let prev = self
-            .timestamps
-            .set(TimestampKey { id: timeline_str }, None)
-            .expect("cannot have uniqueness violation");
-        assert!(prev.is_some());
+    pub fn remove_timestamp(&mut self, _timeline: Timeline) {
+        todo!("remove timestamps");
     }
 
     /// Commits the storage transaction to the stash. Any error returned indicates the stash may be
@@ -2124,7 +2139,6 @@ impl<'a> Transaction<'a> {
         let id_allocator = Arc::new(self.id_allocator.pending());
         let configs = Arc::new(self.configs.pending());
         let settings = Arc::new(self.settings.pending());
-        let timestamps = Arc::new(self.timestamps.pending());
         let system_gid_mapping = Arc::new(self.system_gid_mapping.pending());
         let system_configurations = Arc::new(self.system_configurations.pending());
         let audit_log_updates = Arc::new(self.audit_log_updates);
@@ -2216,14 +2230,6 @@ impl<'a> Transaction<'a> {
                         &mut migration_retractions,
                         &COLLECTION_SETTING,
                         &settings,
-                    )
-                    .await?;
-                    add_batch(
-                        &tx,
-                        &mut batches,
-                        &mut migration_retractions,
-                        &COLLECTION_TIMESTAMP,
-                        &timestamps,
                     )
                     .await?;
                     add_batch(
@@ -2332,7 +2338,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     schema,
                     item,
                     role,
-                    timestamp,
                     system_configuration,
                     audit_log,
                     storage_usage,
@@ -2348,7 +2353,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     add_batch(&tx, &COLLECTION_SCHEMA),
                     add_batch(&tx, &COLLECTION_ITEM),
                     add_batch(&tx, &COLLECTION_ROLE),
-                    add_batch(&tx, &COLLECTION_TIMESTAMP),
                     add_batch(&tx, &COLLECTION_SYSTEM_CONFIGURATION),
                     add_batch(&tx, &COLLECTION_AUDIT_LOG),
                     add_batch(&tx, &COLLECTION_STORAGE_USAGE),
@@ -2365,7 +2369,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     schema,
                     item,
                     role,
-                    timestamp,
                     system_configuration,
                     audit_log,
                     storage_usage,
@@ -2561,8 +2564,6 @@ pub static COLLECTION_SCHEMA: TypedCollection<SchemaKey, SchemaValue> =
     TypedCollection::new("schema");
 pub static COLLECTION_ITEM: TypedCollection<ItemKey, ItemValue> = TypedCollection::new("item");
 pub static COLLECTION_ROLE: TypedCollection<RoleKey, RoleValue> = TypedCollection::new("role");
-pub static COLLECTION_TIMESTAMP: TypedCollection<TimestampKey, TimestampValue> =
-    TypedCollection::new("timestamp");
 pub static COLLECTION_SYSTEM_CONFIGURATION: TypedCollection<
     ServerConfigurationKey,
     ServerConfigurationValue,
@@ -2584,7 +2585,6 @@ pub static ALL_COLLECTIONS: &[&str] = &[
     COLLECTION_SCHEMA.name(),
     COLLECTION_ITEM.name(),
     COLLECTION_ROLE.name(),
-    COLLECTION_TIMESTAMP.name(),
     COLLECTION_SYSTEM_CONFIGURATION.name(),
     COLLECTION_AUDIT_LOG.name(),
     COLLECTION_STORAGE_USAGE.name(),

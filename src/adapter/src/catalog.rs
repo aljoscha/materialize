@@ -3833,6 +3833,7 @@ impl Catalog {
         let metrics_registry = &MetricsRegistry::new();
         let storage = storage::Connection::open(
             stash,
+            panic!("thread through persist client for coord state"),
             now.clone(),
             &BootstrapArgs {
                 default_cluster_replica_size: "1".into(),
