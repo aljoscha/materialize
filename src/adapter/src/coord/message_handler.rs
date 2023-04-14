@@ -625,10 +625,6 @@ impl Coordinator {
         }
 
         if !ready_txns.is_empty() {
-            self.catalog_mut()
-                .confirm_leadership()
-                .await
-                .unwrap_or_terminate("unable to confirm leadership");
             for ready_txn in ready_txns {
                 ready_txn.finish();
             }
