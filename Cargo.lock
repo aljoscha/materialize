@@ -4166,6 +4166,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tracing",
+ "uuid",
  "workspace-hack",
 ]
 

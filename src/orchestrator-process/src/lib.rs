@@ -110,6 +110,7 @@ use tokio::select;
 use tokio::sync::broadcast::{self, Sender};
 use tokio::time::{self, Duration};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use mz_orchestrator::{
     NamespacedOrchestrator, Orchestrator, Service, ServiceConfig, ServiceEvent,
@@ -206,7 +207,8 @@ impl ProcessOrchestrator {
             tcp_proxy,
         }: ProcessOrchestratorConfig,
     ) -> Result<ProcessOrchestrator, anyhow::Error> {
-        let metadata_dir = env::temp_dir().join(format!("environmentd-{environment_id}"));
+        let uuid = Uuid::new_v4();
+        let metadata_dir = env::temp_dir().join(format!("environmentd-{environment_id}-{uuid}"));
         fs::create_dir_all(&metadata_dir)
             .await
             .context("creating metadata directory")?;
