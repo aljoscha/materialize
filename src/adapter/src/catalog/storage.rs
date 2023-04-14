@@ -43,6 +43,8 @@ use crate::catalog::builtin::{
     BuiltinLog, BUILTIN_CLUSTERS, BUILTIN_CLUSTER_REPLICAS, BUILTIN_PREFIXES,
     MZ_INTROSPECTION_ROLE, MZ_SYSTEM_ROLE,
 };
+use crate::catalog::durable_coord_state::DurableCoordState;
+use crate::catalog::durable_coord_state::StateUpdate;
 use crate::catalog::error::{Error, ErrorKind};
 use crate::catalog::{
     is_public_role, is_reserved_name, Cluster, ClusterReplica, Database, RoleMembership, Schema,
@@ -52,7 +54,6 @@ use crate::catalog::{SerializedReplicaConfig, DEFAULT_CLUSTER_REPLICA_NAME};
 use crate::coord::timeline;
 
 use super::{SerializedCatalogItem, SerializedReplicaLocation, SerializedReplicaLogging};
-use crate::catalog::durable_coord_state::DurableCoordState;
 
 const USER_VERSION: &str = "user_version";
 
@@ -78,6 +79,7 @@ pub(crate) const STORAGE_USAGE_ID_ALLOC_KEY: &str = "storage_usage";
 
 async fn migrate(
     stash: &mut Stash,
+    durable_state: &mut DurableCoordState,
     version: u64,
     now: EpochMillis,
     bootstrap_args: &BootstrapArgs,
@@ -522,17 +524,18 @@ async fn migrate(
                 Some(schema_value)
             })?;
 
-            txn.items.update(|item_key, item_value| {
-                let mut item_value = item_value.clone();
-                if item_value.owner_id.is_none() {
-                    if item_key.gid.is_system() {
-                        item_value.owner_id = Some(MZ_SYSTEM_ROLE_ID);
-                    } else {
-                        item_value.owner_id = Some(default_owner_id);
-                    }
-                }
-                Some(item_value)
-            })?;
+            // TODO(aljoscha): A migration that we don't need for the PoC.
+            // txn.items.update(|item_key, item_value| {
+            //     let mut item_value = item_value.clone();
+            //     if item_value.owner_id.is_none() {
+            //         if item_key.gid.is_system() {
+            //             item_value.owner_id = Some(MZ_SYSTEM_ROLE_ID);
+            //         } else {
+            //             item_value.owner_id = Some(default_owner_id);
+            //         }
+            //     }
+            //     Some(item_value)
+            // })?;
 
             txn.clusters.update(|cluster_key, cluster_value| {
                 let mut cluster_value = cluster_value.clone();
@@ -593,7 +596,7 @@ async fn migrate(
     // unneeded Option types.
     fix_incorrect_retractions(stash).await?;
 
-    let mut txn = transaction(stash).await?;
+    let mut txn = transaction(stash, durable_state).await?;
     for (i, migration) in migrations
         .iter()
         .enumerate()
@@ -646,7 +649,6 @@ async fn fix_incorrect_retractions(stash: &mut Stash) -> Result<(), StashError> 
                 fix(&tx, &COLLECTION_DATABASE, &mut ids).await?;
                 fix(&tx, &COLLECTION_SCHEMA, &mut ids).await?;
                 fix(&tx, &COLLECTION_ROLE, &mut ids).await?;
-                fix(&tx, &COLLECTION_ITEM, &mut ids).await?;
                 fix(&tx, &COLLECTION_CLUSTERS, &mut ids).await?;
                 fix(&tx, &COLLECTION_CLUSTER_REPLICAS, &mut ids).await?;
                 Ok(ids)
@@ -824,7 +826,14 @@ impl Connection {
             // IMPORTANT: we durably record the new timestamp before using it.
             conn.persist_timestamp(&Timeline::EpochMilliseconds, boot_ts)
                 .await?;
-            migrate(&mut conn.stash, skip, boot_ts.into(), bootstrap_args).await?;
+            migrate(
+                &mut conn.stash,
+                &mut conn.durable_state,
+                skip,
+                boot_ts.into(),
+                bootstrap_args,
+            )
+            .await?;
         }
 
         Ok(conn)
@@ -1301,7 +1310,7 @@ impl Connection {
     }
 
     pub async fn transaction<'a>(&'a mut self) -> Result<Transaction<'a>, Error> {
-        transaction(&mut self.stash).await
+        transaction(&mut self.stash, &mut self.durable_state).await
     }
 
     pub async fn confirm_leadership(&mut self) -> Result<(), Error> {
@@ -1330,12 +1339,14 @@ where
 }
 
 #[tracing::instrument(name = "storage::transaction", level = "debug", skip_all)]
-pub async fn transaction<'a>(stash: &'a mut Stash) -> Result<Transaction<'a>, Error> {
+pub async fn transaction<'a>(
+    stash: &'a mut Stash,
+    durable_state: &'a mut DurableCoordState,
+) -> Result<Transaction<'a>, Error> {
     let (
         databases,
         schemas,
         roles,
-        items,
         clusters,
         cluster_replicas,
         introspection_sources,
@@ -1352,7 +1363,6 @@ pub async fn transaction<'a>(stash: &'a mut Stash) -> Result<Transaction<'a>, Er
                     tx.peek_one(tx.collection(COLLECTION_DATABASE.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_SCHEMA.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_ROLE.name()).await?),
-                    tx.peek_one(tx.collection(COLLECTION_ITEM.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_CLUSTERS.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_CLUSTER_REPLICAS.name()).await?),
                     tx.peek_one(
@@ -1372,13 +1382,17 @@ pub async fn transaction<'a>(stash: &'a mut Stash) -> Result<Transaction<'a>, Er
         })
         .await?;
 
+    durable_state.sync_to_recent_upper().await;
+
     Ok(Transaction {
         stash,
+        durable_state,
+        durable_state_updates: Vec::new(),
+
         databases: TableTransaction::new(databases, |a, b| a.name == b.name),
         schemas: TableTransaction::new(schemas, |a, b| {
             a.database_id == b.database_id && a.name == b.name
         }),
-        items: TableTransaction::new(items, |a, b| a.schema_id == b.schema_id && a.name == b.name),
         roles: TableTransaction::new(roles, |a, b| a.role.name == b.role.name),
         clusters: TableTransaction::new(clusters, |a, b| a.name == b.name),
         cluster_replicas: TableTransaction::new(cluster_replicas, |a, b| {
@@ -1397,9 +1411,11 @@ pub async fn transaction<'a>(stash: &'a mut Stash) -> Result<Transaction<'a>, Er
 
 pub struct Transaction<'a> {
     stash: &'a mut Stash,
+    durable_state: &'a mut DurableCoordState,
+    durable_state_updates: Vec<(StateUpdate, i64)>,
     databases: TableTransaction<DatabaseKey, DatabaseValue>,
     schemas: TableTransaction<SchemaKey, SchemaValue>,
-    items: TableTransaction<ItemKey, ItemValue>,
+    // items: TableTransaction<ItemKey, ItemValue>,
     roles: TableTransaction<RoleKey, RoleValue>,
     clusters: TableTransaction<ClusterKey, ClusterValue>,
     cluster_replicas: TableTransaction<ClusterReplicaKey, ClusterReplicaValue>,
@@ -1422,8 +1438,9 @@ impl<'a> Transaction<'a> {
     ) -> Vec<(GlobalId, QualifiedItemName, SerializedCatalogItem, RoleId)> {
         let databases = self.databases.items();
         let schemas = self.schemas.items();
+        let durable_items = self.durable_state.get_all_items();
         let mut items = Vec::new();
-        self.items.for_values(|k, v| {
+        durable_items.into_iter().for_each(|(k, v)| {
             let schema = match schemas.get(&SchemaKey { id: v.schema_id }) {
                 Some(schema) => schema,
                 None => panic!(
@@ -1457,7 +1474,9 @@ impl<'a> Transaction<'a> {
                 v.owner_id.expect("owner ID not migrated"),
             ));
         });
+
         items.sort_by_key(|(id, _, _, _)| *id);
+
         items
     }
 
@@ -1663,20 +1682,28 @@ impl<'a> Transaction<'a> {
         item: SerializedCatalogItem,
         owner_id: RoleId,
     ) -> Result<(), Error> {
-        match self.items.insert(
-            ItemKey { gid: id },
-            ItemValue {
-                schema_id: schema_id.0,
-                name: item_name.to_string(),
-                definition: item,
-                owner_id: Some(owner_id),
-            },
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(Error::new(ErrorKind::ItemAlreadyExists(
+        let key = ItemKey { gid: id };
+        let existing_item = self.durable_state.get_item(&key);
+
+        if let Some(_existing_item) = existing_item {
+            Err(Error::new(ErrorKind::ItemAlreadyExists(
                 id,
                 item_name.to_owned(),
-            ))),
+            )))
+        } else {
+            let mut state_updates = self.durable_state.prepare_upsert_item(
+                ItemKey { gid: id },
+                ItemValue {
+                    schema_id: schema_id.0,
+                    name: item_name.to_string(),
+                    definition: item,
+                    owner_id: Some(owner_id),
+                },
+            );
+
+            self.durable_state_updates.append(&mut state_updates);
+
+            Ok(())
         }
     }
 
@@ -1769,8 +1796,13 @@ impl<'a> Transaction<'a> {
     /// Runtime is linear with respect to the total number of items in the stash.
     /// DO NOT call this function in a loop, use [`Self::remove_items`] instead.
     pub fn remove_item(&mut self, id: GlobalId) -> Result<(), Error> {
-        let prev = self.items.set(ItemKey { gid: id }, None)?;
-        if prev.is_some() {
+        let key = ItemKey { gid: id };
+        let existing_item = self.durable_state.get_item(&key);
+
+        if let Some(_existing_item) = existing_item {
+            let mut state_updates = self.durable_state.prepare_remove_item(ItemKey { gid: id });
+
+            self.durable_state_updates.append(&mut state_updates);
             Ok(())
         } else {
             Err(SqlCatalogError::UnknownItem(id.to_string()).into())
@@ -1784,14 +1816,10 @@ impl<'a> Transaction<'a> {
     /// NOTE: On error, there still may be some items removed from the transaction. It is
     /// up to the called to either abort the transaction or commit.
     pub fn remove_items(&mut self, ids: BTreeSet<GlobalId>) -> Result<(), Error> {
-        let n = self.items.delete(|k, _v| ids.contains(&k.gid)).len();
-        if n == ids.len() {
-            Ok(())
-        } else {
-            let item_gids = self.items.items().keys().map(|k| k.gid).collect();
-            let mut unknown = ids.difference(&item_gids);
-            Err(SqlCatalogError::UnknownItem(unknown.join(", ")).into())
+        for id in ids {
+            self.remove_item(id)?;
         }
+        Ok(())
     }
 
     /// Updates item `id` in the transaction to `item_name` and `item`.
@@ -1806,24 +1834,28 @@ impl<'a> Transaction<'a> {
         item_name: &str,
         item: &SerializedCatalogItem,
     ) -> Result<(), Error> {
-        let n = self.items.update(|k, v| {
-            if k.gid == id {
-                Some(ItemValue {
-                    schema_id: v.schema_id,
+        let existing_items = self.durable_state.get_all_items();
+
+        let key = ItemKey { gid: id };
+        let existing_item = existing_items.get(&key);
+        match existing_item {
+            Some(existing_item) => {
+                let new_item = ItemValue {
+                    schema_id: existing_item.schema_id,
                     name: item_name.to_string(),
                     definition: item.clone(),
-                    owner_id: v.owner_id,
-                })
-            } else {
-                None
+                    owner_id: existing_item.owner_id,
+                };
+
+                let mut state_updates = self.durable_state.prepare_upsert_item(key, new_item);
+                self.durable_state_updates.append(&mut state_updates);
             }
-        })?;
-        assert!(n <= 1);
-        if n == 1 {
-            Ok(())
-        } else {
-            Err(SqlCatalogError::UnknownItem(id.to_string()).into())
+            None => {
+                return Err(SqlCatalogError::UnknownItem(id.to_string()).into());
+            }
         }
+
+        Ok(())
     }
 
     /// Updates all items with ids matching the keys of `items` in the transaction, to the
@@ -1837,27 +1869,33 @@ impl<'a> Transaction<'a> {
         &mut self,
         items: BTreeMap<GlobalId, (String, SerializedCatalogItem)>,
     ) -> Result<(), Error> {
-        let n = self.items.update(|k, v| {
-            if let Some((item_name, item)) = items.get(&k.gid) {
-                Some(ItemValue {
-                    schema_id: v.schema_id,
-                    name: item_name.clone(),
-                    definition: item.clone(),
-                    owner_id: v.owner_id,
-                })
-            } else {
-                None
+        let existing_items = self.durable_state.get_all_items();
+
+        for (key, (item_name, item)) in items.iter() {
+            let key = ItemKey { gid: *key };
+            let existing_item = existing_items.get(&key);
+            match existing_item {
+                Some(existing_item) => {
+                    let new_item = ItemValue {
+                        schema_id: existing_item.schema_id,
+                        name: item_name.clone(),
+                        definition: item.clone(),
+                        owner_id: existing_item.owner_id,
+                    };
+
+                    let mut state_updates = self.durable_state.prepare_upsert_item(key, new_item);
+                    self.durable_state_updates.append(&mut state_updates);
+                }
+                None => {
+                    let update_ids: BTreeSet<_> = items.into_keys().collect();
+                    let item_ids: BTreeSet<_> = existing_items.keys().map(|k| k.gid).collect();
+                    let mut unknown = update_ids.difference(&item_ids);
+                    return Err(SqlCatalogError::UnknownItem(unknown.join(", ")).into());
+                }
             }
-        })?;
-        let n = usize::try_from(n).expect("Must be positive and fit in usize");
-        if n == items.len() {
-            Ok(())
-        } else {
-            let update_ids: BTreeSet<_> = items.into_keys().collect();
-            let item_ids: BTreeSet<_> = self.items.items().keys().map(|k| k.gid).collect();
-            let mut unknown = update_ids.difference(&item_ids);
-            Err(SqlCatalogError::UnknownItem(unknown.join(", ")).into())
         }
+
+        Ok(())
     }
 
     /// Updates role `id` in the transaction to `role`.
@@ -2131,7 +2169,6 @@ impl<'a> Transaction<'a> {
         // instead only clone the Arc.
         let databases = Arc::new(self.databases.pending());
         let schemas = Arc::new(self.schemas.pending());
-        let items = Arc::new(self.items.pending());
         let roles = Arc::new(self.roles.pending());
         let clusters = Arc::new(self.clusters.pending());
         let cluster_replicas = Arc::new(self.cluster_replicas.pending());
@@ -2143,6 +2180,16 @@ impl<'a> Transaction<'a> {
         let system_configurations = Arc::new(self.system_configurations.pending());
         let audit_log_updates = Arc::new(self.audit_log_updates);
         let storage_usage_updates = Arc::new(self.storage_usage_updates);
+
+        self.durable_state
+            .commit_updates(self.durable_state_updates)
+            .await
+            .map_err(|e| {
+                Error::from(ErrorKind::Unstructured(format!(
+                    "could not commit coord state update, upper mismatch: {}",
+                    e
+                )))
+            })?;
 
         let consolidate_ids = self
             .stash
@@ -2166,14 +2213,6 @@ impl<'a> Transaction<'a> {
                         &mut migration_retractions,
                         &COLLECTION_SCHEMA,
                         &schemas,
-                    )
-                    .await?;
-                    add_batch(
-                        &tx,
-                        &mut batches,
-                        &mut migration_retractions,
-                        &COLLECTION_ITEM,
-                        &items,
                     )
                     .await?;
                     add_batch(
@@ -2336,7 +2375,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     cluster_replicas,
                     database,
                     schema,
-                    item,
                     role,
                     system_configuration,
                     audit_log,
@@ -2351,7 +2389,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     add_batch(&tx, &COLLECTION_CLUSTER_REPLICAS),
                     add_batch(&tx, &COLLECTION_DATABASE),
                     add_batch(&tx, &COLLECTION_SCHEMA),
-                    add_batch(&tx, &COLLECTION_ITEM),
                     add_batch(&tx, &COLLECTION_ROLE),
                     add_batch(&tx, &COLLECTION_SYSTEM_CONFIGURATION),
                     add_batch(&tx, &COLLECTION_AUDIT_LOG),
@@ -2367,7 +2404,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     cluster_replicas,
                     database,
                     schema,
-                    item,
                     role,
                     system_configuration,
                     audit_log,
@@ -2562,7 +2598,6 @@ pub static COLLECTION_DATABASE: TypedCollection<DatabaseKey, DatabaseValue> =
     TypedCollection::new("database");
 pub static COLLECTION_SCHEMA: TypedCollection<SchemaKey, SchemaValue> =
     TypedCollection::new("schema");
-pub static COLLECTION_ITEM: TypedCollection<ItemKey, ItemValue> = TypedCollection::new("item");
 pub static COLLECTION_ROLE: TypedCollection<RoleKey, RoleValue> = TypedCollection::new("role");
 pub static COLLECTION_SYSTEM_CONFIGURATION: TypedCollection<
     ServerConfigurationKey,
@@ -2583,7 +2618,6 @@ pub static ALL_COLLECTIONS: &[&str] = &[
     COLLECTION_CLUSTER_REPLICAS.name(),
     COLLECTION_DATABASE.name(),
     COLLECTION_SCHEMA.name(),
-    COLLECTION_ITEM.name(),
     COLLECTION_ROLE.name(),
     COLLECTION_SYSTEM_CONFIGURATION.name(),
     COLLECTION_AUDIT_LOG.name(),

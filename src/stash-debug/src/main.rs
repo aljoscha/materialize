@@ -294,7 +294,6 @@ impl Usage {
                 dump_col!(catalog::COLLECTION_CLUSTER_REPLICAS);
                 dump_col!(catalog::COLLECTION_DATABASE);
                 dump_col!(catalog::COLLECTION_SCHEMA);
-                dump_col!(catalog::COLLECTION_ITEM);
                 dump_col!(catalog::COLLECTION_ROLE);
                 dump_col!(catalog::COLLECTION_SYSTEM_CONFIGURATION);
                 dump_col!(catalog::COLLECTION_AUDIT_LOG);
@@ -352,7 +351,6 @@ impl Usage {
                 edit_col!(catalog::COLLECTION_CLUSTER_REPLICAS);
                 edit_col!(catalog::COLLECTION_DATABASE);
                 edit_col!(catalog::COLLECTION_SCHEMA);
-                edit_col!(catalog::COLLECTION_ITEM);
                 edit_col!(catalog::COLLECTION_ROLE);
                 edit_col!(catalog::COLLECTION_SYSTEM_CONFIGURATION);
                 edit_col!(catalog::COLLECTION_AUDIT_LOG);
