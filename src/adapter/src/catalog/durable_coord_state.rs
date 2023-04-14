@@ -25,7 +25,6 @@ use std::sync::Arc;
 use differential_dataflow::consolidation;
 use differential_dataflow::lattice::Lattice;
 use itertools::Itertools;
-use mz_storage_client::types::sources::Timeline;
 use serde::Deserialize;
 use serde::Serialize;
 use timely::progress::Antichain;
@@ -39,7 +38,10 @@ use mz_persist_client::ShardId;
 use mz_persist_types::codec_impls::TodoSchema;
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_persist_types::Codec;
+use mz_storage_client::types::sources::Timeline;
 
+use crate::catalog::storage::ItemKey;
+use crate::catalog::storage::ItemValue;
 use crate::catalog::storage::TimestampKey;
 use crate::catalog::storage::TimestampValue;
 
@@ -49,6 +51,8 @@ pub struct DurableCoordState {
     // full diffs. And only collapse them down to a map when needed. And also
     // ensure that there is only one entry for a given `GlobalId` then.
     timestamps: BTreeMap<TimestampKey, TimestampValue>,
+
+    items: BTreeMap<ItemKey, ItemValue>,
 
     trace: Vec<(StateUpdate, u64, i64)>,
 
@@ -60,6 +64,7 @@ pub struct DurableCoordState {
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum StateUpdate {
     Timestamp(TimestampKey, TimestampValue),
+    Item(ItemKey, ItemValue),
 }
 
 impl Codec for StateUpdate {
@@ -155,6 +160,7 @@ impl DurableCoordState {
 
         let mut this = Self {
             timestamps: BTreeMap::new(),
+            items: BTreeMap::new(),
             trace: Vec::new(),
             upper: restart_as_of,
             listen,
@@ -187,6 +193,14 @@ impl DurableCoordState {
                 )
             })
             .collect_vec()
+    }
+
+    pub fn get_item(&self, key: &ItemKey) -> Option<ItemValue> {
+        self.items.get(key).cloned()
+    }
+
+    pub fn get_all_items(&self) -> BTreeMap<ItemKey, ItemValue> {
+        self.items.clone()
     }
 
     // TODO(aljoscha): These `prepare_*` updates are very inefficient. Also, we
@@ -250,6 +264,48 @@ impl DurableCoordState {
                     StateUpdate::Timestamp(key.clone(), current_timestamp.clone()),
                     -1,
                 ));
+            }
+            None => {
+                // Nothing to do!
+            }
+        }
+
+        updates
+    }
+
+    pub fn prepare_upsert_item(&self, key: ItemKey, item: ItemValue) -> Vec<(StateUpdate, i64)> {
+        let mut updates = Vec::new();
+
+        let current_item = self.items.get(&key);
+
+        match current_item {
+            Some(current_item) if current_item == &item => {
+                // No need to change anything!
+            }
+            Some(current_item) => {
+                // Need to retract the old mapping and insert a new mapping.
+                updates.push((StateUpdate::Item(key.clone(), current_item.clone()), -1));
+                updates.push((StateUpdate::Item(key.clone(), item), 1));
+            }
+            None => {
+                // Only need to add the new mapping.
+                updates.push((StateUpdate::Item(key, item), 1));
+            }
+        }
+
+        updates
+    }
+
+    #[allow(unused)]
+    pub fn prepare_remove_item(&self, key: ItemKey) -> Vec<(StateUpdate, i64)> {
+        let mut updates = Vec::new();
+
+        let current_item = self.items.get(&key);
+
+        match current_item {
+            Some(current_item) => {
+                // Need to retract the mapping.
+                updates.push((StateUpdate::Item(key, current_item.clone()), -1));
             }
             None => {
                 // Nothing to do!
@@ -368,12 +424,16 @@ impl DurableCoordState {
         // in-memory cash of every type of collection every time we're applying
         // updates. It's easy and correct, though.
         self.timestamps = BTreeMap::new();
+        self.items = BTreeMap::new();
 
         for update in self.trace.iter() {
             match update {
                 (state_update, _ts, 1) => match state_update {
                     StateUpdate::Timestamp(timeline, timestamp) => {
                         self.timestamps.insert(timeline.clone(), timestamp.clone());
+                    }
+                    StateUpdate::Item(key, item) => {
+                        self.items.insert(key.clone(), item.clone());
                     }
                 },
                 invalid_update => {
