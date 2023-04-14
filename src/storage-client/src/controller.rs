@@ -2365,7 +2365,7 @@ where
 
             let since = handle.since().clone();
 
-            let our_epoch = self.state.envd_epoch;
+            let mut our_epoch = self.state.envd_epoch;
 
             loop {
                 let current_epoch: PersistEpoch = handle.opaque().clone();
@@ -2386,7 +2386,8 @@ where
                         break handle;
                     }
                 } else {
-                    mz_ore::halt!("fenced by envd @ {current_epoch:?}. ours = {our_epoch}");
+                    debug!("fenced by envd @ {current_epoch:?}. ours = {our_epoch}; we'll continue retrying");
+                    our_epoch = current_epoch.0.expect("known to exist");
                 }
             }
         };
@@ -2721,7 +2722,7 @@ where
                     .await
                 {
                     Ok(_) => info!("successfully finalized read handle for shard {shard_id:?}"),
-                    Err(e) => mz_ore::halt!("fenced by envd @ {e:?}. ours = {our_epoch:?}"),
+                    Err(e) => debug!("fenced by envd @ {e:?}. ours = {our_epoch:?}"),
                 }
 
                 if write.upper().is_empty() {

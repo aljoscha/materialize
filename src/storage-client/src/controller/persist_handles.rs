@@ -103,7 +103,10 @@ impl<T: Timestamp + Lattice + Codec64> PersistReadWorker<T> {
                             .instrument(span)
                             .await;
                         if let Some(Err(other_epoch)) = result {
-                            mz_ore::halt!("fenced by envd @ {other_epoch:?}. ours = {epoch:?}");
+                            // TODO(aljoscha): Maybe do more elaborate things!
+                            tracing::debug!(
+                                "there's another envd trying to downgrade; their epoch {other_epoch:?}, our epoch {epoch:?}"
+                            );
                         }
 
                         // If we're not done we put the handle back
@@ -349,16 +352,18 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistWriteWorke
 
                                         futs.push(async move {
                                             let persist_upper = persist_upper.clone();
-                                            write
+                                            let res = write
                                                 .compare_and_append(
                                                     updates.clone(),
                                                     persist_upper.clone(),
                                                     new_upper.clone(),
                                                 )
                                                 .instrument(span.clone())
-                                                .await
-                                                .expect("cannot append updates")
-                                                .or(Err(*id))?;
+                                                .await;
+
+                                             res
+                                                 .or(Err(*id))?
+                                                 .or(Err(*id))?;
 
                                             Ok::<_, GlobalId>((*id, new_upper))
                                         })
