@@ -9,6 +9,15 @@
 
 //! Abstraction for reading and updating durable coordinator state to/from a log (a persist shard,
 //! in our case).
+//!
+//! ## TODO
+//!  - Add a transaction abstraction:
+//!   - you start a transaction
+//!   - you can read state as of that transaction and prepare updates
+//!   - you can commit a transaction, which might fail
+//!   - we currently make it heard to build a valid transaction and to iterate over state as of the
+//!    transaction, along with already prepared updates
+//!   - all the manual handling of state updates is also a big footgun!
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
