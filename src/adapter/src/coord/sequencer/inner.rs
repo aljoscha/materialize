@@ -1,5 +1,6 @@
 // Copyright Materialize, Inc. and contributors. All rights reserved.
 //
+//
 // Use of this software is governed by the Business Source License
 // included in the LICENSE file.
 //
@@ -19,7 +20,7 @@ use mz_transform::Optimizer;
 use rand::seq::SliceRandom;
 use timely::progress::{Antichain, Timestamp as TimelyTimestamp};
 use tokio::sync::{mpsc, oneshot, OwnedMutexGuard};
-use tracing::{event, warn, Level};
+use tracing::{event, info, warn, Level};
 
 use mz_cloud_resources::VpcEndpointConfig;
 use mz_compute_client::controller::ComputeReplicaConfig;
@@ -36,6 +37,7 @@ use mz_expr::{
     OptimizedMirRelationExpr, RowSetFinishing,
 };
 use mz_ore::collections::CollectionExt;
+use mz_ore::error::ErrorExt;
 use mz_ore::result::ResultExt as OreResultExt;
 use mz_ore::task;
 use mz_repr::explain::{ExplainFormat, Explainee};
@@ -817,13 +819,31 @@ impl Coordinator {
                 // that the table is immediately readable.
                 let upper = since_ts.step_forward();
                 let appends = vec![(table_id, Vec::new(), upper)];
-                self.controller
+                let res = self
+                    .controller
                     .storage
                     .append(appends)
                     .expect("invalid table upper initialization")
                     .await
-                    .expect("One-shot dropped while waiting synchronously")
-                    .unwrap_or_terminate("cannot fail to append");
+                    .expect("One-shot dropped while waiting synchronously");
+                match res {
+                    Ok(_) => (), // All's good!
+                    Err(StorageError::InvalidUppers(_)) => {
+                        info!(
+                            "could not advance upper for table {} to {}; \
+                            likely because someone else already did it",
+                            table_id, upper
+                        );
+                    }
+                    Err(err) => {
+                        panic!(
+                            "could not advance upper for table {} to {}: {}",
+                            table_id,
+                            upper,
+                            err.display_with_causes()
+                        );
+                    }
+                }
                 Ok(ExecuteResponse::CreatedTable)
             }
             Err(AdapterError::Catalog(catalog::Error {

@@ -90,6 +90,7 @@ use mz_controller::clusters::{ClusterConfig, ClusterEvent, ClusterId, ReplicaId}
 use mz_expr::{MirRelationExpr, OptimizedMirRelationExpr, RowSetFinishing};
 use mz_orchestrator::ServiceProcessMetrics;
 use mz_ore::cast::CastFrom;
+use mz_ore::error::ErrorExt;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::NowFn;
 use mz_ore::retry::Retry;
@@ -1134,13 +1135,29 @@ impl Coordinator {
             .filter(|entry| entry.is_table())
             .map(|entry| (entry.id(), Vec::new(), advance_to))
             .collect();
-        self.controller
+        let res = self
+            .controller
             .storage
             .append(appends)
             .expect("invalid updates")
             .await
-            .expect("One-shot shouldn't be dropped during bootstrap")
-            .unwrap_or_terminate("cannot fail to append");
+            .expect("One-shot shouldn't be dropped during bootstrap");
+        match res {
+            Ok(_) => (), // All's good!
+            Err(StorageError::InvalidUppers(table_ids)) => {
+                info!(
+                    "could not advance uppers for tables: {}; \
+                    likely because someone else already did it",
+                    table_ids.into_iter().join(", ")
+                );
+            }
+            Err(err) => {
+                panic!(
+                    "could not advance table uppers: {}",
+                    err.display_with_causes()
+                );
+            }
+        }
 
         // Add builtin table updates the clear the contents of all system tables
         info!("coordinator init: resetting system tables");
