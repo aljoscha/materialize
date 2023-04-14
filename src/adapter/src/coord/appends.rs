@@ -9,25 +9,28 @@
 
 //! Logic and types for all appends executed by the [`Coordinator`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use derivative::Derivative;
+use itertools::Itertools;
 use tokio::sync::OwnedMutexGuard;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
+use mz_ore::error::ErrorExt;
 use mz_ore::task;
 use mz_ore::vec::VecExt;
 use mz_repr::{Diff, GlobalId, Row, Timestamp};
 use mz_sql::plan::Plan;
 use mz_storage_client::client::Update;
+use mz_storage_client::controller::StorageError;
 
 use crate::catalog::BuiltinTableUpdate;
 use crate::coord::timeline::WriteTimestamp;
 use crate::coord::{Coordinator, Message, PendingTxn};
 use crate::session::{Session, WriteOp};
-use crate::util::{ClientTransmitter, CompletedClientTransmitter, ResultExt};
+use crate::util::{ClientTransmitter, CompletedClientTransmitter};
 use crate::ExecuteResponse;
 
 /// An operation that is deferred while waiting for a lock.
@@ -230,32 +233,15 @@ impl Coordinator {
             (None, pending_writes)
         };
 
-        // The value returned here still might be ahead of `now()` if `now()` has gone backwards at
-        // any point during this method or if this was triggered from DDL. We will still commit the
-        // write without waiting for `now()` to advance. This is ok because the next batch of writes
-        // will trigger the wait loop in `try_group_commit()` if `now()` hasn't advanced past the
-        // global timeline, preventing an unbounded advancing of the global timeline ahead of
-        // `now()`. Additionally DDL is infrequent enough and takes long enough that we don't think
-        // it's practical for continuous DDL to advance the global timestamp in an unbounded manner.
-        let WriteTimestamp {
-            timestamp,
-            advance_to,
-        } = self.get_local_write_ts().await;
-        let mut appends: BTreeMap<GlobalId, Vec<(Row, Diff)>> = BTreeMap::new();
-        let mut responses = Vec::with_capacity(self.pending_writes.len());
-        let should_block = pending_writes.iter().any(|write| write.should_block());
-        for pending_write_txn in pending_writes {
+        let _should_block = pending_writes.iter().any(|write| write.should_block());
+
+        let mut staged_appends: BTreeMap<GlobalId, Vec<(Row, Diff)>> = BTreeMap::new();
+        for pending_write_txn in pending_writes.iter() {
             match pending_write_txn {
                 PendingWriteTxn::User {
                     writes,
                     write_lock_guard: _,
-                    pending_txn:
-                        PendingTxn {
-                            client_transmitter,
-                            response,
-                            session,
-                            action,
-                        },
+                    pending_txn: _,
                 } => {
                     for WriteOp { id, rows } in writes {
                         // If the table that some write was targeting has been deleted while the
@@ -264,80 +250,129 @@ impl Coordinator {
                         // and the delete were concurrent. Therefore, we are free to order the
                         // write before the delete without violating any consistency guarantees.
                         if self.catalog().try_get_entry(&id).is_some() {
-                            appends.entry(id).or_default().extend(rows);
+                            staged_appends.entry(*id).or_default().extend(rows.clone());
                         }
                     }
-                    responses.push(CompletedClientTransmitter::new(
-                        client_transmitter,
-                        response,
-                        session,
-                        action,
-                    ));
                 }
                 PendingWriteTxn::System { updates, .. } => {
                     for update in updates {
-                        appends
+                        staged_appends
                             .entry(update.id)
                             .or_default()
-                            .push((update.row, update.diff));
+                            .push((update.row.clone(), update.diff.clone()));
                     }
                 }
             }
         }
 
-        for (_, updates) in &mut appends {
-            differential_dataflow::consolidation::consolidate(updates);
-        }
-        // Add table advancements for all tables.
-        for table in self.catalog().entries().filter(|entry| entry.is_table()) {
-            appends.entry(table.id()).or_default();
-        }
-        let appends = appends
-            .into_iter()
-            .map(|(id, updates)| {
-                let updates = updates
-                    .into_iter()
-                    .map(|(row, diff)| Update {
-                        row,
-                        diff,
-                        timestamp,
-                    })
-                    .collect();
-                (id, updates, advance_to)
-            })
-            .collect();
+        loop {
+            // The value returned here still might be ahead of `now()` if `now()` has gone backwards at
+            // any point during this method or if this was triggered from DDL. We will still commit the
+            // write without waiting for `now()` to advance. This is ok because the next batch of writes
+            // will trigger the wait loop in `try_group_commit()` if `now()` hasn't advanced past the
+            // global timeline, preventing an unbounded advancing of the global timeline ahead of
+            // `now()`. Additionally DDL is infrequent enough and takes long enough that we don't think
+            // it's practical for continuous DDL to advance the global timestamp in an unbounded manner.
+            let WriteTimestamp {
+                timestamp,
+                advance_to,
+            } = self.get_local_write_ts().await;
 
-        let append_fut = self
-            .controller
-            .storage
-            .append(appends)
-            .expect("invalid updates");
-        if should_block {
+            for (_, updates) in &mut staged_appends {
+                differential_dataflow::consolidation::consolidate(updates);
+            }
+            // Add table advancements for all tables.
+            for table in self.catalog().entries().filter(|entry| entry.is_table()) {
+                staged_appends.entry(table.id()).or_default();
+            }
+
+            let appends = staged_appends
+                .iter()
+                .map(|(id, updates)| {
+                    let updates = updates
+                        .iter()
+                        .map(|(row, diff)| Update {
+                            row: row.clone(),
+                            diff: *diff,
+                            timestamp,
+                        })
+                        .collect();
+                    (*id, updates, advance_to)
+                })
+                .collect_vec();
+
+            let append_fut = self
+                .controller
+                .storage
+                .append(appends.clone())
+                .expect("invalid updates");
+
             // We may panic here if the storage controller has shut down, because we cannot
             // correctly return control, nor can we simply hang here.
             // TODO: Clean shutdown.
-            append_fut
+            let res = append_fut
                 .await
-                .expect("One-shot dropped while waiting synchronously")
-                .unwrap_or_terminate("cannot fail to apply appends");
-            self.group_commit_apply(timestamp, responses, write_lock_guard)
-                .await;
-        } else {
-            let internal_cmd_tx = self.internal_cmd_tx.clone();
-            task::spawn(|| "group_commit_apply", async move {
-                if let Ok(response) = append_fut.await {
-                    response.unwrap_or_terminate("cannot fail to apply appends");
-                    if let Err(e) = internal_cmd_tx.send(Message::GroupCommitApply(
-                        timestamp,
-                        responses,
-                        write_lock_guard,
-                    )) {
-                        warn!("Server closed with non-responded writes, {e}");
+                .expect("One-shot dropped while waiting synchronously");
+
+            match res {
+                Ok(()) => {
+                    let mut responses = Vec::with_capacity(self.pending_writes.len());
+                    for pending_write_txn in pending_writes.into_iter() {
+                        match pending_write_txn {
+                            PendingWriteTxn::User {
+                                writes: _,
+                                write_lock_guard: _,
+                                pending_txn:
+                                    PendingTxn {
+                                        client_transmitter,
+                                        response,
+                                        session,
+                                        action,
+                                    },
+                            } => {
+                                responses.push(CompletedClientTransmitter::new(
+                                    client_transmitter,
+                                    response,
+                                    session,
+                                    action,
+                                ));
+                            }
+                            PendingWriteTxn::System { .. } => (), // No responses!,
+                        }
                     }
-                } else {
-                    warn!("Writer terminated with writes in indefinite state");
+
+                    self.group_commit_apply(timestamp, responses, write_lock_guard)
+                        .await;
+                    break;
                 }
-            });
+                Err(StorageError::InvalidUppers(table_ids)) => {
+                    for (id, updates, ts) in appends {
+                        if id.is_user() && !updates.is_empty() {
+                            info!(
+                                "failed append for {id}@{ts}: {:?}, retrying... \
+                                (we should really be doing smarter things, though, \
+                                this is a write conflict)",
+                                updates
+                            );
+                        }
+                    }
+
+                    let table_ids: HashSet<_> = table_ids.into_iter().collect();
+
+                    staged_appends.retain(|id, _appends| table_ids.contains(id));
+
+                    debug!(
+                        "could not apply tables updates for tables {:?}, retrying...",
+                        table_ids
+                    );
+                }
+                Err(err) => {
+                    panic!(
+                        "could not apply tables updates: {}",
+                        err.display_with_causes()
+                    );
+                }
+            }
         }
     }
 
