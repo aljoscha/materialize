@@ -110,6 +110,7 @@ mod error;
 mod migrate;
 
 pub mod builtin;
+pub mod durable_coord_state;
 pub mod storage;
 
 pub const SYSTEM_CONN_ID: ConnectionId = 0;

@@ -2520,14 +2520,14 @@ pub struct StorageUsageKey {
     metric: VersionedStorageUsage,
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash)]
 pub struct TimestampKey {
-    id: String,
+    pub(crate) id: String,
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord)]
 pub struct TimestampValue {
-    ts: mz_repr::Timestamp,
+    pub(crate) ts: mz_repr::Timestamp,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash)]
