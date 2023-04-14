@@ -703,9 +703,9 @@ impl Stash {
                             TransactionError::Commit { .. } => {
                                 return Err("indeterminate COMMIT".into())
                             }
-                            TransactionError::Epoch(err)
-                            | TransactionError::Connect(err)
-                            | TransactionError::Txn(err) => return Err(err),
+                            TransactionError::Connect(err) | TransactionError::Txn(err) => {
+                                return Err(err)
+                            }
                         }
                     }
 
@@ -744,9 +744,9 @@ impl Stash {
                                     }
                                 }
                             }
-                            TransactionError::Epoch(err)
-                            | TransactionError::Connect(err)
-                            | TransactionError::Txn(err) => return Err(err),
+                            TransactionError::Connect(err) | TransactionError::Txn(err) => {
+                                return Err(err)
+                            }
                         }
                     }
                 }
@@ -792,22 +792,6 @@ impl Stash {
         let (epoch_row, res) = future::try_join(epoch_fut, f_fut)
             .await
             .map_err(TransactionError::Txn)?;
-        let current_epoch = NonZeroI64::new(epoch_row.get("epoch")).unwrap();
-        if Some(current_epoch) != self.epoch {
-            return Err(TransactionError::Epoch(
-                InternalStashError::Fence(format!(
-                    "unexpected fence epoch {}, expected {:?}",
-                    current_epoch, self.epoch
-                ))
-                .into(),
-            ));
-        }
-        let current_nonce: Vec<u8> = epoch_row.get("nonce");
-        if current_nonce != self.nonce {
-            return Err(TransactionError::Epoch(
-                InternalStashError::Fence("unexpected fence nonce".into()).into(),
-            ));
-        }
         if let Some(counts) = stmts.counts {
             event!(
                 Level::DEBUG,
@@ -876,8 +860,6 @@ impl Stash {
 pub(crate) enum TransactionError<T> {
     /// A failure occurred pre-transaction.
     Connect(StashError),
-    /// The epoch check failed.
-    Epoch(StashError),
     /// The transaction function failed and the commit was never started.
     Txn(StashError),
     /// The commit was started and failed but may have been committed. This is
@@ -893,9 +875,7 @@ pub(crate) enum TransactionError<T> {
 impl<T> std::fmt::Display for TransactionError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransactionError::Connect(err)
-            | TransactionError::Epoch(err)
-            | TransactionError::Txn(err) => write!(f, "{err}"),
+            TransactionError::Connect(err) | TransactionError::Txn(err) => write!(f, "{err}"),
             TransactionError::Commit {
                 committed_if_version,
                 ..
@@ -910,9 +890,7 @@ impl<T> std::fmt::Display for TransactionError<T> {
 impl<T> TransactionError<T> {
     fn pgerr(&self) -> Option<&tokio_postgres::Error> {
         match self {
-            TransactionError::Connect(err)
-            | TransactionError::Epoch(err)
-            | TransactionError::Txn(err) => {
+            TransactionError::Connect(err) | TransactionError::Txn(err) => {
                 if let InternalStashError::Postgres(err) = &err.inner {
                     Some(err)
                 } else {
@@ -965,8 +943,6 @@ impl<T> TransactionError<T> {
         match self {
             // Always retry if the initial connection failed.
             TransactionError::Connect(_) => true,
-            // Never retry if the epoch check failed.
-            TransactionError::Epoch(_) => false,
             // Retry inner transaction failures.
             TransactionError::Txn(_) => true,
             TransactionError::Commit { .. } => {
