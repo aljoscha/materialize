@@ -1435,6 +1435,209 @@ impl CatalogState {
         tx.insert_storage_usage_event(details);
         Ok(())
     }
+
+    fn deserialize_item(
+        &self,
+        id: GlobalId,
+        SerializedCatalogItem::V1 { create_sql }: SerializedCatalogItem,
+    ) -> Result<CatalogItem, AdapterError> {
+        // TODO - The `None` needs to be changed if we ever allow custom
+        // logical compaction windows in user-defined objects.
+        self.parse_item(id, create_sql, Some(&PlanContext::zero()), false, None)
+    }
+
+    // Parses the given SQL string into a `CatalogItem`.
+    #[tracing::instrument(level = "info", skip(self, pcx))]
+    fn parse_item(
+        &self,
+        id: GlobalId,
+        create_sql: String,
+        pcx: Option<&PlanContext>,
+        is_retained_metrics_object: bool,
+        custom_logical_compaction_window: Option<Duration>,
+    ) -> Result<CatalogItem, AdapterError> {
+        let mut session_catalog = self.for_system_session();
+        enable_features_required_for_catalog_open(&mut session_catalog);
+
+        let stmt = mz_sql::parse::parse(&create_sql)?.into_element();
+        let (stmt, depends_on) = mz_sql::names::resolve(&session_catalog, stmt)?;
+        let depends_on = depends_on.into_iter().collect();
+        let plan = mz_sql::plan::plan(pcx, &session_catalog, stmt, &Params::empty())?;
+        Ok(match plan {
+            Plan::CreateTable(CreateTablePlan { table, .. }) => CatalogItem::Table(Table {
+                create_sql: table.create_sql,
+                desc: table.desc,
+                defaults: table.defaults,
+                conn_id: None,
+                depends_on,
+                custom_logical_compaction_window,
+                is_retained_metrics_object,
+            }),
+            Plan::CreateSource(CreateSourcePlan {
+                source,
+                timeline,
+                cluster_config,
+                ..
+            }) => CatalogItem::Source(Source {
+                create_sql: source.create_sql,
+                data_source: match source.data_source {
+                    mz_sql::plan::DataSourceDesc::Ingestion(ingestion) => {
+                        DataSourceDesc::Ingestion(Ingestion {
+                            desc: ingestion.desc,
+                            source_imports: ingestion.source_imports,
+                            subsource_exports: ingestion.subsource_exports,
+                            cluster_id: match cluster_config {
+                                plan::SourceSinkClusterConfig::Existing { id } => id,
+                                plan::SourceSinkClusterConfig::Linked { .. }
+                                | plan::SourceSinkClusterConfig::Undefined => {
+                                    self.clusters_by_linked_object_id[&id]
+                                }
+                            },
+                            remap_collection_id: ingestion.progress_subsource,
+                        })
+                    }
+                    mz_sql::plan::DataSourceDesc::Progress => DataSourceDesc::Progress,
+                    mz_sql::plan::DataSourceDesc::Source => DataSourceDesc::Source,
+                },
+                desc: source.desc,
+                timeline,
+                depends_on,
+                custom_logical_compaction_window,
+                is_retained_metrics_object,
+            }),
+            Plan::CreateView(CreateViewPlan { view, .. }) => {
+                let optimizer = Optimizer::logical_optimizer();
+                let optimized_expr = optimizer.optimize(view.expr)?;
+                let desc = RelationDesc::new(optimized_expr.typ(), view.column_names);
+                CatalogItem::View(View {
+                    create_sql: view.create_sql,
+                    optimized_expr,
+                    desc,
+                    conn_id: None,
+                    depends_on,
+                })
+            }
+            Plan::CreateMaterializedView(CreateMaterializedViewPlan {
+                materialized_view, ..
+            }) => {
+                let optimizer = Optimizer::logical_optimizer();
+                let optimized_expr = optimizer.optimize(materialized_view.expr)?;
+                let desc = RelationDesc::new(optimized_expr.typ(), materialized_view.column_names);
+                CatalogItem::MaterializedView(MaterializedView {
+                    create_sql: materialized_view.create_sql,
+                    optimized_expr,
+                    desc,
+                    depends_on,
+                    cluster_id: materialized_view.cluster_id,
+                })
+            }
+            Plan::CreateIndex(CreateIndexPlan { index, .. }) => CatalogItem::Index(Index {
+                create_sql: index.create_sql,
+                on: index.on,
+                keys: index.keys,
+                conn_id: None,
+                depends_on,
+                cluster_id: index.cluster_id,
+                custom_logical_compaction_window,
+                is_retained_metrics_object,
+            }),
+            Plan::CreateSink(CreateSinkPlan {
+                sink,
+                with_snapshot,
+                cluster_config,
+                ..
+            }) => CatalogItem::Sink(Sink {
+                create_sql: sink.create_sql,
+                from: sink.from,
+                connection: StorageSinkConnectionState::Pending(sink.connection_builder),
+                envelope: sink.envelope,
+                with_snapshot,
+                depends_on,
+                cluster_id: match cluster_config {
+                    plan::SourceSinkClusterConfig::Existing { id } => id,
+                    plan::SourceSinkClusterConfig::Linked { .. }
+                    | plan::SourceSinkClusterConfig::Undefined => {
+                        self.clusters_by_linked_object_id[&id]
+                    }
+                },
+            }),
+            Plan::CreateType(CreateTypePlan { typ, .. }) => CatalogItem::Type(Type {
+                create_sql: typ.create_sql,
+                details: CatalogTypeDetails {
+                    array_id: None,
+                    typ: typ.inner,
+                },
+                depends_on,
+            }),
+            Plan::CreateSecret(CreateSecretPlan { secret, .. }) => CatalogItem::Secret(Secret {
+                create_sql: secret.create_sql,
+            }),
+            Plan::CreateConnection(CreateConnectionPlan { connection, .. }) => {
+                CatalogItem::Connection(Connection {
+                    create_sql: connection.create_sql,
+                    connection: connection.connection,
+                    depends_on,
+                })
+            }
+            _ => {
+                return Err(Error::new(ErrorKind::Corruption {
+                    detail: "catalog entry generated inappropriate plan".to_string(),
+                })
+                .into())
+            }
+        })
+    }
+
+    pub fn for_session<'a>(&'a self, session: &'a Session) -> ConnCatalog<'a> {
+        Self::for_session_state(self, session)
+    }
+
+    pub fn for_session_state<'a>(state: &'a CatalogState, session: &'a Session) -> ConnCatalog<'a> {
+        let database = state
+            .database_by_name
+            .get(session.vars().database())
+            .map(|id| id.clone());
+        let search_path = session
+            .vars()
+            .search_path()
+            .iter()
+            .map(|schema| {
+                state.resolve_schema(database.as_ref(), None, schema.as_str(), session.conn_id())
+            })
+            .filter_map(|schema| schema.ok())
+            .map(|schema| (schema.name().database.clone(), schema.id().clone()))
+            .collect();
+        ConnCatalog {
+            state: Cow::Borrowed(state),
+            conn_id: session.conn_id(),
+            cluster: session.vars().cluster().into(),
+            database,
+            search_path,
+            role_id: session.role_id().clone(),
+            prepared_statements: Some(Cow::Borrowed(session.prepared_statements())),
+        }
+    }
+
+    pub fn for_sessionless_user(&self, role_id: RoleId) -> ConnCatalog {
+        ConnCatalog {
+            state: Cow::Borrowed(self),
+            conn_id: SYSTEM_CONN_ID,
+            cluster: "default".into(),
+            database: self
+                .resolve_database(DEFAULT_DATABASE_NAME)
+                .ok()
+                .map(|db| db.id()),
+            search_path: Vec::new(),
+            role_id,
+            prepared_statements: None,
+        }
+    }
+
+    // Leaving the system's search path empty allows us to catch issues
+    // where catalog object names have not been normalized correctly.
+    pub fn for_system_session(&self) -> ConnCatalog {
+        self.for_sessionless_user(MZ_SYSTEM_ROLE_ID)
+    }
 }
 
 #[derive(Debug)]
@@ -3869,54 +4072,21 @@ impl Catalog {
     }
 
     pub fn for_session<'a>(&'a self, session: &'a Session) -> ConnCatalog<'a> {
-        Self::for_session_state(&self.state, session)
+        self.state.for_session(session)
     }
 
     pub fn for_session_state<'a>(state: &'a CatalogState, session: &'a Session) -> ConnCatalog<'a> {
-        let database = state
-            .database_by_name
-            .get(session.vars().database())
-            .map(|id| id.clone());
-        let search_path = session
-            .vars()
-            .search_path()
-            .iter()
-            .map(|schema| {
-                state.resolve_schema(database.as_ref(), None, schema.as_str(), session.conn_id())
-            })
-            .filter_map(|schema| schema.ok())
-            .map(|schema| (schema.name().database.clone(), schema.id().clone()))
-            .collect();
-        ConnCatalog {
-            state: Cow::Borrowed(state),
-            conn_id: session.conn_id(),
-            cluster: session.vars().cluster().into(),
-            database,
-            search_path,
-            role_id: session.role_id().clone(),
-            prepared_statements: Some(Cow::Borrowed(session.prepared_statements())),
-        }
+        CatalogState::for_session_state(state, session)
     }
 
     pub fn for_sessionless_user(&self, role_id: RoleId) -> ConnCatalog {
-        ConnCatalog {
-            state: Cow::Borrowed(&self.state),
-            conn_id: SYSTEM_CONN_ID,
-            cluster: "default".into(),
-            database: self
-                .resolve_database(DEFAULT_DATABASE_NAME)
-                .ok()
-                .map(|db| db.id()),
-            search_path: Vec::new(),
-            role_id,
-            prepared_statements: None,
-        }
+        self.state.for_sessionless_user(role_id)
     }
 
     // Leaving the system's search path empty allows us to catch issues
     // where catalog object names have not been normalized correctly.
     pub fn for_system_session(&self) -> ConnCatalog {
-        self.for_sessionless_user(MZ_SYSTEM_ROLE_ID)
+        self.state.for_system_session()
     }
 
     async fn storage<'a>(&'a self) -> MutexGuard<'a, storage::Connection> {
@@ -5903,136 +6073,13 @@ impl Catalog {
         is_retained_metrics_object: bool,
         custom_logical_compaction_window: Option<Duration>,
     ) -> Result<CatalogItem, AdapterError> {
-        let mut session_catalog = self.for_system_session();
-        enable_features_required_for_catalog_open(&mut session_catalog);
-
-        let stmt = mz_sql::parse::parse(&create_sql)?.into_element();
-        let (stmt, depends_on) = mz_sql::names::resolve(&session_catalog, stmt)?;
-        let depends_on = depends_on.into_iter().collect();
-        let plan = mz_sql::plan::plan(pcx, &session_catalog, stmt, &Params::empty())?;
-        Ok(match plan {
-            Plan::CreateTable(CreateTablePlan { table, .. }) => CatalogItem::Table(Table {
-                create_sql: table.create_sql,
-                desc: table.desc,
-                defaults: table.defaults,
-                conn_id: None,
-                depends_on,
-                custom_logical_compaction_window,
-                is_retained_metrics_object,
-            }),
-            Plan::CreateSource(CreateSourcePlan {
-                source,
-                timeline,
-                cluster_config,
-                ..
-            }) => CatalogItem::Source(Source {
-                create_sql: source.create_sql,
-                data_source: match source.data_source {
-                    mz_sql::plan::DataSourceDesc::Ingestion(ingestion) => {
-                        DataSourceDesc::Ingestion(Ingestion {
-                            desc: ingestion.desc,
-                            source_imports: ingestion.source_imports,
-                            subsource_exports: ingestion.subsource_exports,
-                            cluster_id: match cluster_config {
-                                plan::SourceSinkClusterConfig::Existing { id } => id,
-                                plan::SourceSinkClusterConfig::Linked { .. }
-                                | plan::SourceSinkClusterConfig::Undefined => {
-                                    self.state.clusters_by_linked_object_id[&id]
-                                }
-                            },
-                            remap_collection_id: ingestion.progress_subsource,
-                        })
-                    }
-                    mz_sql::plan::DataSourceDesc::Progress => DataSourceDesc::Progress,
-                    mz_sql::plan::DataSourceDesc::Source => DataSourceDesc::Source,
-                },
-                desc: source.desc,
-                timeline,
-                depends_on,
-                custom_logical_compaction_window,
-                is_retained_metrics_object,
-            }),
-            Plan::CreateView(CreateViewPlan { view, .. }) => {
-                let optimizer = Optimizer::logical_optimizer();
-                let optimized_expr = optimizer.optimize(view.expr)?;
-                let desc = RelationDesc::new(optimized_expr.typ(), view.column_names);
-                CatalogItem::View(View {
-                    create_sql: view.create_sql,
-                    optimized_expr,
-                    desc,
-                    conn_id: None,
-                    depends_on,
-                })
-            }
-            Plan::CreateMaterializedView(CreateMaterializedViewPlan {
-                materialized_view, ..
-            }) => {
-                let optimizer = Optimizer::logical_optimizer();
-                let optimized_expr = optimizer.optimize(materialized_view.expr)?;
-                let desc = RelationDesc::new(optimized_expr.typ(), materialized_view.column_names);
-                CatalogItem::MaterializedView(MaterializedView {
-                    create_sql: materialized_view.create_sql,
-                    optimized_expr,
-                    desc,
-                    depends_on,
-                    cluster_id: materialized_view.cluster_id,
-                })
-            }
-            Plan::CreateIndex(CreateIndexPlan { index, .. }) => CatalogItem::Index(Index {
-                create_sql: index.create_sql,
-                on: index.on,
-                keys: index.keys,
-                conn_id: None,
-                depends_on,
-                cluster_id: index.cluster_id,
-                custom_logical_compaction_window,
-                is_retained_metrics_object,
-            }),
-            Plan::CreateSink(CreateSinkPlan {
-                sink,
-                with_snapshot,
-                cluster_config,
-                ..
-            }) => CatalogItem::Sink(Sink {
-                create_sql: sink.create_sql,
-                from: sink.from,
-                connection: StorageSinkConnectionState::Pending(sink.connection_builder),
-                envelope: sink.envelope,
-                with_snapshot,
-                depends_on,
-                cluster_id: match cluster_config {
-                    plan::SourceSinkClusterConfig::Existing { id } => id,
-                    plan::SourceSinkClusterConfig::Linked { .. }
-                    | plan::SourceSinkClusterConfig::Undefined => {
-                        self.state.clusters_by_linked_object_id[&id]
-                    }
-                },
-            }),
-            Plan::CreateType(CreateTypePlan { typ, .. }) => CatalogItem::Type(Type {
-                create_sql: typ.create_sql,
-                details: CatalogTypeDetails {
-                    array_id: None,
-                    typ: typ.inner,
-                },
-                depends_on,
-            }),
-            Plan::CreateSecret(CreateSecretPlan { secret, .. }) => CatalogItem::Secret(Secret {
-                create_sql: secret.create_sql,
-            }),
-            Plan::CreateConnection(CreateConnectionPlan { connection, .. }) => {
-                CatalogItem::Connection(Connection {
-                    create_sql: connection.create_sql,
-                    connection: connection.connection,
-                    depends_on,
-                })
-            }
-            _ => {
-                return Err(Error::new(ErrorKind::Corruption {
-                    detail: "catalog entry generated inappropriate plan".to_string(),
-                })
-                .into())
-            }
-        })
+        self.state.parse_item(
+            id,
+            create_sql,
+            pcx,
+            is_retained_metrics_object,
+            custom_logical_compaction_window,
+        )
     }
 
     pub fn uses_tables(&self, id: GlobalId) -> bool {
