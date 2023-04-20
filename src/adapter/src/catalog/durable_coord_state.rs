@@ -56,12 +56,17 @@ pub struct DurableCoordState {
 
     trace: Vec<(StateUpdate, u64, i64)>,
 
+    /// Updates that have been committed but not yet applied by whoever is driving around this
+    /// [`DurableCoordState`]. All holders of a durable state should periodically drain this and
+    /// apply the updates to their in-memory state.
+    pending_updates: Vec<(StateUpdate, u64, i64)>,
+
     upper: u64,
     listen: Listen<StateUpdate, (), u64, i64>,
     write_handle: WriteHandle<StateUpdate, (), u64, i64>,
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum StateUpdate {
     Timestamp(TimestampKey, TimestampValue),
     Item(ItemKey, ItemValue),
@@ -163,6 +168,7 @@ impl DurableCoordState {
             items: BTreeMap::new(),
             trace: Vec::new(),
             upper: restart_as_of,
+            pending_updates: Vec::new(),
             listen,
             write_handle,
         };
@@ -171,6 +177,9 @@ impl DurableCoordState {
 
         println!("syncing to {:?}", upper);
         this.sync(upper).await;
+
+        // Drain away the updates that we know already!
+        let _updates = this.drain_pending_updates();
 
         this
     }
@@ -409,6 +418,7 @@ impl DurableCoordState {
     // full diffs. And only collapse them down to a map when needed. And also
     // ensure that there is only one entry for a given `GlobalId` then.
     fn apply_updates(&mut self, mut updates: Vec<(StateUpdate, u64, i64)>) {
+        self.pending_updates.extend(updates.iter().cloned());
         self.trace.append(&mut updates);
 
         let upper_frontier = Antichain::from_elem(self.upper);
@@ -441,6 +451,15 @@ impl DurableCoordState {
                 }
             }
         }
+    }
+
+    /// Updates that have been committed but not yet applied by whoever is driving around this
+    /// [`DurableCoordState`]. All holders of a durable state should periodically drain this and
+    /// apply the updates to their in-memory state.
+    pub fn drain_pending_updates(&mut self) -> Vec<(StateUpdate, u64, i64)> {
+        // TODO(aljoscha): Also won't win prices for efficiency!
+        let updates = std::mem::replace(&mut self.pending_updates, Vec::new());
+        updates
     }
 }
 
