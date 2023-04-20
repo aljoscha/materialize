@@ -846,6 +846,7 @@ impl Coordinator {
                 }
                 Ok(ExecuteResponse::CreatedTable)
             }
+            Ok(()) => self.install_table_state(table_id, table).await,
             Err(AdapterError::Catalog(catalog::Error {
                 kind: catalog::ErrorKind::ItemAlreadyExists(_, _),
                 ..
@@ -858,6 +859,67 @@ impl Coordinator {
             }
             Err(err) => Err(err),
         }
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(crate) async fn install_table_state(
+        &mut self,
+        table_id: GlobalId,
+        table: catalog::Table,
+    ) -> Result<ExecuteResponse, AdapterError> {
+        // Determine the initial validity for the table.
+        let since_ts = self.peek_local_write_ts();
+
+        let collection_desc = table.desc.clone().into();
+        self.controller
+            .storage
+            .create_collections(vec![(table_id, collection_desc)])
+            .await
+            .unwrap_or_terminate("cannot fail to create collections");
+
+        let policy = ReadPolicy::ValidFrom(Antichain::from_elem(since_ts));
+        self.controller
+            .storage
+            .set_read_policy(vec![(table_id, policy)]);
+
+        self.initialize_storage_read_policies(
+            vec![table_id],
+            Some(DEFAULT_LOGICAL_COMPACTION_WINDOW_TS),
+        )
+        .await;
+
+        // Advance the new table to a timestamp higher than the current read timestamp so
+        // that the table is immediately readable.
+        let upper = since_ts.step_forward();
+        let appends = vec![(table_id, Vec::new(), upper)];
+        let res = self
+            .controller
+            .storage
+            .append(appends)
+            .expect("invalid table upper initialization")
+            .await
+            .expect("One-shot dropped while waiting synchronously");
+
+        match res {
+            Ok(_) => (), // All's good!
+            Err(StorageError::InvalidUppers(_)) => {
+                info!(
+                    "could not advance upper for table {} to {}; \
+                    likely because someone else already did it",
+                    table_id, upper
+                );
+            }
+            Err(err) => {
+                panic!(
+                    "could not advance upper for table {} to {}: {}",
+                    table_id,
+                    upper,
+                    err.display_with_causes()
+                );
+            }
+        }
+
+        Ok(ExecuteResponse::CreatedTable)
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
