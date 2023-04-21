@@ -145,8 +145,8 @@ pub const LINKED_CLUSTER_REPLICA_NAME: &str = "linked";
 /// The big examples of ambient schemas are `pg_catalog` and `mz_catalog`.
 #[derive(Debug)]
 pub struct Catalog {
-    state: CatalogState,
-    storage: Arc<Mutex<storage::Connection>>,
+    pub(crate) state: CatalogState,
+    pub(crate) storage: Arc<Mutex<storage::Connection>>,
     transient_revision: u64,
 }
 

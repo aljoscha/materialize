@@ -81,7 +81,7 @@ use itertools::Itertools;
 use tokio::runtime::Handle as TokioHandle;
 use tokio::select;
 use tokio::sync::{mpsc, oneshot, watch, OwnedMutexGuard};
-use tracing::{info, span, warn, Instrument, Level};
+use tracing::{debug, info, span, warn, Instrument, Level};
 use uuid::Uuid;
 
 use mz_build_info::BuildInfo;
@@ -115,6 +115,7 @@ use mz_storage_client::types::sources::{IngestionDescription, SourceExport, Time
 use mz_transform::Optimizer;
 
 use crate::catalog::builtin::{BUILTINS, MZ_VIEW_FOREIGN_KEYS, MZ_VIEW_KEYS};
+use crate::catalog::durable_coord_state::StateUpdate;
 use crate::catalog::{
     self, storage, AwsPrincipalContext, BuiltinMigrationMetadata, BuiltinTableUpdate, Catalog,
     CatalogItem, ClusterReplicaSizeMap, DataSourceDesc, Source, StorageSinkConnectionState,
@@ -1251,6 +1252,8 @@ impl Coordinator {
         self.schedule_storage_usage_collection();
 
         loop {
+            self.sync_storage().await.expect("failed to sync storage");
+
             // Before adding a branch to this select loop, please ensure that the branch is
             // cancellation safe and add a comment explaining why. You can refer here for more
             // info: https://docs.rs/tokio/latest/tokio/macro.select.html#cancellation-safety
@@ -1342,6 +1345,49 @@ impl Coordinator {
         for meta in self.active_conns.values() {
             let _ = meta.notice_tx.send(notice.clone());
         }
+    }
+
+    pub async fn sync_storage<'a>(&'a mut self) -> Result<(), AdapterError> {
+        let mut storage = self.catalog.storage.lock().await;
+        storage.durable_state.sync_to_recent_upper().await;
+        let updates = storage.durable_state.drain_pending_updates();
+
+        let item_updates = updates
+            .iter()
+            .filter(|(update, _ts, _diff)| matches!(update, StateUpdate::Item(_, _)))
+            .cloned()
+            .collect_vec();
+
+        drop(storage);
+
+        if !item_updates.is_empty() {
+            debug!("got new item updates! {:?}", item_updates);
+            self.catalog_mut()
+                .state
+                .apply_item_updates(item_updates.clone())?;
+        }
+
+        for update in item_updates {
+            match update {
+                (StateUpdate::Item(key, _value), _ts, 1) => {
+                    let entry = self.catalog_mut().get_entry(&key.gid).clone();
+
+                    match entry.item() {
+                        CatalogItem::Table(table) => {
+                            let table_id = key.gid;
+                            info!("delightful! someone created table {table_id}, setting up our internal state");
+                            self.install_table_state(table_id, table.clone()).await?;
+                        }
+                        item => todo!("set up item: {:?}", item),
+                    }
+                }
+                update => {
+                    todo!("state update: {:?}", update);
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

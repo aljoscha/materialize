@@ -784,7 +784,7 @@ pub struct BootstrapArgs {
 #[derive(Debug)]
 pub struct Connection {
     stash: Stash,
-    durable_state: DurableCoordState,
+    pub durable_state: DurableCoordState,
     boot_ts: mz_repr::Timestamp,
 }
 
