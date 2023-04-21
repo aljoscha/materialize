@@ -28,6 +28,7 @@ use itertools::Itertools;
 use serde::Deserialize;
 use serde::Serialize;
 use timely::progress::Antichain;
+use tracing::debug;
 
 use mz_persist_client::error::UpperMismatch;
 use mz_persist_client::read::Listen;
@@ -155,9 +156,9 @@ impl DurableCoordState {
             .map(|((key, _unit), ts, diff)| (key.expect("key decoding error"), ts, diff))
             .collect_vec();
 
-        println!("initial snapshot: {:?}", initial_snapshot);
+        debug!("initial snapshot: {:?}", initial_snapshot);
 
-        println!("creating listen at {:?}", restart_as_of);
+        debug!("creating listen at {:?}", restart_as_of);
         let listen = read_handle
             .listen(Antichain::from_elem(restart_as_of))
             .await
@@ -175,7 +176,7 @@ impl DurableCoordState {
 
         this.apply_updates(initial_snapshot);
 
-        println!("syncing to {:?}", upper);
+        debug!("syncing to {:?}", upper);
         this.sync(upper).await;
 
         // Drain away the updates that we know already!
@@ -328,7 +329,7 @@ impl DurableCoordState {
         &mut self,
         updates: Vec<(StateUpdate, i64)>,
     ) -> Result<(), UpperMismatch<u64>> {
-        println!("committing {:?}", updates);
+        debug!("commit_updates {:?}", updates);
 
         let current_upper = self.upper.clone();
         // Yeah yeah, need to make this better...
@@ -390,14 +391,14 @@ impl DurableCoordState {
             for listen_event in listen_events.into_iter() {
                 match listen_event {
                     ListenEvent::Progress(upper) => {
-                        println!("progress: {:?}", upper);
+                        debug!("sync; progress: {:?}", upper);
                         self.upper = upper
                             .as_option()
                             .cloned()
                             .expect("we use a totally ordered time and never finalize the shard");
                     }
                     ListenEvent::Updates(batch_updates) => {
-                        println!("updates: {:?}", batch_updates);
+                        debug!("sync; updates: {:?}", batch_updates);
                         let mut batch_updates = batch_updates
                             .into_iter()
                             .map(|((key, _unit), ts, diff)| {
@@ -520,8 +521,6 @@ mod tests {
 
         let stored_timestamp = durable_state.get_timestamp(&timeline);
         assert_eq!(stored_timestamp, Some(timestamp));
-
-        println!("re-creating!");
 
         // Re-create our durable state.
         let mut durable_state = make_test_state(log_shard_id).await;
