@@ -93,6 +93,7 @@ use crate::catalog::builtin::{
 };
 pub use crate::catalog::builtin_table_updates::BuiltinTableUpdate;
 pub use crate::catalog::config::{AwsPrincipalContext, ClusterReplicaSizeMap, Config};
+use crate::catalog::durable_coord_state::StateUpdate;
 pub use crate::catalog::error::{AmbiguousRename, Error, ErrorKind};
 use crate::catalog::storage::{BootstrapArgs, Transaction, MZ_SYSTEM_ROLE_ID};
 use crate::client::ConnectionId;
@@ -1637,6 +1638,106 @@ impl CatalogState {
     // where catalog object names have not been normalized correctly.
     pub fn for_system_session(&self) -> ConnCatalog {
         self.for_sessionless_user(MZ_SYSTEM_ROLE_ID)
+    }
+
+    pub fn apply_item_updates(
+        &mut self,
+        updates: Vec<(StateUpdate, u64, i64)>,
+    ) -> Result<(), Error> {
+        let mut item_additions = Vec::new();
+        let mut item_drops = Vec::new();
+        for update in updates {
+            match update {
+                (state_update, _ts, 1) => {
+                    match state_update {
+                        StateUpdate::Item(key, v) => {
+                            item_additions.push((key.gid, v));
+                        }
+                        StateUpdate::Timestamp(_, _) => {
+                            // We're ignoring these here!
+                        }
+                    }
+                }
+                (state_update, _ts, -1) => {
+                    match state_update {
+                        StateUpdate::Item(key, value) => {
+                            item_drops.push((key.gid, value));
+                        }
+                        StateUpdate::Timestamp(_, _) => {
+                            // We're ignoring these here!
+                        }
+                    }
+                }
+
+                (state_update, _ts, diff) => {
+                    panic!(
+                        "state update with invalid diff: {:?}, {}",
+                        state_update, diff
+                    );
+                }
+            }
+        }
+
+        item_additions.sort_by_key(|(id, _value)| *id);
+        for (id, _item) in item_drops {
+            self.drop_item(id);
+        }
+        for (id, item_value) in item_additions {
+            // TODO(aljoscha): It's hard to find the schema because we don't have a schemas_by_id.
+            // So we do it the hard way. We could just add that mapping, though.
+
+            let schema_id = SchemaId(item_value.schema_id);
+            let mut found_schema = None;
+            for db in self.database_by_id.values() {
+                let schema = db.schemas_by_id.get(&schema_id);
+
+                if let Some(schema) = schema {
+                    found_schema = Some(schema);
+                    break;
+                }
+            }
+
+            if let Some(schema) = self.ambient_schemas_by_id.get(&schema_id) {
+                assert!(found_schema.is_none());
+                found_schema.replace(schema);
+            }
+
+            let schema = match found_schema {
+                Some(schema) => schema,
+                None => panic!(
+                    "corrupt stash! unknown schema id {}, for item with key \
+                    {id:?} and value {item_value:?}; schemas: {:?}",
+                    item_value.schema_id,
+                    self.ambient_schemas_by_id.keys().collect_vec()
+                ),
+            };
+
+            let database_spec = schema.name.database.clone();
+
+            // This should be serialized? Or something?
+            let oid = self.allocate_oid()?;
+            let name = QualifiedItemName {
+                qualifiers: ItemQualifiers {
+                    database_spec,
+                    schema_spec: SchemaSpecifier::from(item_value.schema_id),
+                },
+                item: item_value.name.clone(),
+            };
+            let item = match self.deserialize_item(id, item_value.definition.clone()) {
+                Ok(item) => item,
+                err => panic!("{:?}", err),
+            };
+
+            self.insert_item(
+                id,
+                oid,
+                name,
+                item,
+                item_value.owner_id.expect("missing owner ID"),
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -3192,11 +3293,15 @@ impl Catalog {
                 .await?;
         }
 
+        let mut builtin_table_updates = vec![];
+
         let mut catalog = {
             let mut storage = catalog.storage().await;
             let mut tx = storage.transaction().await?;
-            let catalog = Self::load_catalog_items(&mut tx, &catalog)?;
-            tx.commit().await?;
+            let mut catalog = Self::load_catalog_items(&mut tx, &catalog)?;
+            // TODO: Maybe we have to drop these updates?
+            tx.commit(Some(&mut catalog.state), &mut builtin_table_updates)
+                .await?;
             catalog
         };
 
@@ -3222,7 +3327,6 @@ impl Catalog {
             }
         }
 
-        let mut builtin_table_updates = vec![];
         for (schema_id, schema) in &catalog.state.ambient_schemas_by_id {
             let db_spec = ResolvedDatabaseSpecifier::Ambient;
             builtin_table_updates.push(catalog.state.pack_schema_update(&db_spec, schema_id, 1));
@@ -3834,11 +3938,14 @@ impl Catalog {
 
     #[tracing::instrument(level = "info", skip_all)]
     pub async fn apply_persisted_builtin_migration(
-        &self,
+        &mut self,
         migration_metadata: &mut BuiltinMigrationMetadata,
     ) -> Result<(), Error> {
         let mut storage = self.storage().await;
         let mut tx = storage.transaction().await?;
+        // Prepare a candidate catalog state.
+        let mut state = self.state.clone();
+
         tx.remove_items(migration_metadata.user_drop_ops.drain(..).collect())?;
         for (id, schema_id, name) in migration_metadata.user_create_ops.drain(..) {
             let entry = self.get_entry(&id);
@@ -3862,7 +3969,16 @@ impl Catalog {
                 }),
         )?;
 
-        tx.commit().await?;
+        let mut builtin_table_updates = Vec::new();
+        tx.commit(Some(&mut state), &mut builtin_table_updates)
+            .await?;
+        assert!(
+            builtin_table_updates.is_empty(),
+            "got builtin table updates during migration"
+        );
+
+        drop(storage);
+        self.state = state;
 
         Ok(())
     }
@@ -4654,13 +4770,14 @@ impl Catalog {
         // process if this fails, because we have to restart envd due to
         // indeterminate stash state, which we only reconcile during catalog
         // init.
-        tx.commit()
+        tx.commit(Some(&mut state), &mut builtin_table_updates)
             .await
             .unwrap_or_terminate("catalog storage transaction commit must succeed");
 
         // Dropping here keeps the mutable borrow on self, preventing us accidentally
         // mutating anything until after f is executed.
         drop(storage);
+
         self.state = state;
         self.transient_revision += 1;
 
@@ -5312,8 +5429,6 @@ impl Catalog {
                             details,
                         )?;
                     }
-                    state.insert_item(id, oid, name, item, owner_id);
-                    builtin_table_updates.extend(state.pack_item_update(id, 1));
                 }
                 Op::DropObject(id) => match id {
                     ObjectId::Database(id) => {
@@ -5526,7 +5641,6 @@ impl Catalog {
                             tx.remove_item(id)?;
                         }
 
-                        builtin_table_updates.extend(state.pack_item_update(id, -1));
                         if Self::should_audit_log_item(&entry.item) {
                             state.add_to_audit_log(
                                 oracle_write_ts,
@@ -5545,7 +5659,6 @@ impl Catalog {
                                 }),
                             )?;
                         }
-                        state.drop_item(id);
                     }
                 },
                 Op::DropTimeline(timeline) => {

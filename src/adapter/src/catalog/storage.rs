@@ -53,7 +53,10 @@ use crate::catalog::{
 use crate::catalog::{SerializedReplicaConfig, DEFAULT_CLUSTER_REPLICA_NAME};
 use crate::coord::timeline;
 
-use super::{SerializedCatalogItem, SerializedReplicaLocation, SerializedReplicaLogging};
+use super::{
+    BuiltinTableUpdate, CatalogState, SerializedCatalogItem, SerializedReplicaLocation,
+    SerializedReplicaLogging,
+};
 
 const USER_VERSION: &str = "user_version";
 
@@ -607,7 +610,14 @@ async fn migrate(
     }
     add_new_builtin_clusters_migration(&mut txn)?;
     add_new_builtin_cluster_replicas_migration(&mut txn, bootstrap_args)?;
-    txn.commit_fix_migration_retractions().await?;
+
+    let mut builtin_table_updates = Vec::new();
+    txn.commit_fix_migration_retractions(None, &mut builtin_table_updates)
+        .await?;
+    assert!(
+        builtin_table_updates.is_empty(),
+        "got builtin table updates during migration"
+    );
 
     Ok(())
 }
@@ -2112,21 +2122,36 @@ impl<'a> Transaction<'a> {
     /// must be fatal to the calling process. We do not panic/halt inside this function itself so
     /// that errors can bubble up during initialization.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn commit(self) -> Result<(), Error> {
-        self.commit_inner(false).await
+    pub async fn commit(
+        self,
+        catalog_state: Option<&mut CatalogState>,
+        builtin_table_updates: &mut Vec<BuiltinTableUpdate>,
+    ) -> Result<(), Error> {
+        self.commit_inner(catalog_state, builtin_table_updates, false)
+            .await
     }
 
     /// Like `commit`, but fixes retractions during migration.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn commit_fix_migration_retractions(self) -> Result<(), Error> {
-        self.commit_inner(true).await
+    pub async fn commit_fix_migration_retractions(
+        self,
+        catalog_state: Option<&mut CatalogState>,
+        builtin_table_updates: &mut Vec<BuiltinTableUpdate>,
+    ) -> Result<(), Error> {
+        self.commit_inner(catalog_state, builtin_table_updates, true)
+            .await
     }
 
     /// If `fix_migration_retractions` is true, additionally fix collections that have retracted
     /// non-existent JSON rows, but whose Rust consolidations are the same (i.e., an Option field
     /// was added, so we no longer know how to retract the None variant).
     #[tracing::instrument(level = "debug", skip_all)]
-    pub async fn commit_inner(self, fix_migration_retractions: bool) -> Result<(), Error> {
+    pub async fn commit_inner(
+        self,
+        mut catalog_state: Option<&mut CatalogState>,
+        builtin_table_updates: &mut Vec<BuiltinTableUpdate>,
+        fix_migration_retractions: bool,
+    ) -> Result<(), Error> {
         async fn add_batch<'tx, K, V>(
             tx: &'tx mz_stash::Transaction<'tx>,
             batches: &mut Vec<AppendBatch>,
@@ -2190,6 +2215,57 @@ impl<'a> Transaction<'a> {
                     e
                 )))
             })?;
+
+        let committed_updates = self.durable_state.drain_pending_updates();
+
+        let item_updates = committed_updates
+            .iter()
+            .filter(|(update, _ts, _diff)| matches!(update, StateUpdate::Item(_, _)))
+            .cloned()
+            .collect_vec();
+        if !item_updates.is_empty() {
+            let catalog_state = match catalog_state.as_mut() {
+                Some(catalog_state) => catalog_state,
+                None => {
+                    panic!("got item updates but no catalog state! {:?}", item_updates);
+                }
+            };
+
+            // We need to pack table updates for negative updates before we change catalog
+            // state, otherwise we wouldn't be able to form the update.
+            //
+            // N.B. We should be able to form the builtin table update just from the
+            // StateUpdate, but that's something for future-Aljscha.
+            for update in item_updates.iter() {
+                match update {
+                    (StateUpdate::Item(key, _item), _ts, -1) => {
+                        builtin_table_updates.extend(catalog_state.pack_item_update(key.gid, -1));
+                    }
+                    (StateUpdate::Item(_key, _item), _ts, 1) => {
+                        // Will apply those later!
+                    }
+                    update => {
+                        panic!("unexpected update: {:?}", update);
+                    }
+                }
+            }
+
+            catalog_state.apply_item_updates(item_updates.clone())?;
+
+            for update in item_updates {
+                match update {
+                    (StateUpdate::Item(key, _item), _ts, 1) => {
+                        builtin_table_updates.extend(catalog_state.pack_item_update(key.gid, 1));
+                    }
+                    (StateUpdate::Item(_key, _item), _ts, -1) => {
+                        // Already applied those earlier!
+                    }
+                    update => {
+                        panic!("unexpected update: {:?}", update);
+                    }
+                }
+            }
+        }
 
         let consolidate_ids = self
             .stash
@@ -2505,12 +2581,12 @@ pub struct DatabaseValue {
     owner_id: Option<RoleId>,
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash)]
 pub struct SchemaKey {
     id: u64,
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord)]
 pub struct SchemaValue {
     database_id: Option<u64>,
     name: String,
@@ -2520,16 +2596,16 @@ pub struct SchemaValue {
 
 #[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash, Debug)]
 pub struct ItemKey {
-    gid: GlobalId,
+    pub(crate) gid: GlobalId,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Debug)]
 pub struct ItemValue {
-    schema_id: u64,
-    name: String,
-    definition: SerializedCatalogItem,
+    pub(crate) schema_id: u64,
+    pub(crate) name: String,
+    pub(crate) definition: SerializedCatalogItem,
     // TODO(jkosh44) Remove option in v0.50.0
-    owner_id: Option<RoleId>,
+    pub(crate) owner_id: Option<RoleId>,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash, Debug)]

@@ -65,6 +65,10 @@ pub(crate) async fn migrate(
     info!("migrating from catalog version {:?}", catalog_version);
 
     let mut tx = storage.transaction().await?;
+
+    // Prepare a candidate catalog state.
+    let mut state = catalog.state.clone();
+
     // First, do basic AST -> AST transformations.
     // rewrite_items(&mut tx, None, |_tx, _cat, _stmt| Box::pin(async { Ok(()) })).await?;
 
@@ -86,7 +90,18 @@ pub(crate) async fn migrate(
         })
     })
     .await?;
-    tx.commit().await?;
+
+    let mut builtin_table_updates = Vec::new();
+    tx.commit(Some(&mut state), &mut builtin_table_updates)
+        .await?;
+    assert!(
+        builtin_table_updates.is_empty(),
+        "got builtin table updates during migration"
+    );
+
+    drop(storage);
+    catalog.state = state;
+
     info!(
         "migration from catalog version {:?} complete",
         catalog_version
