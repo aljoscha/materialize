@@ -11,13 +11,9 @@
 //! in our case).
 //!
 //! ## TODO
-//!  - Add a transaction abstraction:
-//!   - you start a transaction
-//!   - you can read state as of that transaction and prepare updates
-//!   - you can commit a transaction, which might fail
-//!   - we currently make it heard to build a valid transaction and to iterate over state as of the
-//!    transaction, along with already prepared updates
-//!   - all the manual handling of state updates is also a big footgun!
+//!  - Maybe allow "read" methods on DurableCoordState itself, instead of forcing users to create a
+//!  "read transaction"?
+//!  - As of right now, creating a "read transaction" requires mutable access to DurableCoordState.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -52,7 +48,6 @@ pub struct DurableCoordState {
     // full diffs. And only collapse them down to a map when needed. And also
     // ensure that there is only one entry for a given `GlobalId` then.
     timestamps: BTreeMap<TimestampKey, TimestampValue>,
-
     items: BTreeMap<ItemKey, ItemValue>,
 
     trace: Vec<(StateUpdate, u64, i64)>,
@@ -65,6 +60,23 @@ pub struct DurableCoordState {
     upper: u64,
     listen: Listen<StateUpdate, (), u64, i64>,
     write_handle: WriteHandle<StateUpdate, (), u64, i64>,
+}
+
+/// An transaction for updating [`DurableCoordState`].
+///
+/// This contains a copy of state as it was when the transaction was created. You also need to use
+/// this when querying state.
+#[derive(Debug)]
+pub struct Transaction<'a> {
+    // NOTE: We keep a copy of the state here and mutate it when preparing state updates, to make
+    // sure that we always have an up-to-date view and can generate the correct differential state
+    // updates.
+    timestamps: BTreeMap<TimestampKey, TimestampValue>,
+    items: BTreeMap<ItemKey, ItemValue>,
+
+    updates: Vec<(StateUpdate, i64)>,
+
+    durable_coord_state: &'a mut DurableCoordState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -185,147 +197,12 @@ impl DurableCoordState {
         this
     }
 
-    pub fn get_timestamp(&self, timeline: &Timeline) -> Option<mz_repr::Timestamp> {
-        let key = TimestampKey {
-            id: timeline.to_string(),
-        };
-        let timestamp = self.timestamps.get(&key);
-        timestamp.map(|ts| ts.ts)
+    pub async fn begin_transaction(&mut self) -> Transaction {
+        self.sync_to_recent_upper().await;
+        Transaction::new(self)
     }
 
-    pub fn get_all_timestamps(&self) -> Vec<(Timeline, mz_repr::Timestamp)> {
-        self.timestamps
-            .iter()
-            .map(|(timeline, ts)| {
-                (
-                    timeline.id.parse().expect("invalid timeline persisted"),
-                    ts.ts,
-                )
-            })
-            .collect_vec()
-    }
-
-    pub fn get_item(&self, key: &ItemKey) -> Option<ItemValue> {
-        self.items.get(key).cloned()
-    }
-
-    pub fn get_all_items(&self) -> BTreeMap<ItemKey, ItemValue> {
-        self.items.clone()
-    }
-
-    // TODO(aljoscha): These `prepare_*` updates are very inefficient. Also, we
-    // can probably factor out quite a bit of common functionality.
-    //
-    // Also, the API for these is currently a big footgun! If we do two
-    // `prepare_*` calls for the same global ID, both will emit updates because
-    // we don't "remember" an update that we already emitted.
-
-    pub fn prepare_upsert_timestamp(
-        &self,
-        timeline: Timeline,
-        timestamp: mz_repr::Timestamp,
-    ) -> Vec<(StateUpdate, i64)> {
-        let key = TimestampKey {
-            id: timeline.to_string(),
-        };
-
-        let mut updates = Vec::new();
-
-        let current_timestamp = self.timestamps.get(&key);
-
-        match current_timestamp {
-            Some(current_timestamp) if current_timestamp.ts == timestamp => {
-                // No need to change anything!
-            }
-            Some(current_timestamp) => {
-                // Need to retract the old mapping and insert a new mapping.
-                updates.push((
-                    StateUpdate::Timestamp(key.clone(), current_timestamp.clone()),
-                    -1,
-                ));
-                let timestamp_value = TimestampValue { ts: timestamp };
-                updates.push((StateUpdate::Timestamp(key.clone(), timestamp_value), 1));
-            }
-            None => {
-                let timestamp_value = TimestampValue { ts: timestamp };
-                // Only need to add the new mapping.
-                updates.push((StateUpdate::Timestamp(key, timestamp_value), 1));
-            }
-        }
-
-        updates
-    }
-
-    // We currently never remove timestamps, but ... :shrug:.
-    #[allow(unused)]
-    pub fn prepare_remove_timestamp(&self, timeline: Timeline) -> Vec<(StateUpdate, i64)> {
-        let key = TimestampKey {
-            id: timeline.to_string(),
-        };
-
-        let mut updates = Vec::new();
-
-        let current_timestamp = self.timestamps.get(&key);
-
-        match current_timestamp {
-            Some(current_timestamp) => {
-                // Need to retract the mapping.
-                updates.push((
-                    StateUpdate::Timestamp(key.clone(), current_timestamp.clone()),
-                    -1,
-                ));
-            }
-            None => {
-                // Nothing to do!
-            }
-        }
-
-        updates
-    }
-
-    pub fn prepare_upsert_item(&self, key: ItemKey, item: ItemValue) -> Vec<(StateUpdate, i64)> {
-        let mut updates = Vec::new();
-
-        let current_item = self.items.get(&key);
-
-        match current_item {
-            Some(current_item) if current_item == &item => {
-                // No need to change anything!
-            }
-            Some(current_item) => {
-                // Need to retract the old mapping and insert a new mapping.
-                updates.push((StateUpdate::Item(key.clone(), current_item.clone()), -1));
-                updates.push((StateUpdate::Item(key.clone(), item), 1));
-            }
-            None => {
-                // Only need to add the new mapping.
-                updates.push((StateUpdate::Item(key, item), 1));
-            }
-        }
-
-        updates
-    }
-
-    #[allow(unused)]
-    pub fn prepare_remove_item(&self, key: ItemKey) -> Vec<(StateUpdate, i64)> {
-        let mut updates = Vec::new();
-
-        let current_item = self.items.get(&key);
-
-        match current_item {
-            Some(current_item) => {
-                // Need to retract the mapping.
-                updates.push((StateUpdate::Item(key, current_item.clone()), -1));
-            }
-            None => {
-                // Nothing to do!
-            }
-        }
-
-        updates
-    }
-
-    pub async fn commit_updates(
+    pub(crate) async fn commit_updates(
         &mut self,
         updates: Vec<(StateUpdate, i64)>,
     ) -> Result<(), UpperMismatch<u64>> {
@@ -464,6 +341,162 @@ impl DurableCoordState {
     }
 }
 
+impl<'a> Transaction<'a> {
+    fn new(durable_coord_state: &mut DurableCoordState) -> Transaction {
+        Transaction {
+            timestamps: durable_coord_state.timestamps.clone(),
+            items: durable_coord_state.items.clone(),
+            updates: Vec::new(),
+            durable_coord_state,
+        }
+    }
+
+    pub fn get_timestamp(&self, timeline: &Timeline) -> Option<mz_repr::Timestamp> {
+        let key = TimestampKey {
+            id: timeline.to_string(),
+        };
+        let timestamp = self.timestamps.get(&key);
+        timestamp.map(|ts| ts.ts)
+    }
+
+    pub fn get_all_timestamps(&self) -> Vec<(Timeline, mz_repr::Timestamp)> {
+        self.timestamps
+            .iter()
+            .map(|(timeline, ts)| {
+                (
+                    timeline.id.parse().expect("invalid timeline persisted"),
+                    ts.ts,
+                )
+            })
+            .collect_vec()
+    }
+
+    pub fn get_item(&self, key: &ItemKey) -> Option<ItemValue> {
+        self.items.get(key).cloned()
+    }
+
+    pub fn get_all_items(&self) -> BTreeMap<ItemKey, ItemValue> {
+        self.items.clone()
+    }
+
+    // TODO(aljoscha): We can probably factor out quite a bit of common functionality.
+
+    pub fn upsert_timestamp(&mut self, timeline: Timeline, timestamp: mz_repr::Timestamp) {
+        let key = TimestampKey {
+            id: timeline.to_string(),
+        };
+
+        let current_timestamp = self.timestamps.get(&key);
+
+        match current_timestamp {
+            Some(current_timestamp) if current_timestamp.ts == timestamp => {
+                // No need to change anything!
+            }
+            Some(current_timestamp) => {
+                // Need to retract the old mapping and insert a new mapping.
+                self.updates.push((
+                    StateUpdate::Timestamp(key.clone(), current_timestamp.clone()),
+                    -1,
+                ));
+                let timestamp_value = TimestampValue { ts: timestamp };
+                self.updates.push((
+                    StateUpdate::Timestamp(key.clone(), timestamp_value.clone()),
+                    1,
+                ));
+                self.timestamps.insert(key, timestamp_value);
+            }
+            None => {
+                let timestamp_value = TimestampValue { ts: timestamp };
+                // Only need to add the new mapping.
+                self.updates.push((
+                    StateUpdate::Timestamp(key.clone(), timestamp_value.clone()),
+                    1,
+                ));
+                self.timestamps.insert(key, timestamp_value);
+            }
+        }
+    }
+
+    // We currently never remove timestamps, but ... :shrug:.
+    #[allow(unused)]
+    pub fn remove_timestamp(&mut self, timeline: Timeline) {
+        let key = TimestampKey {
+            id: timeline.to_string(),
+        };
+
+        let current_timestamp = self.timestamps.get(&key);
+
+        match current_timestamp {
+            Some(current_timestamp) => {
+                // Need to retract the mapping.
+                self.updates.push((
+                    StateUpdate::Timestamp(key.clone(), current_timestamp.clone()),
+                    -1,
+                ));
+                self.timestamps.remove(&key);
+            }
+            None => {
+                // Nothing to do!
+            }
+        }
+    }
+
+    pub fn upsert_item(&mut self, key: ItemKey, item: ItemValue) {
+        let current_item = self.items.get(&key);
+
+        match current_item {
+            Some(current_item) if current_item == &item => {
+                // No need to change anything!
+            }
+            Some(current_item) => {
+                // Need to retract the old mapping and insert a new mapping.
+                self.updates
+                    .push((StateUpdate::Item(key.clone(), current_item.clone()), -1));
+                self.updates
+                    .push((StateUpdate::Item(key.clone(), item.clone()), 1));
+                self.items.insert(key, item);
+            }
+            None => {
+                // Only need to add the new mapping.
+                self.updates
+                    .push((StateUpdate::Item(key.clone(), item.clone()), 1));
+                self.items.insert(key, item);
+            }
+        }
+    }
+
+    #[allow(unused)]
+    pub fn remove_item(&mut self, key: ItemKey) {
+        let current_item = self.items.get(&key);
+
+        match current_item {
+            Some(current_item) => {
+                // Need to retract the mapping.
+                self.updates
+                    .push((StateUpdate::Item(key.clone(), current_item.clone()), -1));
+
+                self.items.remove(&key);
+            }
+            None => {
+                // Nothing to do!
+            }
+        }
+    }
+
+    pub async fn commit(self) -> Result<(), UpperMismatch<u64>> {
+        self.durable_coord_state.commit_updates(self.updates).await
+    }
+
+    pub async fn commit_and_drain_updates(
+        self,
+    ) -> Result<Vec<(StateUpdate, u64, i64)>, UpperMismatch<u64>> {
+        self.durable_coord_state
+            .commit_updates(self.updates)
+            .await?;
+        Ok(self.durable_coord_state.drain_pending_updates())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,39 +544,39 @@ mod tests {
         let timeline = Timeline::EpochMilliseconds;
         let timestamp = mz_repr::Timestamp::new(0);
 
-        let mut updates = Vec::new();
+        let mut tx = durable_state.begin_transaction().await;
 
-        let mut new_updates = durable_state.prepare_upsert_timestamp(timeline.clone(), timestamp);
-        updates.append(&mut new_updates);
+        tx.upsert_timestamp(timeline.clone(), timestamp);
 
-        let res = durable_state.commit_updates(updates).await;
+        let res = tx.commit().await;
         assert!(matches!(res, Ok(())));
 
-        let stored_timestamp = durable_state.get_timestamp(&timeline);
+        let read_tx = durable_state.begin_transaction().await;
+        let stored_timestamp = read_tx.get_timestamp(&timeline);
         assert_eq!(stored_timestamp, Some(timestamp));
 
         // Re-create our durable state.
         let mut durable_state = make_test_state(log_shard_id).await;
 
-        let stored_timestamp = durable_state.get_timestamp(&timeline);
+        let read_tx = durable_state.begin_transaction().await;
+        let stored_timestamp = read_tx.get_timestamp(&timeline);
         assert_eq!(stored_timestamp, Some(timestamp));
 
         // Do something that causes a retraction and update.
-        let mut updates = Vec::new();
 
         let new_timestamp = mz_repr::Timestamp::new(1);
 
-        let mut new_updates =
-            durable_state.prepare_upsert_timestamp(timeline.clone(), new_timestamp);
-        updates.append(&mut new_updates);
+        let mut tx = durable_state.begin_transaction().await;
+        tx.upsert_timestamp(timeline.clone(), new_timestamp);
 
-        let res = durable_state.commit_updates(updates).await;
+        let res = tx.commit().await;
         assert!(matches!(res, Ok(())));
 
         // Re-create our durable state.
-        let durable_state = make_test_state(log_shard_id).await;
+        let mut durable_state = make_test_state(log_shard_id).await;
 
-        let stored_timestamp = durable_state.get_timestamp(&timeline);
+        let read_tx = durable_state.begin_transaction().await;
+        let stored_timestamp = read_tx.get_timestamp(&timeline);
         assert_eq!(stored_timestamp, Some(new_timestamp));
     }
 }

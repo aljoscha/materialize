@@ -54,8 +54,8 @@ use crate::catalog::{SerializedReplicaConfig, DEFAULT_CLUSTER_REPLICA_NAME};
 use crate::coord::timeline;
 
 use super::{
-    BuiltinTableUpdate, CatalogState, SerializedCatalogItem, SerializedReplicaLocation,
-    SerializedReplicaLogging,
+    durable_coord_state, BuiltinTableUpdate, CatalogState, SerializedCatalogItem,
+    SerializedReplicaLocation, SerializedReplicaLogging,
 };
 
 const USER_VERSION: &str = "user_version";
@@ -1273,13 +1273,8 @@ impl Connection {
     pub async fn get_all_persisted_timestamps(
         &mut self,
     ) -> Result<BTreeMap<Timeline, mz_repr::Timestamp>, Error> {
-        self.durable_state.sync_to_recent_upper().await;
-
-        let timestamps = self
-            .durable_state
-            .get_all_timestamps()
-            .into_iter()
-            .collect();
+        let read_tx = self.durable_state.begin_transaction().await;
+        let timestamps = read_tx.get_all_timestamps().into_iter().collect();
         Ok(timestamps)
     }
 
@@ -1292,11 +1287,10 @@ impl Connection {
     ) -> Result<(), Error> {
         // TODO(aljoscha): Add assertion to make sure timestamps always go up!
         loop {
-            let updates = self
-                .durable_state
-                .prepare_upsert_timestamp(timeline.clone(), timestamp);
+            let mut tx = self.durable_state.begin_transaction().await;
+            tx.upsert_timestamp(timeline.clone(), timestamp);
 
-            let res = self.durable_state.commit_updates(updates).await;
+            let res = tx.commit().await;
 
             match res {
                 Ok(()) => return Ok(()),
@@ -1305,8 +1299,8 @@ impl Connection {
                 }
             }
 
-            self.durable_state.sync_to_recent_upper().await;
-            let recent_timestamp = self.durable_state.get_timestamp(timeline);
+            let read_tx = self.durable_state.begin_transaction().await;
+            let recent_timestamp = read_tx.get_timestamp(timeline);
             if let Some(recent_timestamp) = recent_timestamp {
                 if recent_timestamp >= timestamp {
                     debug!(
@@ -1341,9 +1335,8 @@ async fn try_get_persisted_timestamp(
 ) -> Result<Option<mz_repr::Timestamp>, Error>
 where
 {
-    durable_state.sync_to_recent_upper().await;
-
-    let timestamp = durable_state.get_timestamp(timeline);
+    let read_tx = durable_state.begin_transaction().await;
+    let timestamp = read_tx.get_timestamp(timeline);
 
     Ok(timestamp)
 }
@@ -1392,13 +1385,11 @@ pub async fn transaction<'a>(
         })
         .await?;
 
-    durable_state.sync_to_recent_upper().await;
+    let durable_state_tx = durable_state.begin_transaction().await;
 
     Ok(Transaction {
         stash,
-        durable_state,
-        durable_state_updates: Vec::new(),
-
+        durable_state_tx,
         databases: TableTransaction::new(databases, |a, b| a.name == b.name),
         schemas: TableTransaction::new(schemas, |a, b| {
             a.database_id == b.database_id && a.name == b.name
@@ -1421,8 +1412,7 @@ pub async fn transaction<'a>(
 
 pub struct Transaction<'a> {
     stash: &'a mut Stash,
-    durable_state: &'a mut DurableCoordState,
-    durable_state_updates: Vec<(StateUpdate, i64)>,
+    durable_state_tx: durable_coord_state::Transaction<'a>,
     databases: TableTransaction<DatabaseKey, DatabaseValue>,
     schemas: TableTransaction<SchemaKey, SchemaValue>,
     // items: TableTransaction<ItemKey, ItemValue>,
@@ -1448,7 +1438,7 @@ impl<'a> Transaction<'a> {
     ) -> Vec<(GlobalId, QualifiedItemName, SerializedCatalogItem, RoleId)> {
         let databases = self.databases.items();
         let schemas = self.schemas.items();
-        let durable_items = self.durable_state.get_all_items();
+        let durable_items = self.durable_state_tx.get_all_items();
         let mut items = Vec::new();
         durable_items.into_iter().for_each(|(k, v)| {
             let schema = match schemas.get(&SchemaKey { id: v.schema_id }) {
@@ -1693,7 +1683,7 @@ impl<'a> Transaction<'a> {
         owner_id: RoleId,
     ) -> Result<(), Error> {
         let key = ItemKey { gid: id };
-        let existing_item = self.durable_state.get_item(&key);
+        let existing_item = self.durable_state_tx.get_item(&key);
 
         if let Some(_existing_item) = existing_item {
             Err(Error::new(ErrorKind::ItemAlreadyExists(
@@ -1701,7 +1691,7 @@ impl<'a> Transaction<'a> {
                 item_name.to_owned(),
             )))
         } else {
-            let mut state_updates = self.durable_state.prepare_upsert_item(
+            self.durable_state_tx.upsert_item(
                 ItemKey { gid: id },
                 ItemValue {
                     schema_id: schema_id.0,
@@ -1710,8 +1700,6 @@ impl<'a> Transaction<'a> {
                     owner_id: Some(owner_id),
                 },
             );
-
-            self.durable_state_updates.append(&mut state_updates);
 
             Ok(())
         }
@@ -1807,12 +1795,11 @@ impl<'a> Transaction<'a> {
     /// DO NOT call this function in a loop, use [`Self::remove_items`] instead.
     pub fn remove_item(&mut self, id: GlobalId) -> Result<(), Error> {
         let key = ItemKey { gid: id };
-        let existing_item = self.durable_state.get_item(&key);
+        let existing_item = self.durable_state_tx.get_item(&key);
 
         if let Some(_existing_item) = existing_item {
-            let mut state_updates = self.durable_state.prepare_remove_item(ItemKey { gid: id });
+            self.durable_state_tx.remove_item(ItemKey { gid: id });
 
-            self.durable_state_updates.append(&mut state_updates);
             Ok(())
         } else {
             Err(SqlCatalogError::UnknownItem(id.to_string()).into())
@@ -1844,7 +1831,7 @@ impl<'a> Transaction<'a> {
         item_name: &str,
         item: &SerializedCatalogItem,
     ) -> Result<(), Error> {
-        let existing_items = self.durable_state.get_all_items();
+        let existing_items = self.durable_state_tx.get_all_items();
 
         let key = ItemKey { gid: id };
         let existing_item = existing_items.get(&key);
@@ -1857,8 +1844,7 @@ impl<'a> Transaction<'a> {
                     owner_id: existing_item.owner_id,
                 };
 
-                let mut state_updates = self.durable_state.prepare_upsert_item(key, new_item);
-                self.durable_state_updates.append(&mut state_updates);
+                self.durable_state_tx.upsert_item(key, new_item);
             }
             None => {
                 return Err(SqlCatalogError::UnknownItem(id.to_string()).into());
@@ -1879,7 +1865,7 @@ impl<'a> Transaction<'a> {
         &mut self,
         items: BTreeMap<GlobalId, (String, SerializedCatalogItem)>,
     ) -> Result<(), Error> {
-        let existing_items = self.durable_state.get_all_items();
+        let existing_items = self.durable_state_tx.get_all_items();
 
         for (key, (item_name, item)) in items.iter() {
             let key = ItemKey { gid: *key };
@@ -1893,8 +1879,7 @@ impl<'a> Transaction<'a> {
                         owner_id: existing_item.owner_id,
                     };
 
-                    let mut state_updates = self.durable_state.prepare_upsert_item(key, new_item);
-                    self.durable_state_updates.append(&mut state_updates);
+                    self.durable_state_tx.upsert_item(key, new_item);
                 }
                 None => {
                     let update_ids: BTreeSet<_> = items.into_keys().collect();
@@ -2206,8 +2191,9 @@ impl<'a> Transaction<'a> {
         let audit_log_updates = Arc::new(self.audit_log_updates);
         let storage_usage_updates = Arc::new(self.storage_usage_updates);
 
-        self.durable_state
-            .commit_updates(self.durable_state_updates)
+        let committed_updates = self
+            .durable_state_tx
+            .commit_and_drain_updates()
             .await
             .map_err(|e| {
                 Error::from(ErrorKind::Unstructured(format!(
@@ -2215,8 +2201,6 @@ impl<'a> Transaction<'a> {
                     e
                 )))
             })?;
-
-        let committed_updates = self.durable_state.drain_pending_updates();
 
         let item_updates = committed_updates
             .iter()
