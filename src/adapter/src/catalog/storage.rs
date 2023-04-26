@@ -346,8 +346,10 @@ async fn migrate(
                 (),
                 1,
             ));
-            txn.configs
-                .insert(USER_VERSION.to_string(), ConfigValue { value: 0 })?;
+            let prev = txn
+                .durable_state_tx
+                .upsert_config(USER_VERSION.to_string(), ConfigValue { value: 0 });
+            assert!(prev.is_none());
             Ok(())
         },
         // These migrations were removed, but we need to keep empty migrations because the
@@ -797,18 +799,13 @@ impl Connection {
         bootstrap_args: &BootstrapArgs,
     ) -> Result<Connection, Error> {
         // The `user_version` field stores the index of the last migration that
-        // was run. If the upper is min, the config collection is empty.
-        let skip = if is_collection_uninitialized(&mut stash, &COLLECTION_CONFIG).await? {
-            0
-        } else {
-            // An advanced collection must have had its user version set, so the unwrap
-            // must succeed.
-            COLLECTION_CONFIG
-                .peek_key_one(&mut stash, USER_VERSION.to_string())
-                .await?
-                .expect("user_version must exist")
-                .value
-                + 1
+        // was run.
+        let skip = {
+            let read_tx = durable_state.begin_transaction().await;
+            read_tx
+                .get_config(&USER_VERSION.to_string())
+                .map(|version| version.value + 1)
+                .unwrap_or(0)
         };
 
         // Initialize connection.
@@ -1354,7 +1351,6 @@ pub async fn transaction<'a>(
         cluster_replicas,
         introspection_sources,
         id_allocator,
-        configs,
         settings,
         system_gid_mapping,
         system_configurations,
@@ -1373,7 +1369,6 @@ pub async fn transaction<'a>(
                             .await?,
                     ),
                     tx.peek_one(tx.collection(COLLECTION_ID_ALLOC.name()).await?),
-                    tx.peek_one(tx.collection(COLLECTION_CONFIG.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_SETTING.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_SYSTEM_GID_MAPPING.name()).await?),
                     tx.peek_one(
@@ -1401,7 +1396,6 @@ pub async fn transaction<'a>(
         }),
         introspection_sources: TableTransaction::new(introspection_sources, |_a, _b| false),
         id_allocator: TableTransaction::new(id_allocator, |_a, _b| false),
-        configs: TableTransaction::new(configs, |_a, _b| false),
         settings: TableTransaction::new(settings, |_a, _b| false),
         system_gid_mapping: TableTransaction::new(system_gid_mapping, |_a, _b| false),
         system_configurations: TableTransaction::new(system_configurations, |_a, _b| false),
@@ -1422,7 +1416,6 @@ pub struct Transaction<'a> {
     introspection_sources:
         TableTransaction<ClusterIntrospectionSourceIndexKey, ClusterIntrospectionSourceIndexValue>,
     id_allocator: TableTransaction<IdAllocKey, IdAllocValue>,
-    configs: TableTransaction<String, ConfigValue>,
     settings: TableTransaction<SettingKey, SettingValue>,
     system_gid_mapping: TableTransaction<GidMappingKey, GidMappingValue>,
     system_configurations: TableTransaction<ServerConfigurationKey, ServerConfigurationValue>,
@@ -1917,10 +1910,9 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn update_user_version(&mut self, version: u64) -> Result<(), Error> {
-        let prev = self.configs.set(
-            USER_VERSION.to_string(),
-            Some(ConfigValue { value: version }),
-        )?;
+        let prev = self
+            .durable_state_tx
+            .upsert_config(USER_VERSION.to_string(), ConfigValue { value: version });
         assert!(prev.is_some());
         Ok(())
     }
@@ -2184,7 +2176,6 @@ impl<'a> Transaction<'a> {
         let cluster_replicas = Arc::new(self.cluster_replicas.pending());
         let introspection_sources = Arc::new(self.introspection_sources.pending());
         let id_allocator = Arc::new(self.id_allocator.pending());
-        let configs = Arc::new(self.configs.pending());
         let settings = Arc::new(self.settings.pending());
         let system_gid_mapping = Arc::new(self.system_gid_mapping.pending());
         let system_configurations = Arc::new(self.system_configurations.pending());
@@ -2319,14 +2310,6 @@ impl<'a> Transaction<'a> {
                         &tx,
                         &mut batches,
                         &mut migration_retractions,
-                        &COLLECTION_CONFIG,
-                        &configs,
-                    )
-                    .await?;
-                    add_batch(
-                        &tx,
-                        &mut batches,
-                        &mut migration_retractions,
                         &COLLECTION_SETTING,
                         &settings,
                     )
@@ -2426,7 +2409,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                 // Query all collections in parallel. Makes for triplicated
                 // names, but runs quick.
                 let (
-                    config,
                     setting,
                     id_alloc,
                     system_gid_mapping,
@@ -2440,7 +2422,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     audit_log,
                     storage_usage,
                 ) = futures::try_join!(
-                    add_batch(&tx, &COLLECTION_CONFIG),
                     add_batch(&tx, &COLLECTION_SETTING),
                     add_batch(&tx, &COLLECTION_ID_ALLOC),
                     add_batch(&tx, &COLLECTION_SYSTEM_GID_MAPPING),
@@ -2455,7 +2436,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     add_batch(&tx, &COLLECTION_STORAGE_USAGE),
                 )?;
                 let batches: Vec<AppendBatch> = [
-                    config,
                     setting,
                     id_alloc,
                     system_gid_mapping,
@@ -2604,7 +2584,7 @@ pub struct RoleValue {
     role: SerializedRole,
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash, Debug)]
 pub struct ConfigValue {
     value: u64,
 }
@@ -2639,7 +2619,6 @@ pub struct ServerConfigurationValue {
     value: String,
 }
 
-pub static COLLECTION_CONFIG: TypedCollection<String, ConfigValue> = TypedCollection::new("config");
 pub static COLLECTION_SETTING: TypedCollection<SettingKey, SettingValue> =
     TypedCollection::new("setting");
 pub static COLLECTION_ID_ALLOC: TypedCollection<IdAllocKey, IdAllocValue> =
@@ -2669,7 +2648,6 @@ pub static COLLECTION_STORAGE_USAGE: TypedCollection<StorageUsageKey, ()> =
     TypedCollection::new("storage_usage");
 
 pub static ALL_COLLECTIONS: &[&str] = &[
-    COLLECTION_CONFIG.name(),
     COLLECTION_SETTING.name(),
     COLLECTION_ID_ALLOC.name(),
     COLLECTION_SYSTEM_GID_MAPPING.name(),

@@ -1656,6 +1656,9 @@ impl CatalogState {
                         StateUpdate::Timestamp(_, _) => {
                             // We're ignoring these here!
                         }
+                        StateUpdate::Config(_, _) => {
+                            // We're ignoring these here!
+                        }
                     }
                 }
                 (state_update, _ts, -1) => {
@@ -1664,6 +1667,9 @@ impl CatalogState {
                             item_drops.push((key.gid, value));
                         }
                         StateUpdate::Timestamp(_, _) => {
+                            // We're ignoring these here!
+                        }
+                        StateUpdate::Config(_, _) => {
                             // We're ignoring these here!
                         }
                     }
