@@ -104,7 +104,7 @@ use mz_repr::{Datum, GlobalId, Row, Timestamp};
 use mz_secrets::SecretsController;
 use mz_sql::ast::{CreateSourceStatement, CreateSubsourceStatement, Raw, Statement};
 use mz_sql::catalog::EnvironmentId;
-use mz_sql::names::Aug;
+use mz_sql::names::{Aug, ObjectId};
 use mz_sql::plan::{CopyFormat, Params, QueryWhen};
 use mz_storage_client::controller::{
     CollectionDescription, CreateExportToken, DataSource, StorageError,
@@ -1360,6 +1360,29 @@ impl Coordinator {
 
         drop(storage);
 
+        // We first figure out what updates (if any) we need to apply to the in-memory state of the
+        // Coordinator. As of now, these will mostly be "drop" operations since additions to state
+        // are handled in bespoke `sequence_foo` methods.
+        let mut state_update_ops = Vec::new();
+        for update in &item_updates {
+            match update {
+                (StateUpdate::Item(key, _value), _ts, -1) => {
+                    state_update_ops.push(catalog::Op::DropObject(ObjectId::Item(key.gid)));
+                }
+                (StateUpdate::Item(_key, _value), _ts, 1) => {
+                    // These are handled later!
+                }
+                update => {
+                    todo!("state update: {:?}", update);
+                }
+            }
+        }
+
+        if !state_update_ops.is_empty() {
+            let (state_updates, _ops) = self.prepare_state_updates(state_update_ops).await;
+            self.apply_state_updates(state_updates).await;
+        }
+
         if !item_updates.is_empty() {
             debug!("got new item updates! {:?}", item_updates);
             self.catalog_mut()
@@ -1380,6 +1403,9 @@ impl Coordinator {
                         }
                         item => todo!("set up item: {:?}", item),
                     }
+                }
+                (StateUpdate::Item(key, _value), _ts, -1) => {
+                    // Handled above!
                 }
                 update => {
                     todo!("state update: {:?}", update);
