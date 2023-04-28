@@ -490,8 +490,8 @@ impl<'a> Transaction<'a> {
     }
 
     #[allow(unused)]
-    pub fn remove_item(&mut self, key: ItemKey) {
-        let current_item = self.items.get(&key);
+    pub fn remove_item(&mut self, key: ItemKey) -> Option<ItemValue> {
+        let current_item = self.items.get(&key).cloned();
 
         match current_item {
             Some(current_item) => {
@@ -500,9 +500,12 @@ impl<'a> Transaction<'a> {
                     .push((StateUpdate::Item(key.clone(), current_item.clone()), -1));
 
                 self.items.remove(&key);
+
+                Some(current_item)
             }
             None => {
                 // Nothing to do!
+                None
             }
         }
     }

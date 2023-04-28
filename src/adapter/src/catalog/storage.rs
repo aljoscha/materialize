@@ -1792,11 +1792,10 @@ impl<'a> Transaction<'a> {
     /// DO NOT call this function in a loop, use [`Self::remove_items`] instead.
     pub fn remove_item(&mut self, id: GlobalId) -> Result<(), Error> {
         let key = ItemKey { gid: id };
-        let existing_item = self.durable_state_tx.get_item(&key);
+
+        let existing_item = self.durable_state_tx.remove_item(key);
 
         if let Some(_existing_item) = existing_item {
-            self.durable_state_tx.remove_item(ItemKey { gid: id });
-
             Ok(())
         } else {
             Err(SqlCatalogError::UnknownItem(id.to_string()).into())
