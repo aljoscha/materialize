@@ -1284,8 +1284,13 @@ impl Connection {
     ) -> Result<(), Error> {
         // TODO(aljoscha): Add assertion to make sure timestamps always go up!
         loop {
+            let next = timestamp;
             let mut tx = self.durable_state.begin_transaction().await;
-            tx.upsert_timestamp(timeline.clone(), timestamp);
+            let prev = tx.upsert_timestamp(timeline.clone(), timestamp);
+
+            if let Some(prev) = prev {
+                assert!(next >= prev, "global timestamp must always go up");
+            }
 
             let res = tx.commit().await;
 

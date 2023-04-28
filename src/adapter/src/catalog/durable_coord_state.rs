@@ -395,16 +395,21 @@ impl<'a> Transaction<'a> {
 
     // TODO(aljoscha): We can probably factor out quite a bit of common functionality.
 
-    pub fn upsert_timestamp(&mut self, timeline: Timeline, timestamp: mz_repr::Timestamp) {
+    pub fn upsert_timestamp(
+        &mut self,
+        timeline: Timeline,
+        timestamp: mz_repr::Timestamp,
+    ) -> Option<mz_repr::Timestamp> {
         let key = TimestampKey {
             id: timeline.to_string(),
         };
 
-        let current_timestamp = self.timestamps.get(&key);
+        let current_timestamp = self.timestamps.get(&key).cloned();
 
         match current_timestamp {
             Some(current_timestamp) if current_timestamp.ts == timestamp => {
                 // No need to change anything!
+                Some(current_timestamp.ts)
             }
             Some(current_timestamp) => {
                 // Need to retract the old mapping and insert a new mapping.
@@ -418,6 +423,7 @@ impl<'a> Transaction<'a> {
                     1,
                 ));
                 self.timestamps.insert(key, timestamp_value);
+                Some(current_timestamp.ts)
             }
             None => {
                 let timestamp_value = TimestampValue { ts: timestamp };
@@ -427,6 +433,7 @@ impl<'a> Transaction<'a> {
                     1,
                 ));
                 self.timestamps.insert(key, timestamp_value);
+                None
             }
         }
     }
