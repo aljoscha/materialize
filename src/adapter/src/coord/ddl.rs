@@ -18,6 +18,7 @@ use serde_json::json;
 use timely::progress::Antichain;
 use tracing::Level;
 use tracing::{event, warn};
+use uuid::Uuid;
 
 use mz_audit_log::VersionedEvent;
 use mz_compute_client::protocol::response::PeekResponse;
@@ -28,6 +29,7 @@ use mz_repr::{GlobalId, Timestamp};
 use mz_sql::names::{ObjectId, ResolvedDatabaseSpecifier};
 use mz_sql::session::vars::{self, SystemVars, Var};
 use mz_storage_client::controller::{CreateExportToken, ExportDescription, ReadPolicy};
+use mz_storage_client::types::instances::StorageInstanceId;
 use mz_storage_client::types::sinks::{SinkAsOf, StorageSinkConnection};
 use mz_storage_client::types::sources::{GenericSourceConnection, Timeline};
 
@@ -42,6 +44,7 @@ use crate::telemetry::SegmentClientExt;
 use crate::util::{ComputeSinkId, ResultExt};
 use crate::{catalog, AdapterError, AdapterNotice};
 
+use super::id_bundle::CollectionIdBundle;
 use super::read_policy::SINCE_GRANULARITY;
 use super::timeline::{TimelineContext, TimelineState};
 
@@ -76,12 +79,93 @@ impl Coordinator {
     pub(crate) async fn catalog_transact_with<F, R>(
         &mut self,
         session: Option<&Session>,
-        mut ops: Vec<catalog::Op>,
+        ops: Vec<catalog::Op>,
         f: F,
     ) -> Result<R, AdapterError>
     where
         F: FnOnce(CatalogTxn<Timestamp>) -> Result<R, AdapterError>,
     {
+        event!(Level::TRACE, ops = format!("{:?}", ops));
+
+        let (state_updates, ops) = self.prepare_state_updates(ops).await;
+
+        self.validate_resource_limits(
+            &ops,
+            session
+                .map(|session| session.conn_id())
+                .unwrap_or(SYSTEM_CONN_ID),
+        )?;
+
+        // This will produce timestamps that are guaranteed to increase on each
+        // call, and also never be behind the system clock. If the system clock
+        // hasn't advanced (or has gone backward), it will increment by 1. For
+        // the audit log, we need to balance "close (within 10s or so) to the
+        // system clock" and "always goes up". We've chosen here to prioritize
+        // always going up, and believe we will always be close to the system
+        // clock because it is well configured (chrony) and so may only rarely
+        // regress or pause for 10s.
+        let oracle_write_ts = self.get_local_write_ts().await.timestamp;
+
+        let (catalog, controller) = self.catalog_and_controller_mut();
+        let TransactionResult {
+            builtin_table_updates,
+            audit_events,
+            result,
+        } = catalog
+            .transact(oracle_write_ts, session, ops, |catalog| {
+                f(CatalogTxn {
+                    dataflow_client: controller,
+                    catalog,
+                })
+            })
+            .await?;
+
+        // No error returns are allowed after this point. Enforce this at compile time
+        // by using this odd structure so we don't accidentally add a stray `?`.
+        let _: () = async {
+            self.send_builtin_table_updates(builtin_table_updates).await;
+
+            self.apply_state_updates(state_updates).await;
+        }
+        .await;
+
+        if let (Some(segment_client), Some(user_metadata)) = (
+            &self.segment_client,
+            session.and_then(|s| s.user().external_metadata.as_ref()),
+        ) {
+            for VersionedEvent::V1(event) in audit_events {
+                let event_type = format!(
+                    "{} {}",
+                    event.object_type.as_title_case(),
+                    event.event_type.as_title_case()
+                );
+                // Note: when there is no Session, that means something internal to
+                // environmentd initiated the transaction, hence the default name.
+                let application_name = session
+                    .map(|s| s.application_name())
+                    .unwrap_or("environmentd");
+                segment_client.environment_track(
+                    &self.catalog().config().environment_id,
+                    application_name,
+                    user_metadata.user_id,
+                    event_type,
+                    json!({ "details": event.details.as_json() }),
+                );
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Prepares any state updates that need to be performed when the given `ops` are successfully
+    /// committed to persistent state.
+    ///
+    /// This also returns an updated `ops` that might contain more ops that need to be applied.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn prepare_state_updates(
+        &self,
+        mut ops: Vec<catalog::Op>,
+    ) -> (CoordinatorStateUpdates, Vec<catalog::Op>) {
         event!(Level::TRACE, ops = format!("{:?}", ops));
 
         let mut sources_to_drop = vec![];
@@ -280,174 +364,132 @@ impl Coordinator {
                 .map(catalog::Op::DropTimeline),
         );
 
-        self.validate_resource_limits(
-            &ops,
-            session
-                .map(|session| session.conn_id())
-                .unwrap_or(SYSTEM_CONN_ID),
-        )?;
+        let state_updates = CoordinatorStateUpdates {
+            sources_to_drop,
+            tables_to_drop,
+            storage_sinks_to_drop,
+            indexes_to_drop,
+            materialized_views_to_drop,
+            subscribe_sinks_to_drop,
+            replication_slots_to_drop,
+            secrets_to_drop,
+            timeline_associations,
+            vpc_endpoints_to_drop,
+            clusters_to_drop,
+            cluster_replicas_to_drop,
+            peeks_to_drop,
+            update_compute_config,
+            update_storage_config,
+            update_metrics_retention,
+        };
 
-        // This will produce timestamps that are guaranteed to increase on each
-        // call, and also never be behind the system clock. If the system clock
-        // hasn't advanced (or has gone backward), it will increment by 1. For
-        // the audit log, we need to balance "close (within 10s or so) to the
-        // system clock" and "always goes up". We've chosen here to prioritize
-        // always going up, and believe we will always be close to the system
-        // clock because it is well configured (chrony) and so may only rarely
-        // regress or pause for 10s.
-        let oracle_write_ts = self.get_local_write_ts().await.timestamp;
+        (state_updates, ops)
+    }
 
-        let (catalog, controller) = self.catalog_and_controller_mut();
-        let TransactionResult {
-            builtin_table_updates,
-            audit_events,
-            result,
-        } = catalog
-            .transact(oracle_write_ts, session, ops, |catalog| {
-                f(CatalogTxn {
-                    dataflow_client: controller,
-                    catalog,
-                })
-            })
-            .await?;
-
-        // No error returns are allowed after this point. Enforce this at compile time
-        // by using this odd structure so we don't accidentally add a stray `?`.
-        let _: () = async {
-            self.send_builtin_table_updates(builtin_table_updates).await;
-
-            if !timeline_associations.is_empty() {
-                for (timeline, (should_be_empty, id_bundle)) in timeline_associations {
-                    let became_empty =
-                        self.remove_resources_associated_with_timeline(timeline, id_bundle);
-                    assert_eq!(should_be_empty, became_empty, "emptiness did not match!");
+    /// Applies the prepared `state_updates` to the coordinators in-memory state.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn apply_state_updates(&mut self, state_updates: CoordinatorStateUpdates) {
+        if !state_updates.timeline_associations.is_empty() {
+            for (timeline, (should_be_empty, id_bundle)) in state_updates.timeline_associations {
+                let became_empty =
+                    self.remove_resources_associated_with_timeline(timeline, id_bundle);
+                assert_eq!(should_be_empty, became_empty, "emptiness did not match!");
+            }
+        }
+        if !state_updates.sources_to_drop.is_empty() {
+            self.drop_sources(state_updates.sources_to_drop);
+        }
+        if !state_updates.tables_to_drop.is_empty() {
+            self.drop_sources(state_updates.tables_to_drop);
+        }
+        if !state_updates.storage_sinks_to_drop.is_empty() {
+            self.drop_storage_sinks(state_updates.storage_sinks_to_drop);
+        }
+        if !state_updates.subscribe_sinks_to_drop.is_empty() {
+            let (dropped_metadata, subscribe_sinks_to_drop): (Vec<_>, BTreeSet<_>) =
+                state_updates.subscribe_sinks_to_drop.into_iter().unzip();
+            for (conn_id, dropped_name) in dropped_metadata {
+                if let Some(conn_meta) = self.active_conns.get_mut(&conn_id) {
+                    conn_meta
+                        .drop_sinks
+                        .retain(|sink| !subscribe_sinks_to_drop.contains(sink));
+                    // Send notice on a best effort basis.
+                    let _ = conn_meta
+                        .notice_tx
+                        .send(AdapterNotice::DroppedSubscribe { dropped_name });
                 }
             }
-            if !sources_to_drop.is_empty() {
-                self.drop_sources(sources_to_drop);
-            }
-            if !tables_to_drop.is_empty() {
-                self.drop_sources(tables_to_drop);
-            }
-            if !storage_sinks_to_drop.is_empty() {
-                self.drop_storage_sinks(storage_sinks_to_drop);
-            }
-            if !subscribe_sinks_to_drop.is_empty() {
-                let (dropped_metadata, subscribe_sinks_to_drop): (Vec<_>, BTreeSet<_>) =
-                    subscribe_sinks_to_drop.into_iter().unzip();
-                for (conn_id, dropped_name) in dropped_metadata {
-                    if let Some(conn_meta) = self.active_conns.get_mut(&conn_id) {
-                        conn_meta
-                            .drop_sinks
-                            .retain(|sink| !subscribe_sinks_to_drop.contains(sink));
-                        // Send notice on a best effort basis.
-                        let _ = conn_meta
-                            .notice_tx
-                            .send(AdapterNotice::DroppedSubscribe { dropped_name });
-                    }
-                }
-                self.drop_compute_sinks(subscribe_sinks_to_drop);
-            }
-            if !peeks_to_drop.is_empty() {
-                for (dropped_name, uuid) in peeks_to_drop {
-                    if let Some(pending_peek) = self.remove_pending_peek(&uuid) {
-                        self.controller
-                            .active_compute()
-                            .cancel_peeks(pending_peek.cluster_id, vec![uuid].into_iter().collect())
-                            .unwrap_or_terminate("unable to cancel peek");
-                        // Client may have left.
-                        let _ = pending_peek.sender.send(PeekResponse::Error(format!(
-                            "query could not complete because {dropped_name} was dropped"
-                        )));
-                    }
+            self.drop_compute_sinks(subscribe_sinks_to_drop);
+        }
+        if !state_updates.peeks_to_drop.is_empty() {
+            for (dropped_name, uuid) in state_updates.peeks_to_drop {
+                if let Some(pending_peek) = self.remove_pending_peek(&uuid) {
+                    self.controller
+                        .active_compute()
+                        .cancel_peeks(pending_peek.cluster_id, vec![uuid].into_iter().collect())
+                        .unwrap_or_terminate("unable to cancel peek");
+                    // Client may have left.
+                    let _ = pending_peek.sender.send(PeekResponse::Error(format!(
+                        "query could not complete because {dropped_name} was dropped"
+                    )));
                 }
             }
-            if !indexes_to_drop.is_empty() {
-                self.drop_indexes(indexes_to_drop);
+        }
+        if !state_updates.indexes_to_drop.is_empty() {
+            self.drop_indexes(state_updates.indexes_to_drop);
+        }
+        if !state_updates.materialized_views_to_drop.is_empty() {
+            self.drop_materialized_views(state_updates.materialized_views_to_drop);
+        }
+        if !state_updates.secrets_to_drop.is_empty() {
+            self.drop_secrets(state_updates.secrets_to_drop).await;
+        }
+        if !state_updates.vpc_endpoints_to_drop.is_empty() {
+            self.drop_vpc_endpoints(state_updates.vpc_endpoints_to_drop)
+                .await;
+        }
+        if !state_updates.cluster_replicas_to_drop.is_empty() {
+            fail::fail_point!("after_catalog_drop_replica");
+            for (cluster_id, replica_id) in state_updates.cluster_replicas_to_drop {
+                self.drop_replica(cluster_id, replica_id).await;
             }
-            if !materialized_views_to_drop.is_empty() {
-                self.drop_materialized_views(materialized_views_to_drop);
+        }
+        if !state_updates.clusters_to_drop.is_empty() {
+            for cluster_id in state_updates.clusters_to_drop {
+                self.controller.drop_cluster(cluster_id);
             }
-            if !secrets_to_drop.is_empty() {
-                self.drop_secrets(secrets_to_drop).await;
-            }
-            if !vpc_endpoints_to_drop.is_empty() {
-                self.drop_vpc_endpoints(vpc_endpoints_to_drop).await;
-            }
-            if !cluster_replicas_to_drop.is_empty() {
-                fail::fail_point!("after_catalog_drop_replica");
-                for (cluster_id, replica_id) in cluster_replicas_to_drop {
-                    self.drop_replica(cluster_id, replica_id).await;
-                }
-            }
-            if !clusters_to_drop.is_empty() {
-                for cluster_id in clusters_to_drop {
-                    self.controller.drop_cluster(cluster_id);
-                }
-            }
+        }
 
-            // We don't want to block the coordinator on an external postgres server, so
-            // move the drop slots to a separate task. This does mean that a failed drop
-            // slot won't bubble up to the user as an error message. However, even if it
-            // did (and how the code previously worked), mz has already dropped it from our
-            // catalog, and so we wouldn't be able to retry anyway.
-            if !replication_slots_to_drop.is_empty() {
-                // TODO(guswynn): see if there is more relevant info to add to this name
-                task::spawn(|| "drop_replication_slots", async move {
-                    for (config, slot_name) in replication_slots_to_drop {
-                        // Try to drop the replication slots, but give up after a while.
-                        let _ = Retry::default()
-                            .max_duration(Duration::from_secs(30))
-                            .retry_async(|_state| async {
-                                mz_postgres_util::drop_replication_slots(
-                                    config.clone(),
-                                    &[&slot_name],
-                                )
+        // We don't want to block the coordinator on an external postgres server, so
+        // move the drop slots to a separate task. This does mean that a failed drop
+        // slot won't bubble up to the user as an error message. However, even if it
+        // did (and how the code previously worked), mz has already dropped it from our
+        // catalog, and so we wouldn't be able to retry anyway.
+        if !state_updates.replication_slots_to_drop.is_empty() {
+            // TODO(guswynn): see if there is more relevant info to add to this name
+            task::spawn(|| "drop_replication_slots", async move {
+                for (config, slot_name) in state_updates.replication_slots_to_drop {
+                    // Try to drop the replication slots, but give up after a while.
+                    let _ = Retry::default()
+                        .max_duration(Duration::from_secs(30))
+                        .retry_async(|_state| async {
+                            mz_postgres_util::drop_replication_slots(config.clone(), &[&slot_name])
                                 .await
-                            })
-                            .await;
-                    }
-                });
-            }
-
-            if update_compute_config {
-                self.update_compute_config();
-            }
-            if update_storage_config {
-                self.update_storage_config();
-            }
-            if update_metrics_retention {
-                self.update_metrics_retention();
-            }
-        }
-        .await;
-
-        if let (Some(segment_client), Some(user_metadata)) = (
-            &self.segment_client,
-            session.and_then(|s| s.user().external_metadata.as_ref()),
-        ) {
-            for VersionedEvent::V1(event) in audit_events {
-                let event_type = format!(
-                    "{} {}",
-                    event.object_type.as_title_case(),
-                    event.event_type.as_title_case()
-                );
-                // Note: when there is no Session, that means something internal to
-                // environmentd initiated the transaction, hence the default name.
-                let application_name = session
-                    .map(|s| s.application_name())
-                    .unwrap_or("environmentd");
-                segment_client.environment_track(
-                    &self.catalog().config().environment_id,
-                    application_name,
-                    user_metadata.user_id,
-                    event_type,
-                    json!({ "details": event.details.as_json() }),
-                );
-            }
+                        })
+                        .await;
+                }
+            });
         }
 
-        Ok(result)
+        if state_updates.update_compute_config {
+            self.update_compute_config();
+        }
+        if state_updates.update_storage_config {
+            self.update_storage_config();
+        }
+        if state_updates.update_metrics_retention {
+            self.update_metrics_retention();
+        }
     }
 
     async fn drop_replica(&mut self, cluster_id: ClusterId, replica_id: ReplicaId) {
@@ -1116,4 +1158,25 @@ impl Coordinator {
             Ok(())
         }
     }
+}
+
+/// Updates that need to be applied to the coordinators in-memory state after a transaction of `Ops`
+/// succeeds.
+pub(crate) struct CoordinatorStateUpdates {
+    sources_to_drop: Vec<GlobalId>,
+    tables_to_drop: Vec<GlobalId>,
+    storage_sinks_to_drop: Vec<GlobalId>,
+    indexes_to_drop: Vec<(StorageInstanceId, GlobalId)>,
+    materialized_views_to_drop: Vec<(StorageInstanceId, GlobalId)>,
+    subscribe_sinks_to_drop: Vec<((u32, String), ComputeSinkId)>,
+    replication_slots_to_drop: Vec<(mz_postgres_util::Config, String)>,
+    secrets_to_drop: Vec<GlobalId>,
+    timeline_associations: BTreeMap<Timeline, (bool, CollectionIdBundle)>,
+    vpc_endpoints_to_drop: Vec<GlobalId>,
+    clusters_to_drop: Vec<StorageInstanceId>,
+    cluster_replicas_to_drop: Vec<(StorageInstanceId, u64)>,
+    peeks_to_drop: Vec<(String, Uuid)>,
+    update_compute_config: bool,
+    update_storage_config: bool,
+    update_metrics_retention: bool,
 }
