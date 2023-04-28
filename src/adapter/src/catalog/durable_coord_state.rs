@@ -462,12 +462,13 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn upsert_item(&mut self, key: ItemKey, item: ItemValue) {
-        let current_item = self.items.get(&key);
+    pub fn upsert_item(&mut self, key: ItemKey, item: ItemValue) -> Option<ItemValue> {
+        let current_item = self.items.get(&key).cloned();
 
         match current_item {
-            Some(current_item) if current_item == &item => {
+            Some(current_item) if current_item == item => {
                 // No need to change anything!
+                Some(current_item)
             }
             Some(current_item) => {
                 // Need to retract the old mapping and insert a new mapping.
@@ -476,12 +477,14 @@ impl<'a> Transaction<'a> {
                 self.updates
                     .push((StateUpdate::Item(key.clone(), item.clone()), 1));
                 self.items.insert(key, item);
+                Some(current_item)
             }
             None => {
                 // Only need to add the new mapping.
                 self.updates
                     .push((StateUpdate::Item(key.clone(), item.clone()), 1));
                 self.items.insert(key, item);
+                None
             }
         }
     }

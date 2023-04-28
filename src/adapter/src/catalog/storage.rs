@@ -1681,26 +1681,25 @@ impl<'a> Transaction<'a> {
         owner_id: RoleId,
     ) -> Result<(), Error> {
         let key = ItemKey { gid: id };
-        let existing_item = self.durable_state_tx.get_item(&key);
+
+        let existing_item = self.durable_state_tx.upsert_item(
+            key,
+            ItemValue {
+                schema_id: schema_id.0,
+                name: item_name.to_string(),
+                definition: item,
+                owner_id: Some(owner_id),
+            },
+        );
 
         if let Some(_existing_item) = existing_item {
-            Err(Error::new(ErrorKind::ItemAlreadyExists(
+            return Err(Error::new(ErrorKind::ItemAlreadyExists(
                 id,
                 item_name.to_owned(),
-            )))
-        } else {
-            self.durable_state_tx.upsert_item(
-                ItemKey { gid: id },
-                ItemValue {
-                    schema_id: schema_id.0,
-                    name: item_name.to_string(),
-                    definition: item,
-                    owner_id: Some(owner_id),
-                },
-            );
-
-            Ok(())
+            )));
         }
+
+        Ok(())
     }
 
     pub fn get_and_increment_id(&mut self, key: String) -> Result<u64, Error> {
