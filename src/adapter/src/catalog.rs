@@ -4311,7 +4311,12 @@ impl Catalog {
         self.storage().await.get_next_replica_id().await
     }
 
-    /// Persist new global timestamp for a timeline to disk.
+    /// Get previously persisted global timestamp for a timeline.
+    pub async fn get_timestamp(&self, timeline: &Timeline) -> Result<mz_repr::Timestamp, Error> {
+        self.storage().await.get_timestamp(timeline).await
+    }
+
+    /// Persist new global timestamp for a timeline.
     pub async fn persist_timestamp(
         &self,
         timeline: &Timeline,

@@ -1162,7 +1162,7 @@ impl Coordinator {
 
         // Add builtin table updates the clear the contents of all system tables
         info!("coordinator init: resetting system tables");
-        let read_ts = self.get_local_read_ts();
+        let read_ts = self.get_local_read_ts().await;
         for system_table in entries
             .iter()
             .filter(|entry| entry.is_table() && entry.id().is_system())

@@ -243,8 +243,11 @@ impl crate::coord::Coordinator {
         for (timeline_context, id_bundle) in self.partition_ids_by_timeline_context(id_bundle) {
             match timeline_context {
                 TimelineContext::TimelineDependent(timeline) => {
-                    let TimelineState { oracle, .. } = self.ensure_timeline_state(&timeline).await;
-                    let read_ts = oracle.read_ts();
+                    self.ensure_timeline_state(&timeline).await;
+                    let oracle = self.get_timestamp_oracle(&timeline);
+                    let read_ts = oracle
+                        .read_ts(|| self.catalog().get_timestamp(&timeline))
+                        .await;
                     let new_read_holds = self.initialize_read_holds(read_ts, &id_bundle);
                     let TimelineState { read_holds, .. } =
                         self.ensure_timeline_state(&timeline).await;

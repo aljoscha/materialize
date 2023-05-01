@@ -36,7 +36,6 @@ use crate::client::ConnectionId;
 use crate::coord::id_bundle::CollectionIdBundle;
 use crate::coord::read_policy::ReadHolds;
 use crate::coord::{timeline, Coordinator};
-use crate::util::ResultExt;
 use crate::AdapterError;
 
 /// An enum describing the timeline context of a query.
@@ -82,7 +81,7 @@ pub struct WriteTimestamp<T = mz_repr::Timestamp> {
 /// providing read (and sometimes write) timestamps, and a set of read holds which
 /// guarantee that those read timestamps are valid.
 pub(crate) struct TimelineState<T> {
-    pub(crate) oracle: DurableTimestampOracle<T>,
+    pub(crate) oracle: TimestampOracle<T>,
     pub(crate) read_holds: ReadHolds<T>,
 }
 
@@ -94,53 +93,58 @@ impl<T: fmt::Debug> fmt::Debug for TimelineState<T> {
     }
 }
 
-/// A timeline can perform reads and writes. Reads happen at the read timestamp
-/// and writes happen at the write timestamp. After the write has completed, but before a response
-/// is sent, the read timestamp must be updated to a value greater than or equal to `self.write_ts`.
-struct TimestampOracleState<T> {
-    read_ts: T,
-    write_ts: T,
-}
-
-/// A type that provides write and read timestamps, reads observe exactly their preceding writes..
+/// A type that provides write and read timestamps, reads observe exactly their preceding writes.
 ///
 /// Specifically, all read timestamps will be greater or equal to all previously reported completed
 /// write timestamps, and strictly less than all subsequently emitted write timestamps.
-struct TimestampOracle<T> {
-    state: TimestampOracleState<T>,
+///
+/// A timeline can perform reads and writes. Reads happen at the read timestamp
+/// and writes happen at the write timestamp. After the write has completed, but before a response
+/// is sent, the read timestamp must be updated to a value greater than or equal to `self.write_ts`.
+pub struct TimestampOracle<T> {
     next: Box<dyn Fn() -> T>,
+    write_ts: T,
 }
 
 impl<T: TimestampManipulation> TimestampOracle<T> {
     /// Create a new timeline, starting at the indicated time. `next` generates
-    /// new timestamps when invoked. The timestamps have no requirements, and can
-    /// retreat from previous invocations.
-    pub fn new<F>(initially: T, next: F) -> Self
+    /// new timestamps when invoked. Timestamps that are returned are made durable and will never
+    /// retract.
+    pub(crate) async fn new<F, Fut>(initially: T, next: F, persist_fn: impl Fn(T) -> Fut) -> Self
     where
         F: Fn() -> T + 'static,
+        Fut: Future<Output = Result<(), crate::catalog::Error>>,
     {
-        Self {
-            state: TimestampOracleState {
-                read_ts: initially.clone(),
-                write_ts: initially,
-            },
-            next: Box::new(next),
+        let res = persist_fn(initially.clone()).await;
+        match res {
+            Ok(()) => {}
+            Err(err) => {
+                panic!("cannot persist initial timestamp: {}, retrying...", err);
+            }
         }
+
+        let oracle = Self {
+            next: Box::new(next),
+            write_ts: initially,
+        };
+
+        oracle
     }
 
     /// Acquire a new timestamp for writing.
     ///
     /// This timestamp will be strictly greater than all prior values of
     /// `self.read_ts()` and `self.write_ts()`.
-    fn write_ts(&mut self) -> WriteTimestamp<T> {
+    async fn write_ts<Fut>(&mut self, read_fn: impl Fn() -> Fut) -> WriteTimestamp<T>
+    where
+        Fut: Future<Output = Result<T, crate::catalog::Error>>,
+    {
         let mut next = (self.next)();
-        if next.less_equal(&self.state.write_ts) {
-            next = self.state.write_ts.step_forward();
+        let write_ts = read_fn().await.expect("cannot read current write_ts");
+        if next.less_equal(&write_ts) {
+            next = write_ts.step_forward();
         }
-        assert!(self.state.read_ts.less_than(&next));
-        assert!(self.state.write_ts.less_than(&next));
-        self.state.write_ts = next.clone();
-        assert!(self.state.read_ts.less_equal(&self.state.write_ts));
+        self.write_ts = next.clone();
         let advance_to = next.step_forward();
         WriteTimestamp {
             timestamp: next,
@@ -150,29 +154,31 @@ impl<T: TimestampManipulation> TimestampOracle<T> {
 
     /// Peek the current write timestamp.
     fn peek_write_ts(&self) -> T {
-        self.state.write_ts.clone()
+        self.write_ts.clone()
     }
 
     /// Acquire a new timestamp for reading.
-    ///
-    /// This timestamp will be greater or equal to all prior values of `self.apply_write(write_ts)`,
-    /// and strictly less than all subsequent values of `self.write_ts()`.
-    fn read_ts(&self) -> T {
-        self.state.read_ts.clone()
+    pub async fn read_ts<Fut>(&self, read_fn: impl Fn() -> Fut) -> T
+    where
+        Fut: Future<Output = Result<T, crate::catalog::Error>>,
+    {
+        read_fn().await.expect("cannot read read_ts")
     }
 
     /// Mark a write at `write_ts` completed.
     ///
     /// All subsequent values of `self.read_ts()` will be greater or equal to `write_ts`.
-    fn apply_write(&mut self, write_ts: T) {
-        if self.state.read_ts.less_than(&write_ts) {
-            self.state.read_ts = write_ts;
-
-            if self.state.write_ts.less_than(&self.state.read_ts) {
-                self.state.write_ts = self.state.read_ts.clone();
+    pub async fn apply_write<Fut>(&mut self, lower_bound: T, persist_fn: impl FnOnce(T) -> Fut)
+    where
+        Fut: Future<Output = Result<(), crate::catalog::Error>>,
+    {
+        let res = persist_fn(lower_bound.clone()).await;
+        match res {
+            Ok(()) => {}
+            Err(err) => {
+                panic!("cannot apply_write timestamp: {}, retrying...", err);
             }
         }
-        assert!(self.state.read_ts.less_equal(&self.state.write_ts));
     }
 }
 
@@ -235,117 +241,6 @@ pub fn monotonic_now(now: NowFn, previous_now: Timestamp) -> Timestamp {
     monotonic_now
 }
 
-/// A type that wraps a [`TimestampOracle`] and provides durable timestamps. This allows us to
-/// recover a timestamp that is larger than all previous timestamps on restart. The protocol
-/// is based on timestamp recovery from Percolator <https://research.google/pubs/pub36726/>. We
-/// "pre-allocate" a group of timestamps at once, and only durably store the largest of those
-/// timestamps. All timestamps within that interval can be served directly from memory, without
-/// going to disk. On restart, we re-initialize the current timestamp to a value one larger
-/// than the persisted timestamp.
-///
-/// See [`TimestampOracle`] for more details on the properties of the timestamps.
-pub struct DurableTimestampOracle<T> {
-    timestamp_oracle: TimestampOracle<T>,
-    durable_timestamp: T,
-    persist_interval: T,
-}
-
-impl<T: TimestampManipulation> DurableTimestampOracle<T> {
-    /// Create a new durable timeline, starting at the indicated time. Timestamps will be
-    /// allocated in groups of size `persist_interval`. Also returns the new timestamp that
-    /// needs to be persisted to disk.
-    ///
-    /// See [`TimestampOracle::new`] for more details.
-    pub(crate) async fn new<F, Fut>(
-        initially: T,
-        next: F,
-        persist_interval: T,
-        persist_fn: impl FnOnce(T) -> Fut,
-    ) -> Self
-    where
-        F: Fn() -> T + 'static,
-        Fut: Future<Output = Result<(), crate::catalog::Error>>,
-    {
-        let mut oracle = Self {
-            timestamp_oracle: TimestampOracle::new(initially.clone(), next),
-            durable_timestamp: initially.clone(),
-            persist_interval,
-        };
-        oracle
-            .maybe_allocate_new_timestamps(&initially, persist_fn)
-            .await;
-        oracle
-    }
-
-    /// Acquire a new timestamp for writing. Optionally returns a timestamp that needs to be
-    /// persisted to disk.
-    ///
-    /// See [`TimestampOracle::write_ts`] for more details.
-    async fn write_ts<Fut>(&mut self, persist_fn: impl FnOnce(T) -> Fut) -> WriteTimestamp<T>
-    where
-        Fut: Future<Output = Result<(), crate::catalog::Error>>,
-    {
-        let ts = self.timestamp_oracle.write_ts();
-        self.maybe_allocate_new_timestamps(&ts.timestamp, persist_fn)
-            .await;
-        ts
-    }
-
-    /// Peek current write timestamp.
-    fn peek_write_ts(&self) -> T {
-        self.timestamp_oracle.peek_write_ts()
-    }
-
-    /// Acquire a new timestamp for reading. Optionally returns a timestamp that needs to be
-    /// persisted to disk.
-    ///
-    /// See [`TimestampOracle::read_ts`] for more details.
-    pub fn read_ts(&self) -> T {
-        let ts = self.timestamp_oracle.read_ts();
-        assert!(
-            ts.less_than(&self.durable_timestamp),
-            "read_ts should not advance the global timestamp"
-        );
-        ts
-    }
-
-    /// Mark a write at `write_ts` completed.
-    ///
-    /// See [`TimestampOracle::apply_write`] for more details.
-    pub async fn apply_write<Fut>(&mut self, lower_bound: T, persist_fn: impl FnOnce(T) -> Fut)
-    where
-        Fut: Future<Output = Result<(), crate::catalog::Error>>,
-    {
-        self.timestamp_oracle.apply_write(lower_bound.clone());
-        self.maybe_allocate_new_timestamps(&lower_bound, persist_fn)
-            .await;
-    }
-
-    /// Checks to see if we can serve the timestamp from memory, or if we need to durably store
-    /// a new timestamp.
-    ///
-    /// If `ts` is less than the persisted timestamp then we can serve `ts` from memory,
-    /// otherwise we need to durably store some timestamp greater than `ts`.
-    async fn maybe_allocate_new_timestamps<Fut>(
-        &mut self,
-        ts: &T,
-        persist_fn: impl FnOnce(T) -> Fut,
-    ) where
-        Fut: Future<Output = Result<(), crate::catalog::Error>>,
-    {
-        if self.durable_timestamp.less_equal(ts)
-            // Since the timestamp is at its max value, we know that no other Coord can
-            // allocate a higher value.
-            && self.durable_timestamp.less_than(&T::maximum())
-        {
-            self.durable_timestamp = ts.step_forward_by(&self.persist_interval);
-            persist_fn(self.durable_timestamp.clone())
-                .await
-                .unwrap_or_terminate("can't persist timestamp");
-        }
-    }
-}
-
 impl Coordinator {
     pub(crate) fn now(&self) -> EpochMillis {
         (self.catalog().config().now)()
@@ -358,7 +253,7 @@ impl Coordinator {
     pub(crate) fn get_timestamp_oracle_mut(
         &mut self,
         timeline: &Timeline,
-    ) -> &mut DurableTimestampOracle<Timestamp> {
+    ) -> &mut TimestampOracle<Timestamp> {
         &mut self
             .global_timelines
             .get_mut(timeline)
@@ -366,10 +261,7 @@ impl Coordinator {
             .oracle
     }
 
-    pub(crate) fn get_timestamp_oracle(
-        &self,
-        timeline: &Timeline,
-    ) -> &DurableTimestampOracle<Timestamp> {
+    pub(crate) fn get_timestamp_oracle(&self, timeline: &Timeline) -> &TimestampOracle<Timestamp> {
         &self
             .global_timelines
             .get(timeline)
@@ -379,15 +271,17 @@ impl Coordinator {
 
     /// Returns a reference to the timestamp oracle used for reads and writes
     /// from/to a local input.
-    fn get_local_timestamp_oracle(&self) -> &DurableTimestampOracle<Timestamp> {
+    fn get_local_timestamp_oracle(&self) -> &TimestampOracle<Timestamp> {
         self.get_timestamp_oracle(&Timeline::EpochMilliseconds)
     }
 
     /// Assign a timestamp for a read from a local input. Reads following writes
     /// must be at a time >= the write's timestamp; we choose "equal to" for
     /// simplicity's sake and to open as few new timestamps as possible.
-    pub(crate) fn get_local_read_ts(&self) -> Timestamp {
-        self.get_local_timestamp_oracle().read_ts()
+    pub(crate) async fn get_local_read_ts(&self) -> Timestamp {
+        self.get_local_timestamp_oracle()
+            .read_ts(&|| self.catalog.get_timestamp(&Timeline::EpochMilliseconds))
+            .await
     }
 
     /// Assign a timestamp for a write to a local input and increase the local ts.
@@ -399,10 +293,7 @@ impl Coordinator {
             .get_mut(&Timeline::EpochMilliseconds)
             .expect("no realtime timeline")
             .oracle
-            .write_ts(|ts| {
-                self.catalog
-                    .persist_timestamp(&Timeline::EpochMilliseconds, ts)
-            })
+            .write_ts(|| self.catalog.get_timestamp(&Timeline::EpochMilliseconds))
             .await
     }
 
@@ -455,7 +346,7 @@ impl Coordinator {
         timeline: &'a Timeline,
         initially: Timestamp,
         now: NowFn,
-        persist_fn: impl FnOnce(Timestamp) -> Fut,
+        persist_fn: impl Fn(Timestamp) -> Fut,
         global_timelines: &'a mut BTreeMap<Timeline, TimelineState<Timestamp>>,
     ) -> &'a mut TimelineState<Timestamp>
     where
@@ -463,21 +354,9 @@ impl Coordinator {
     {
         if !global_timelines.contains_key(timeline) {
             let oracle = if timeline == &Timeline::EpochMilliseconds {
-                DurableTimestampOracle::new(
-                    initially,
-                    move || (now)().into(),
-                    *TIMESTAMP_PERSIST_INTERVAL,
-                    persist_fn,
-                )
-                .await
+                TimestampOracle::new(initially, move || (now)().into(), persist_fn).await
             } else {
-                DurableTimestampOracle::new(
-                    initially,
-                    Timestamp::minimum,
-                    *TIMESTAMP_PERSIST_INTERVAL,
-                    persist_fn,
-                )
-                .await
+                TimestampOracle::new(initially, Timestamp::minimum, persist_fn).await
             };
             global_timelines.insert(
                 timeline.clone(),
@@ -887,7 +766,10 @@ impl Coordinator {
         ) in global_timelines
         {
             let now = if timeline == Timeline::EpochMilliseconds {
-                oracle.read_ts()
+                let timeline = timeline.clone();
+                oracle
+                    .read_ts(|| self.catalog().get_timestamp(&timeline))
+                    .await
             } else {
                 // For non realtime sources, we define now as the largest timestamp, not in
                 // advance of any object's upper. This is the largest timestamp that is closed
@@ -898,7 +780,9 @@ impl Coordinator {
             oracle
                 .apply_write(now, |ts| self.catalog().persist_timestamp(&timeline, ts))
                 .await;
-            let read_ts = oracle.read_ts();
+            let read_ts = oracle
+                .read_ts(|| self.catalog().get_timestamp(&timeline))
+                .await;
             if read_holds.times().any(|time| time.less_than(&read_ts)) {
                 read_holds = self.update_read_hold(read_holds, read_ts);
             }

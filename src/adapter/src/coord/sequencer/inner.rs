@@ -2046,19 +2046,21 @@ impl Coordinator {
             real_time_recency_ts,
         }: PeekStageFinish,
     ) -> Result<ExecuteResponse, AdapterError> {
-        let mut peek_plan = self.plan_peek(
-            source,
-            session,
-            &when,
-            cluster_id,
-            view_id,
-            index_id,
-            timeline_context,
-            source_ids,
-            id_bundle,
-            in_immediate_multi_stmt_txn,
-            real_time_recency_ts,
-        )?;
+        let mut peek_plan = self
+            .plan_peek(
+                source,
+                session,
+                &when,
+                cluster_id,
+                view_id,
+                index_id,
+                timeline_context,
+                source_ids,
+                id_bundle,
+                in_immediate_multi_stmt_txn,
+                real_time_recency_ts,
+            )
+            .await?;
 
         if let Some(id_bundle) = peek_plan.read_holds.take() {
             if let TimestampContext::TimelineTimestamp(_, timestamp) = peek_plan.timestamp_context {
@@ -2100,7 +2102,7 @@ impl Coordinator {
         }
     }
 
-    fn plan_peek(
+    async fn plan_peek(
         &self,
         source: MirRelationExpr,
         session: &Session,
@@ -2132,14 +2134,16 @@ impl Coordinator {
                         self.timedomain_for(&source_ids, &timeline_context, conn_id, cluster_id)?;
                     // We want to prevent compaction of the indexes consulted by
                     // determine_timestamp, not the ones listed in the query.
-                    let timestamp = self.determine_timestamp(
-                        session,
-                        &id_bundle,
-                        &QueryWhen::Immediately,
-                        cluster_id,
-                        timeline_context,
-                        real_time_recency_ts,
-                    )?;
+                    let timestamp = self
+                        .determine_timestamp(
+                            session,
+                            &id_bundle,
+                            &QueryWhen::Immediately,
+                            cluster_id,
+                            timeline_context,
+                            real_time_recency_ts,
+                        )
+                        .await?;
                     // We only need read holds if the read depends on a timestamp.
                     if timestamp.timestamp_context.contains_timestamp() {
                         read_holds = Some(id_bundle);
@@ -2155,7 +2159,8 @@ impl Coordinator {
                 cluster_id,
                 timeline_context,
                 real_time_recency_ts,
-            )?
+            )
+            .await?
             .timestamp_context
         };
 
@@ -2352,7 +2357,8 @@ impl Coordinator {
         let id_bundle = self.index_oracle(cluster_id).sufficient_collections(&uses);
         let timeline = self.validate_timeline_context(id_bundle.iter())?;
         let as_of = self
-            .determine_timestamp(session, &id_bundle, &when, cluster_id, timeline, None)?
+            .determine_timestamp(session, &id_bundle, &when, cluster_id, timeline, None)
+            .await?
             .timestamp_context
             .timestamp_or_default();
 
@@ -2475,14 +2481,17 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn sequence_explain(
+    pub(super) async fn sequence_explain(
         &mut self,
         tx: ClientTransmitter<ExecuteResponse>,
         session: Session,
         plan: ExplainPlan,
     ) {
         match plan.stage {
-            ExplainStage::Timestamp => self.sequence_explain_timestamp_begin(tx, session, plan),
+            ExplainStage::Timestamp => {
+                self.sequence_explain_timestamp_begin(tx, session, plan)
+                    .await
+            }
             _ => tx.send(self.sequence_explain_plan(&session, plan), session),
         }
     }
@@ -2673,7 +2682,7 @@ impl Coordinator {
         Ok(send_immediate_rows(rows))
     }
 
-    fn sequence_explain_timestamp_begin(
+    async fn sequence_explain_timestamp_begin(
         &mut self,
         tx: ClientTransmitter<ExecuteResponse>,
         session: Session,
@@ -2721,7 +2730,8 @@ impl Coordinator {
                     optimized_plan,
                     id_bundle,
                     None,
-                ),
+                )
+                .await,
                 session,
             ),
         }
@@ -2755,7 +2765,7 @@ impl Coordinator {
         Ok((format, source_ids, optimized_plan, cluster.id(), id_bundle))
     }
 
-    pub(super) fn sequence_explain_timestamp_finish_inner(
+    pub(super) async fn sequence_explain_timestamp_finish_inner(
         &self,
         session: &Session,
         format: ExplainFormat,
@@ -2772,14 +2782,16 @@ impl Coordinator {
             }
         };
         let timeline_context = self.validate_timeline_context(optimized_plan.depends_on())?;
-        let determination = self.determine_timestamp(
-            session,
-            &id_bundle,
-            &QueryWhen::Immediately,
-            cluster_id,
-            timeline_context,
-            real_time_recency_ts,
-        )?;
+        let determination = self
+            .determine_timestamp(
+                session,
+                &id_bundle,
+                &QueryWhen::Immediately,
+                cluster_id,
+                timeline_context,
+                real_time_recency_ts,
+            )
+            .await?;
         let mut sources = Vec::new();
         {
             for id in id_bundle.storage_ids.iter() {

@@ -112,7 +112,7 @@ impl Coordinator {
     /// after `since` and sure to be available not after `upper`.
     ///
     /// The timeline that `id_bundle` belongs to is also returned, if one exists.
-    pub(crate) fn determine_timestamp(
+    pub(crate) async fn determine_timestamp(
         &self,
         session: &Session,
         id_bundle: &CollectionIdBundle,
@@ -170,7 +170,11 @@ impl Coordinator {
                     && isolation_level == &IsolationLevel::StrictSerializable)
             {
                 let timestamp_oracle = self.get_timestamp_oracle(timeline);
-                oracle_read_ts = Some(timestamp_oracle.read_ts());
+                oracle_read_ts = Some(
+                    timestamp_oracle
+                        .read_ts(|| self.catalog().get_timestamp(&timeline))
+                        .await,
+                );
                 candidate.join_assign(&oracle_read_ts.expect("known to be `Some`"));
             }
         }

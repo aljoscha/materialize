@@ -608,8 +608,12 @@ impl Coordinator {
             if let TimestampContext::TimelineTimestamp(timeline, timestamp) =
                 read_txn.timestamp_context()
             {
-                let timestamp_oracle = self.get_timestamp_oracle_mut(&timeline);
-                let read_ts = timestamp_oracle.read_ts();
+                let timestamp_oracle = self.get_timestamp_oracle(&timeline);
+
+                let read_ts = timestamp_oracle
+                    .read_ts(|| self.catalog().get_timestamp(&timeline))
+                    .await;
+
                 if timestamp <= read_ts {
                     ready_txns.push(read_txn);
                 } else {
@@ -683,7 +687,8 @@ impl Coordinator {
                     optimized_plan,
                     id_bundle,
                     Some(real_time_recency_ts),
-                ),
+                )
+                .await,
                 session,
             ),
             RealTimeRecencyContext::Peek {

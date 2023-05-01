@@ -253,7 +253,7 @@ impl Coordinator {
                 self.sequence_copy_rows(tx, session, id, columns, rows);
             }
             Plan::Explain(plan) => {
-                self.sequence_explain(tx, session, plan);
+                self.sequence_explain(tx, session, plan).await;
             }
             Plan::Insert(plan) => {
                 self.sequence_insert(tx, session, plan).await;
@@ -440,7 +440,7 @@ impl Coordinator {
         self.sequence_create_role(session, plan).await
     }
 
-    pub(crate) fn sequence_explain_timestamp_finish(
+    pub(crate) async fn sequence_explain_timestamp_finish(
         &self,
         session: &Session,
         format: ExplainFormat,
@@ -457,6 +457,7 @@ impl Coordinator {
             id_bundle,
             real_time_recency_ts,
         )
+        .await
     }
 
     pub(crate) fn allocate_transient_id(&mut self) -> Result<GlobalId, AdapterError> {

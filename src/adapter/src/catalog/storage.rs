@@ -1275,6 +1275,21 @@ impl Connection {
         Ok(timestamps)
     }
 
+    /// Get the current write/read timestamp for the `timeline`.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn get_timestamp(
+        &mut self,
+        timeline: &Timeline,
+    ) -> Result<mz_repr::Timestamp, Error> {
+        let read_tx = self.durable_state.begin_transaction().await;
+        let timestamp = read_tx.get_timestamp(timeline);
+
+        timestamp.ok_or(
+            ErrorKind::Unstructured(format!("missing timestamp for timeline {:?}", timeline))
+                .into(),
+        )
+    }
+
     /// Persist new global timestamp for a timeline to disk.
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn persist_timestamp(
