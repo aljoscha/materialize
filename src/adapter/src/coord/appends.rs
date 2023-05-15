@@ -151,7 +151,7 @@ impl Coordinator {
     /// writes.
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) async fn try_group_commit(&mut self) {
-        let timestamp = self.peek_local_write_ts();
+        let timestamp = self.peek_local_write_ts().await;
         let now = Timestamp::from((self.catalog().config().now)());
         if timestamp > now {
             // Cap retry time to 1s. In cases where the system clock has retreated by

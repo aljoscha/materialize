@@ -245,9 +245,7 @@ impl crate::coord::Coordinator {
                 TimelineContext::TimelineDependent(timeline) => {
                     self.ensure_timeline_state(&timeline).await;
                     let oracle = self.get_timestamp_oracle(&timeline);
-                    let read_ts = oracle
-                        .read_ts(|| self.catalog().get_timestamp(&timeline))
-                        .await;
+                    let read_ts = oracle.read_ts(|| self.catalog().read_ts(&timeline)).await;
                     let new_read_holds = self.initialize_read_holds(read_ts, &id_bundle);
                     let TimelineState { read_holds, .. } =
                         self.ensure_timeline_state(&timeline).await;

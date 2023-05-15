@@ -172,7 +172,7 @@ impl Coordinator {
                 let timestamp_oracle = self.get_timestamp_oracle(timeline);
                 oracle_read_ts = Some(
                     timestamp_oracle
-                        .read_ts(|| self.catalog().get_timestamp(&timeline))
+                        .read_ts(|| self.catalog().read_ts(&timeline))
                         .await,
                 );
                 candidate.join_assign(&oracle_read_ts.expect("known to be `Some`"));

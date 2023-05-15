@@ -16,7 +16,6 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use itertools::{max, Itertools};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
 
 use mz_audit_log::{
     EventDetails, EventType, EventV1, ObjectType, VersionedEvent, VersionedStorageUsage,
@@ -37,6 +36,7 @@ use mz_sql::names::{
 };
 use mz_stash::{AppendBatch, Data, Id, Stash, StashError, TableTransaction, TypedCollection};
 use mz_storage_client::types::sources::Timeline;
+use timely::PartialOrder;
 
 use crate::catalog;
 use crate::catalog::builtin::{
@@ -817,10 +817,9 @@ impl Connection {
         //
         // This time is usually the current system time, but with protection
         // against backwards time jumps, even across restarts.
-        let previous_now_ts =
-            try_get_persisted_timestamp(&mut durable_state, &Timeline::EpochMilliseconds)
-                .await?
-                .unwrap_or(mz_repr::Timestamp::MIN);
+        let previous_now_ts = try_get_persisted_timestamp(&mut stash, &Timeline::EpochMilliseconds)
+            .await?
+            .unwrap_or(mz_repr::Timestamp::MIN);
         let boot_ts = timeline::monotonic_now(now, previous_now_ts);
 
         let mut conn = Connection {
@@ -831,7 +830,8 @@ impl Connection {
 
         if !conn.stash.is_readonly() {
             // IMPORTANT: we durably record the new timestamp before using it.
-            conn.persist_timestamp(&Timeline::EpochMilliseconds, boot_ts)
+            let boot_ts = conn
+                .allocate_write_ts(&Timeline::EpochMilliseconds, boot_ts)
                 .await?;
             migrate(
                 &mut conn.stash,
@@ -1270,64 +1270,156 @@ impl Connection {
     pub async fn get_all_persisted_timestamps(
         &mut self,
     ) -> Result<BTreeMap<Timeline, mz_repr::Timestamp>, Error> {
-        let read_tx = self.durable_state.begin_transaction().await;
-        let timestamps = read_tx.get_all_timestamps().into_iter().collect();
-        Ok(timestamps)
+        Ok(COLLECTION_TIMESTAMP
+            .peek_one(&mut self.stash)
+            .await?
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.id.parse().expect("invalid timeline persisted"),
+                    v.write_ts,
+                )
+            })
+            .collect())
     }
 
-    /// Get the current write/read timestamp for the `timeline`.
+    /// Allocates a new timestamp for writing.
+    ///
+    /// This timestamp will be strictly greater than all prior values of `self.read_ts()` and
+    /// `self.allocate_write_ts()`.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn get_timestamp(
+    pub async fn allocate_write_ts(
+        &mut self,
+        timeline: &Timeline,
+        mut proposed_write_ts: mz_repr::Timestamp,
+    ) -> Result<mz_repr::Timestamp, Error> {
+        let key = TimestampKey {
+            id: timeline.to_string(),
+        };
+        let (prev, next) = COLLECTION_TIMESTAMP
+            .upsert_key(&mut self.stash, key, move |current_ts| {
+                match current_ts {
+                    None => {
+                        // Currently we have no read/write ts!
+                        Ok::<_, Error>(TimestampValue {
+                            read_ts: proposed_write_ts,
+                            write_ts: proposed_write_ts,
+                        })
+                    }
+                    Some(current_ts) => {
+                        if proposed_write_ts.less_equal(&current_ts.write_ts) {
+                            proposed_write_ts = current_ts.write_ts.step_forward();
+                        }
+                        // NOTE: These asserts are a bit weird (the last one), but this is copied
+                        // straight from pre-existing `TimstampOracle`.
+                        assert!(current_ts.read_ts.less_than(&proposed_write_ts));
+                        assert!(current_ts.write_ts.less_than(&proposed_write_ts));
+                        let new_write_ts = proposed_write_ts.clone();
+                        assert!(current_ts.read_ts.less_equal(&new_write_ts));
+
+                        Ok::<_, Error>(TimestampValue {
+                            read_ts: current_ts.read_ts,
+                            write_ts: new_write_ts,
+                        })
+                    }
+                }
+            })
+            .await??;
+        if let Some(prev) = prev {
+            assert!(
+                next.write_ts > prev.write_ts,
+                "global timestamp must always go up"
+            );
+        }
+        Ok(next.write_ts)
+    }
+
+    /// Get the current read timestamp for the `timeline`.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn read_ts(&mut self, timeline: &Timeline) -> Result<mz_repr::Timestamp, Error> {
+        let key = TimestampKey {
+            id: timeline.to_string(),
+        };
+
+        let ts = COLLECTION_TIMESTAMP
+            .peek_key_one(&mut self.stash, key)
+            .await?;
+
+        let read_ts = ts.map(|ts| ts.read_ts).unwrap_or(mz_repr::Timestamp::MIN);
+
+        Ok(read_ts)
+    }
+
+    /// Get the current write timestamp, without allocating a new one.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub async fn peek_write_ts(
         &mut self,
         timeline: &Timeline,
     ) -> Result<mz_repr::Timestamp, Error> {
-        let read_tx = self.durable_state.begin_transaction().await;
-        let timestamp = read_tx.get_timestamp(timeline);
+        let key = TimestampKey {
+            id: timeline.to_string(),
+        };
 
-        timestamp.ok_or(
-            ErrorKind::Unstructured(format!("missing timestamp for timeline {:?}", timeline))
-                .into(),
-        )
+        let ts = COLLECTION_TIMESTAMP
+            .peek_key_one(&mut self.stash, key)
+            .await?;
+
+        let write_ts = ts.map(|ts| ts.write_ts).unwrap_or(mz_repr::Timestamp::MIN);
+
+        Ok(write_ts)
     }
 
-    /// Persist new global timestamp for a timeline to disk.
+    /// Mark a write at `write_ts` completed.
+    ///
+    /// All subsequent values of `self.read_ts()` will be greater or equal to `write_ts`.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn persist_timestamp(
+    pub async fn finalize_write(
         &mut self,
         timeline: &Timeline,
-        timestamp: mz_repr::Timestamp,
+        write_ts: mz_repr::Timestamp,
     ) -> Result<(), Error> {
-        // TODO(aljoscha): Add assertion to make sure timestamps always go up!
-        loop {
-            let next = timestamp;
-            let mut tx = self.durable_state.begin_transaction().await;
-            let prev = tx.upsert_timestamp(timeline.clone(), timestamp);
+        let key = TimestampKey {
+            id: timeline.to_string(),
+        };
 
-            if let Some(prev) = prev {
-                assert!(next >= prev, "global timestamp must always go up");
-            }
+        let (prev, next) = COLLECTION_TIMESTAMP
+            .upsert_key(&mut self.stash, key, move |current_ts| match current_ts {
+                None => Ok::<_, Error>(TimestampValue {
+                    read_ts: write_ts,
+                    write_ts,
+                }),
+                Some(current_ts) => {
+                    let new_read_ts = if write_ts > current_ts.read_ts {
+                        write_ts
+                    } else {
+                        current_ts.read_ts
+                    };
 
-            let res = tx.commit().await;
+                    let new_write_ts = if write_ts > current_ts.write_ts {
+                        write_ts
+                    } else {
+                        current_ts.write_ts
+                    };
 
-            match res {
-                Ok(()) => return Ok(()),
-                Err(upper_error) => {
-                    debug!("upper mismatch while persisting timestamp: {}", upper_error);
+                    Ok::<_, Error>(TimestampValue {
+                        read_ts: new_read_ts,
+                        write_ts: new_write_ts,
+                    })
                 }
-            }
+            })
+            .await??;
 
-            let read_tx = self.durable_state.begin_transaction().await;
-            let recent_timestamp = read_tx.get_timestamp(timeline);
-            if let Some(recent_timestamp) = recent_timestamp {
-                if recent_timestamp >= timestamp {
-                    debug!(
-                        "someone already persisted a higher timestamp: {} >= {}",
-                        recent_timestamp, timestamp
-                    );
-                    return Ok(());
-                }
-            }
+        if let Some(prev) = prev {
+            assert!(
+                next.write_ts >= prev.write_ts,
+                "global write timestamp must always go up"
+            );
+            assert!(
+                next.read_ts >= prev.read_ts,
+                "global read timestamp must always go up"
+            );
         }
+        Ok(())
     }
 
     pub async fn transaction<'a>(&'a mut self) -> Result<Transaction<'a>, Error> {
@@ -1347,15 +1439,18 @@ impl Connection {
 ///
 /// Returns `None` if no persisted timestamp for the specified timeline exists.
 async fn try_get_persisted_timestamp(
-    durable_state: &mut DurableCoordState,
+    stash: &mut Stash,
     timeline: &Timeline,
 ) -> Result<Option<mz_repr::Timestamp>, Error>
 where
 {
-    let read_tx = durable_state.begin_transaction().await;
-    let timestamp = read_tx.get_timestamp(timeline);
-
-    Ok(timestamp)
+    let key = TimestampKey {
+        id: timeline.to_string(),
+    };
+    Ok(COLLECTION_TIMESTAMP
+        .peek_key_one(stash, key)
+        .await?
+        .map(|v| v.write_ts))
 }
 
 #[tracing::instrument(name = "storage::transaction", level = "debug", skip_all)]
@@ -1371,7 +1466,7 @@ pub async fn transaction<'a>(
         cluster_replicas,
         introspection_sources,
         id_allocator,
-        settings,
+        timestamps,
         system_gid_mapping,
         system_configurations,
     ) = stash
@@ -1389,7 +1484,7 @@ pub async fn transaction<'a>(
                             .await?,
                     ),
                     tx.peek_one(tx.collection(COLLECTION_ID_ALLOC.name()).await?),
-                    tx.peek_one(tx.collection(COLLECTION_SETTING.name()).await?),
+                    tx.peek_one(tx.collection(COLLECTION_TIMESTAMP.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_SYSTEM_GID_MAPPING.name()).await?),
                     tx.peek_one(
                         tx.collection(COLLECTION_SYSTEM_CONFIGURATION.name())
@@ -1416,7 +1511,7 @@ pub async fn transaction<'a>(
         }),
         introspection_sources: TableTransaction::new(introspection_sources, |_a, _b| false),
         id_allocator: TableTransaction::new(id_allocator, |_a, _b| false),
-        settings: TableTransaction::new(settings, |_a, _b| false),
+        timestamps: TableTransaction::new(timestamps, |_a, _b| false),
         system_gid_mapping: TableTransaction::new(system_gid_mapping, |_a, _b| false),
         system_configurations: TableTransaction::new(system_configurations, |_a, _b| false),
         audit_log_updates: Vec::new(),
@@ -1436,7 +1531,7 @@ pub struct Transaction<'a> {
     introspection_sources:
         TableTransaction<ClusterIntrospectionSourceIndexKey, ClusterIntrospectionSourceIndexValue>,
     id_allocator: TableTransaction<IdAllocKey, IdAllocValue>,
-    settings: TableTransaction<SettingKey, SettingValue>,
+    timestamps: TableTransaction<TimestampKey, TimestampValue>,
     system_gid_mapping: TableTransaction<GidMappingKey, GidMappingValue>,
     system_configurations: TableTransaction<ServerConfigurationKey, ServerConfigurationValue>,
     // Don't make this a table transaction so that it's not read into the stash
@@ -2108,8 +2203,13 @@ impl<'a> Transaction<'a> {
         self.system_configurations.delete(|_k, _v| true);
     }
 
-    pub fn remove_timestamp(&mut self, _timeline: Timeline) {
-        todo!("remove timestamps");
+    pub fn remove_timestamp(&mut self, timeline: Timeline) {
+        let timeline_str = timeline.to_string();
+        let prev = self
+            .timestamps
+            .set(TimestampKey { id: timeline_str }, None)
+            .expect("cannot have uniqueness violation");
+        assert!(prev.is_some());
     }
 
     /// Commits the storage transaction to the stash. Any error returned indicates the stash may be
@@ -2194,7 +2294,7 @@ impl<'a> Transaction<'a> {
         let cluster_replicas = Arc::new(self.cluster_replicas.pending());
         let introspection_sources = Arc::new(self.introspection_sources.pending());
         let id_allocator = Arc::new(self.id_allocator.pending());
-        let settings = Arc::new(self.settings.pending());
+        let timestamps = Arc::new(self.timestamps.pending());
         let system_gid_mapping = Arc::new(self.system_gid_mapping.pending());
         let system_configurations = Arc::new(self.system_configurations.pending());
         let audit_log_updates = Arc::new(self.audit_log_updates);
@@ -2328,8 +2428,8 @@ impl<'a> Transaction<'a> {
                         &tx,
                         &mut batches,
                         &mut migration_retractions,
-                        &COLLECTION_SETTING,
-                        &settings,
+                        &COLLECTION_TIMESTAMP,
+                        &timestamps,
                     )
                     .await?;
                     add_batch(
@@ -2436,6 +2536,7 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     database,
                     schema,
                     role,
+                    timestamp,
                     system_configuration,
                     audit_log,
                     storage_usage,
@@ -2449,6 +2550,7 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     add_batch(&tx, &COLLECTION_DATABASE),
                     add_batch(&tx, &COLLECTION_SCHEMA),
                     add_batch(&tx, &COLLECTION_ROLE),
+                    add_batch(&tx, &COLLECTION_TIMESTAMP),
                     add_batch(&tx, &COLLECTION_SYSTEM_CONFIGURATION),
                     add_batch(&tx, &COLLECTION_AUDIT_LOG),
                     add_batch(&tx, &COLLECTION_STORAGE_USAGE),
@@ -2463,6 +2565,7 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     database,
                     schema,
                     role,
+                    timestamp,
                     system_configuration,
                     audit_log,
                     storage_usage,
@@ -2478,12 +2581,12 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
         .map_err(|err| err.into())
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash)]
+#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash, Debug)]
 pub struct SettingKey {
     name: String,
 }
 
-#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord)]
+#[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Debug)]
 pub struct SettingValue {
     value: String,
 }
@@ -2624,7 +2727,8 @@ pub struct TimestampKey {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord)]
 pub struct TimestampValue {
-    pub(crate) ts: mz_repr::Timestamp,
+    pub(crate) read_ts: mz_repr::Timestamp,
+    pub(crate) write_ts: mz_repr::Timestamp,
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialOrd, PartialEq, Eq, Ord, Hash)]
@@ -2656,6 +2760,8 @@ pub static COLLECTION_DATABASE: TypedCollection<DatabaseKey, DatabaseValue> =
 pub static COLLECTION_SCHEMA: TypedCollection<SchemaKey, SchemaValue> =
     TypedCollection::new("schema");
 pub static COLLECTION_ROLE: TypedCollection<RoleKey, RoleValue> = TypedCollection::new("role");
+pub static COLLECTION_TIMESTAMP: TypedCollection<TimestampKey, TimestampValue> =
+    TypedCollection::new("timestamp");
 pub static COLLECTION_SYSTEM_CONFIGURATION: TypedCollection<
     ServerConfigurationKey,
     ServerConfigurationValue,
@@ -2675,6 +2781,7 @@ pub static ALL_COLLECTIONS: &[&str] = &[
     COLLECTION_DATABASE.name(),
     COLLECTION_SCHEMA.name(),
     COLLECTION_ROLE.name(),
+    COLLECTION_TIMESTAMP.name(),
     COLLECTION_SYSTEM_CONFIGURATION.name(),
     COLLECTION_AUDIT_LOG.name(),
     COLLECTION_STORAGE_USAGE.name(),

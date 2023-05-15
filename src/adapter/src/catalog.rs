@@ -1653,9 +1653,6 @@ impl CatalogState {
                         StateUpdate::Item(key, v) => {
                             item_additions.push((key.gid, v));
                         }
-                        StateUpdate::Timestamp(_, _) => {
-                            // We're ignoring these here!
-                        }
                         StateUpdate::Config(_, _) => {
                             // We're ignoring these here!
                         }
@@ -1665,9 +1662,6 @@ impl CatalogState {
                     match state_update {
                         StateUpdate::Item(key, value) => {
                             item_drops.push((key.gid, value));
-                        }
-                        StateUpdate::Timestamp(_, _) => {
-                            // We're ignoring these here!
                         }
                         StateUpdate::Config(_, _) => {
                             // We're ignoring these here!
@@ -4311,20 +4305,42 @@ impl Catalog {
         self.storage().await.get_next_replica_id().await
     }
 
-    /// Get previously persisted global timestamp for a timeline.
-    pub async fn get_timestamp(&self, timeline: &Timeline) -> Result<mz_repr::Timestamp, Error> {
-        self.storage().await.get_timestamp(timeline).await
-    }
-
-    /// Persist new global timestamp for a timeline.
-    pub async fn persist_timestamp(
+    /// Allocates a new timestamp for writing.
+    ///
+    /// This timestamp will be strictly greater than all prior values of `self.read_ts()` and
+    /// `self.allocate_write_ts()`.
+    pub async fn allocate_write_ts(
         &self,
         timeline: &Timeline,
-        timestamp: mz_repr::Timestamp,
+        proposed_write_ts: mz_repr::Timestamp,
+    ) -> Result<mz_repr::Timestamp, Error> {
+        self.storage()
+            .await
+            .allocate_write_ts(timeline, proposed_write_ts)
+            .await
+    }
+
+    /// Get the current read timestamp for the `timeline`.
+    pub async fn read_ts(&self, timeline: &Timeline) -> Result<mz_repr::Timestamp, Error> {
+        self.storage().await.read_ts(timeline).await
+    }
+
+    /// Get the current write timestamp, without allocating a new one.
+    pub async fn peek_write_ts(&self, timeline: &Timeline) -> Result<mz_repr::Timestamp, Error> {
+        self.storage().await.peek_write_ts(timeline).await
+    }
+
+    /// Mark a write at `write_ts` completed.
+    ///
+    /// All subsequent values of `self.read_ts()` will be greater or equal to `write_ts`.
+    pub async fn finalize_write(
+        &self,
+        timeline: &Timeline,
+        write_ts: mz_repr::Timestamp,
     ) -> Result<(), Error> {
         self.storage()
             .await
-            .persist_timestamp(timeline, timestamp)
+            .finalize_write(timeline, write_ts)
             .await
     }
 

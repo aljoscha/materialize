@@ -748,9 +748,7 @@ impl Coordinator {
         self.ensure_timeline_state(&timeline).await;
         let oracle = self.get_timestamp_oracle(&timeline);
 
-        let now = oracle
-            .read_ts(|| self.catalog().get_timestamp(&timeline))
-            .await;
+        let now = oracle.read_ts(|| self.catalog().read_ts(&timeline)).await;
 
         let frontier = Antichain::from_elem(now);
         let as_of = SinkAsOf {

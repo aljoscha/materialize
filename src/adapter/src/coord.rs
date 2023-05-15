@@ -1249,7 +1249,7 @@ impl Coordinator {
             }
         });
 
-        self.schedule_storage_usage_collection();
+        self.schedule_storage_usage_collection().await;
 
         loop {
             self.sync_storage().await.expect("failed to sync storage");
@@ -1539,7 +1539,7 @@ pub async fn serve(
                     &timeline,
                     initial_timestamp,
                     coord_now.clone(),
-                    |ts| catalog.persist_timestamp(&timeline, ts),
+                    |ts| catalog.finalize_write(&timeline, ts),
                     &mut timestamp_oracles,
                 ));
             }

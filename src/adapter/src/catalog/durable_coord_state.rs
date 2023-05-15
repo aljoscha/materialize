@@ -35,20 +35,16 @@ use mz_persist_client::ShardId;
 use mz_persist_types::codec_impls::TodoSchema;
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_persist_types::Codec;
-use mz_storage_client::types::sources::Timeline;
 
 use crate::catalog::storage::ConfigValue;
 use crate::catalog::storage::ItemKey;
 use crate::catalog::storage::ItemValue;
-use crate::catalog::storage::TimestampKey;
-use crate::catalog::storage::TimestampValue;
 
 #[derive(Debug)]
 pub struct DurableCoordState {
     // TODO(aljoscha): We should keep these collections as a _trace_, with the
     // full diffs. And only collapse them down to a map when needed. And also
     // ensure that there is only one entry for a given `GlobalId` then.
-    timestamps: BTreeMap<TimestampKey, TimestampValue>,
     items: BTreeMap<ItemKey, ItemValue>,
     config: BTreeMap<String, ConfigValue>,
 
@@ -73,7 +69,6 @@ pub struct Transaction<'a> {
     // NOTE: We keep a copy of the state here and mutate it when preparing state updates, to make
     // sure that we always have an up-to-date view and can generate the correct differential state
     // updates.
-    timestamps: BTreeMap<TimestampKey, TimestampValue>,
     items: BTreeMap<ItemKey, ItemValue>,
     config: BTreeMap<String, ConfigValue>,
 
@@ -84,7 +79,6 @@ pub struct Transaction<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum StateUpdate {
-    Timestamp(TimestampKey, TimestampValue),
     Item(ItemKey, ItemValue),
     Config(String, ConfigValue),
 }
@@ -181,7 +175,6 @@ impl DurableCoordState {
             .expect("invalid usage");
 
         let mut this = Self {
-            timestamps: BTreeMap::new(),
             items: BTreeMap::new(),
             config: BTreeMap::new(),
             trace: Vec::new(),
@@ -316,16 +309,12 @@ impl DurableCoordState {
         // TODO(aljoscha): This is very inefficient, we're rebuilding the
         // in-memory cash of every type of collection every time we're applying
         // updates. It's easy and correct, though.
-        self.timestamps = BTreeMap::new();
         self.items = BTreeMap::new();
         self.config = BTreeMap::new();
 
         for update in self.trace.iter() {
             match update {
                 (state_update, _ts, 1) => match state_update {
-                    StateUpdate::Timestamp(timeline, timestamp) => {
-                        self.timestamps.insert(timeline.clone(), timestamp.clone());
-                    }
                     StateUpdate::Item(key, item) => {
                         self.items.insert(key.clone(), item.clone());
                     }
@@ -353,32 +342,11 @@ impl DurableCoordState {
 impl<'a> Transaction<'a> {
     fn new(durable_coord_state: &mut DurableCoordState) -> Transaction {
         Transaction {
-            timestamps: durable_coord_state.timestamps.clone(),
             items: durable_coord_state.items.clone(),
             config: durable_coord_state.config.clone(),
             updates: Vec::new(),
             durable_coord_state,
         }
-    }
-
-    pub fn get_timestamp(&self, timeline: &Timeline) -> Option<mz_repr::Timestamp> {
-        let key = TimestampKey {
-            id: timeline.to_string(),
-        };
-        let timestamp = self.timestamps.get(&key);
-        timestamp.map(|ts| ts.ts)
-    }
-
-    pub fn get_all_timestamps(&self) -> Vec<(Timeline, mz_repr::Timestamp)> {
-        self.timestamps
-            .iter()
-            .map(|(timeline, ts)| {
-                (
-                    timeline.id.parse().expect("invalid timeline persisted"),
-                    ts.ts,
-                )
-            })
-            .collect_vec()
     }
 
     pub fn get_item(&self, key: &ItemKey) -> Option<ItemValue> {
@@ -391,75 +359,6 @@ impl<'a> Transaction<'a> {
 
     pub fn get_config(&self, key: &String) -> Option<ConfigValue> {
         self.config.get(key).cloned()
-    }
-
-    // TODO(aljoscha): We can probably factor out quite a bit of common functionality.
-
-    pub fn upsert_timestamp(
-        &mut self,
-        timeline: Timeline,
-        timestamp: mz_repr::Timestamp,
-    ) -> Option<mz_repr::Timestamp> {
-        let key = TimestampKey {
-            id: timeline.to_string(),
-        };
-
-        let current_timestamp = self.timestamps.get(&key).cloned();
-
-        match current_timestamp {
-            Some(current_timestamp) if current_timestamp.ts == timestamp => {
-                // No need to change anything!
-                Some(current_timestamp.ts)
-            }
-            Some(current_timestamp) => {
-                // Need to retract the old mapping and insert a new mapping.
-                self.updates.push((
-                    StateUpdate::Timestamp(key.clone(), current_timestamp.clone()),
-                    -1,
-                ));
-                let timestamp_value = TimestampValue { ts: timestamp };
-                self.updates.push((
-                    StateUpdate::Timestamp(key.clone(), timestamp_value.clone()),
-                    1,
-                ));
-                self.timestamps.insert(key, timestamp_value);
-                Some(current_timestamp.ts)
-            }
-            None => {
-                let timestamp_value = TimestampValue { ts: timestamp };
-                // Only need to add the new mapping.
-                self.updates.push((
-                    StateUpdate::Timestamp(key.clone(), timestamp_value.clone()),
-                    1,
-                ));
-                self.timestamps.insert(key, timestamp_value);
-                None
-            }
-        }
-    }
-
-    // We currently never remove timestamps, but ... :shrug:.
-    #[allow(unused)]
-    pub fn remove_timestamp(&mut self, timeline: Timeline) {
-        let key = TimestampKey {
-            id: timeline.to_string(),
-        };
-
-        let current_timestamp = self.timestamps.get(&key);
-
-        match current_timestamp {
-            Some(current_timestamp) => {
-                // Need to retract the mapping.
-                self.updates.push((
-                    StateUpdate::Timestamp(key.clone(), current_timestamp.clone()),
-                    -1,
-                ));
-                self.timestamps.remove(&key);
-            }
-            None => {
-                // Nothing to do!
-            }
-        }
     }
 
     pub fn upsert_item(&mut self, key: ItemKey, item: ItemValue) -> Option<ItemValue> {
@@ -571,11 +470,14 @@ impl<'a> Transaction<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::catalog::SerializedCatalogItem;
+
     use super::*;
 
     use std::sync::Arc;
     use std::time::Duration;
 
+    use mz_repr::GlobalId;
     use once_cell::sync::Lazy;
 
     use mz_build_info::DUMMY_BUILD_INFO;
@@ -613,33 +515,49 @@ mod tests {
 
         let mut durable_state = make_test_state(log_shard_id).await;
 
-        let timeline = Timeline::EpochMilliseconds;
-        let timestamp = mz_repr::Timestamp::new(0);
+        let item_key = ItemKey {
+            gid: GlobalId::User(42),
+        };
+        let item_value = ItemValue {
+            schema_id: 0,
+            name: "item".to_string(),
+            definition: SerializedCatalogItem::V1 {
+                create_sql: "item_sql".to_string(),
+            },
+            owner_id: None,
+        };
 
         let mut tx = durable_state.begin_transaction().await;
 
-        tx.upsert_timestamp(timeline.clone(), timestamp);
+        tx.upsert_item(item_key.clone(), item_value.clone());
 
         let res = tx.commit().await;
         assert!(matches!(res, Ok(())));
 
         let read_tx = durable_state.begin_transaction().await;
-        let stored_timestamp = read_tx.get_timestamp(&timeline);
-        assert_eq!(stored_timestamp, Some(timestamp));
+        let stored_item = read_tx.get_item(&item_key);
+        assert_eq!(stored_item, Some(item_value.clone()));
 
         // Re-create our durable state.
         let mut durable_state = make_test_state(log_shard_id).await;
 
         let read_tx = durable_state.begin_transaction().await;
-        let stored_timestamp = read_tx.get_timestamp(&timeline);
-        assert_eq!(stored_timestamp, Some(timestamp));
+        let stored_item = read_tx.get_item(&item_key);
+        assert_eq!(stored_item, Some(item_value.clone()));
 
         // Do something that causes a retraction and update.
 
-        let new_timestamp = mz_repr::Timestamp::new(1);
+        let new_item_value = ItemValue {
+            schema_id: 0,
+            name: "new_item".to_string(),
+            definition: SerializedCatalogItem::V1 {
+                create_sql: "new item_sql".to_string(),
+            },
+            owner_id: None,
+        };
 
         let mut tx = durable_state.begin_transaction().await;
-        tx.upsert_timestamp(timeline.clone(), new_timestamp);
+        tx.upsert_item(item_key.clone(), new_item_value.clone());
 
         let res = tx.commit().await;
         assert!(matches!(res, Ok(())));
@@ -648,7 +566,7 @@ mod tests {
         let mut durable_state = make_test_state(log_shard_id).await;
 
         let read_tx = durable_state.begin_transaction().await;
-        let stored_timestamp = read_tx.get_timestamp(&timeline);
-        assert_eq!(stored_timestamp, Some(new_timestamp));
+        let stored_item = read_tx.get_item(&item_key);
+        assert_eq!(stored_item, Some(new_item_value));
     }
 }

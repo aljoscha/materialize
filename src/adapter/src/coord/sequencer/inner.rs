@@ -795,7 +795,7 @@ impl Coordinator {
         match self.catalog_transact(Some(session), ops).await {
             Ok(()) => {
                 // Determine the initial validity for the table.
-                let since_ts = self.peek_local_write_ts();
+                let since_ts = self.peek_local_write_ts().await;
 
                 let collection_desc = table.desc.clone().into();
                 self.controller
@@ -868,7 +868,7 @@ impl Coordinator {
         table: catalog::Table,
     ) -> Result<ExecuteResponse, AdapterError> {
         // Determine the initial validity for the table.
-        let since_ts = self.peek_local_write_ts();
+        let since_ts = self.peek_local_write_ts().await;
 
         let collection_desc = table.desc.clone().into();
         self.controller

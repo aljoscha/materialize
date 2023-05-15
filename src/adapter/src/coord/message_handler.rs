@@ -191,10 +191,10 @@ impl Coordinator {
         if let Err(err) = self.catalog_transact(None, ops).await {
             tracing::warn!("Failed to update storage metrics: {:?}", err);
         }
-        self.schedule_storage_usage_collection();
+        self.schedule_storage_usage_collection().await;
     }
 
-    pub fn schedule_storage_usage_collection(&self) {
+    pub async fn schedule_storage_usage_collection(&self) {
         // Instead of using an `tokio::timer::Interval`, we calculate the time until the next
         // usage collection and wait for that amount of time. This is so we can keep the intervals
         // consistent even across restarts. If collection takes too long, it is possible that
@@ -222,7 +222,7 @@ impl Coordinator {
                 .expect("storage usage collection interval must fit into u64");
         let offset =
             rngs::SmallRng::from_seed(seed).gen_range(0..storage_usage_collection_interval_ms);
-        let now_ts: EpochMillis = self.peek_local_write_ts().into();
+        let now_ts: EpochMillis = self.peek_local_write_ts().await.into();
 
         // 2) Determine the amount of ms between now and the next collection time.
         let previous_collection_ts =
@@ -611,7 +611,7 @@ impl Coordinator {
                 let timestamp_oracle = self.get_timestamp_oracle(&timeline);
 
                 let read_ts = timestamp_oracle
-                    .read_ts(|| self.catalog().get_timestamp(&timeline))
+                    .read_ts(|| self.catalog().read_ts(&timeline))
                     .await;
 
                 if timestamp <= read_ts {
