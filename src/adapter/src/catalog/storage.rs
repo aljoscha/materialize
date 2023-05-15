@@ -866,40 +866,31 @@ impl Connection {
 
 impl Connection {
     async fn get_setting(&mut self, key: &str) -> Result<Option<String>, Error> {
-        Self::get_setting_stash(&mut self.stash, key).await
+        let key = SettingKey {
+            name: key.to_string(),
+        };
+        let read_tx = self.durable_state.begin_transaction().await;
+
+        let setting_value = read_tx.get_setting(&key);
+        let setting_value = setting_value.map(|s| s.value);
+
+        Ok(setting_value)
     }
 
     async fn set_setting(&mut self, key: &str, value: &str) -> Result<(), Error> {
-        Self::set_setting_stash(&mut self.stash, key, value).await
-    }
-
-    async fn get_setting_stash(stash: &mut Stash, key: &str) -> Result<Option<String>, Error> {
-        let v = COLLECTION_SETTING
-            .peek_key_one(
-                stash,
-                SettingKey {
-                    name: key.to_string(),
-                },
-            )
-            .await?;
-        Ok(v.map(|v| v.value))
-    }
-
-    async fn set_setting_stash<V: Into<String> + std::fmt::Display>(
-        stash: &mut Stash,
-        key: &str,
-        value: V,
-    ) -> Result<(), Error> {
         let key = SettingKey {
             name: key.to_string(),
         };
         let value = SettingValue {
             value: value.into(),
         };
-        COLLECTION_SETTING
-            .upsert(stash, once((key, value)))
-            .await
-            .map_err(|e| e.into())
+        let mut tx = self.durable_state.begin_transaction().await;
+
+        tx.upsert_setting(key, value);
+
+        tx.commit().await.map_err(|err| {
+            ErrorKind::Unstructured(format!("unexpected stash state: {:?}", err)).into()
+        })
     }
 
     pub async fn get_catalog_content_version(&mut self) -> Result<Option<String>, Error> {
@@ -2527,7 +2518,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                 // Query all collections in parallel. Makes for triplicated
                 // names, but runs quick.
                 let (
-                    setting,
                     id_alloc,
                     system_gid_mapping,
                     clusters,
@@ -2541,7 +2531,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     audit_log,
                     storage_usage,
                 ) = futures::try_join!(
-                    add_batch(&tx, &COLLECTION_SETTING),
                     add_batch(&tx, &COLLECTION_ID_ALLOC),
                     add_batch(&tx, &COLLECTION_SYSTEM_GID_MAPPING),
                     add_batch(&tx, &COLLECTION_CLUSTERS),
@@ -2556,7 +2545,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     add_batch(&tx, &COLLECTION_STORAGE_USAGE),
                 )?;
                 let batches: Vec<AppendBatch> = [
-                    setting,
                     id_alloc,
                     system_gid_mapping,
                     clusters,
@@ -2741,8 +2729,6 @@ pub struct ServerConfigurationValue {
     value: String,
 }
 
-pub static COLLECTION_SETTING: TypedCollection<SettingKey, SettingValue> =
-    TypedCollection::new("setting");
 pub static COLLECTION_ID_ALLOC: TypedCollection<IdAllocKey, IdAllocValue> =
     TypedCollection::new("id_alloc");
 pub static COLLECTION_SYSTEM_GID_MAPPING: TypedCollection<GidMappingKey, GidMappingValue> =
@@ -2772,7 +2758,6 @@ pub static COLLECTION_STORAGE_USAGE: TypedCollection<StorageUsageKey, ()> =
     TypedCollection::new("storage_usage");
 
 pub static ALL_COLLECTIONS: &[&str] = &[
-    COLLECTION_SETTING.name(),
     COLLECTION_ID_ALLOC.name(),
     COLLECTION_SYSTEM_GID_MAPPING.name(),
     COLLECTION_CLUSTERS.name(),

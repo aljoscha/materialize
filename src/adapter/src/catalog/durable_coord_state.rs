@@ -39,6 +39,8 @@ use mz_persist_types::Codec;
 use crate::catalog::storage::ConfigValue;
 use crate::catalog::storage::ItemKey;
 use crate::catalog::storage::ItemValue;
+use crate::catalog::storage::SettingKey;
+use crate::catalog::storage::SettingValue;
 
 #[derive(Debug)]
 pub struct DurableCoordState {
@@ -47,6 +49,7 @@ pub struct DurableCoordState {
     // ensure that there is only one entry for a given `GlobalId` then.
     items: BTreeMap<ItemKey, ItemValue>,
     config: BTreeMap<String, ConfigValue>,
+    settings: BTreeMap<SettingKey, SettingValue>,
 
     trace: Vec<(StateUpdate, u64, i64)>,
 
@@ -71,6 +74,7 @@ pub struct Transaction<'a> {
     // updates.
     items: BTreeMap<ItemKey, ItemValue>,
     config: BTreeMap<String, ConfigValue>,
+    settings: BTreeMap<SettingKey, SettingValue>,
 
     updates: Vec<(StateUpdate, i64)>,
 
@@ -81,6 +85,7 @@ pub struct Transaction<'a> {
 pub enum StateUpdate {
     Item(ItemKey, ItemValue),
     Config(String, ConfigValue),
+    Setting(SettingKey, SettingValue),
 }
 
 impl Codec for StateUpdate {
@@ -177,6 +182,7 @@ impl DurableCoordState {
         let mut this = Self {
             items: BTreeMap::new(),
             config: BTreeMap::new(),
+            settings: BTreeMap::new(),
             trace: Vec::new(),
             upper: restart_as_of,
             pending_updates: Vec::new(),
@@ -311,6 +317,7 @@ impl DurableCoordState {
         // updates. It's easy and correct, though.
         self.items = BTreeMap::new();
         self.config = BTreeMap::new();
+        self.settings = BTreeMap::new();
 
         for update in self.trace.iter() {
             match update {
@@ -320,6 +327,9 @@ impl DurableCoordState {
                     }
                     StateUpdate::Config(key, value) => {
                         self.config.insert(key.clone(), value.clone());
+                    }
+                    StateUpdate::Setting(key, value) => {
+                        self.settings.insert(key.clone(), value.clone());
                     }
                 },
                 invalid_update => {
@@ -344,6 +354,7 @@ impl<'a> Transaction<'a> {
         Transaction {
             items: durable_coord_state.items.clone(),
             config: durable_coord_state.config.clone(),
+            settings: durable_coord_state.settings.clone(),
             updates: Vec::new(),
             durable_coord_state,
         }
@@ -359,6 +370,10 @@ impl<'a> Transaction<'a> {
 
     pub fn get_config(&self, key: &String) -> Option<ConfigValue> {
         self.config.get(key).cloned()
+    }
+
+    pub fn get_setting(&self, key: &SettingKey) -> Option<SettingValue> {
+        self.settings.get(key).cloned()
     }
 
     pub fn upsert_item(&mut self, key: ItemKey, item: ItemValue) -> Option<ItemValue> {
@@ -447,6 +462,59 @@ impl<'a> Transaction<'a> {
                     .push((StateUpdate::Config(key.clone(), current_config.clone()), -1));
 
                 self.config.remove(&key);
+            }
+            None => {
+                // Nothing to do!
+            }
+        }
+    }
+
+    pub fn upsert_setting(
+        &mut self,
+        key: SettingKey,
+        setting: SettingValue,
+    ) -> Option<SettingValue> {
+        let current_setting = self.settings.get(&key).cloned();
+
+        match current_setting {
+            Some(current_setting) if current_setting == setting => {
+                // No need to change anything!
+                Some(current_setting)
+            }
+            Some(current_setting) => {
+                // Need to retract the old mapping and insert a new mapping.
+                self.updates.push((
+                    StateUpdate::Setting(key.clone(), current_setting.clone()),
+                    -1,
+                ));
+                self.updates
+                    .push((StateUpdate::Setting(key.clone(), setting.clone()), 1));
+                self.settings.insert(key, setting);
+                Some(current_setting)
+            }
+            None => {
+                // Only need to add the new mapping.
+                self.updates
+                    .push((StateUpdate::Setting(key.clone(), setting.clone()), 1));
+                self.settings.insert(key, setting);
+                None
+            }
+        }
+    }
+
+    #[allow(unused)]
+    pub fn remove_setting(&mut self, key: SettingKey) {
+        let current_setting = self.settings.get(&key);
+
+        match current_setting {
+            Some(current_setting) => {
+                // Need to retract the mapping.
+                self.updates.push((
+                    StateUpdate::Setting(key.clone(), current_setting.clone()),
+                    -1,
+                ));
+
+                self.settings.remove(&key);
             }
             None => {
                 // Nothing to do!
