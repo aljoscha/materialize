@@ -42,7 +42,9 @@ use mz_ore::result::ResultExt as OreResultExt;
 use mz_ore::task;
 use mz_repr::explain::{ExplainFormat, Explainee};
 use mz_repr::role_id::RoleId;
-use mz_repr::{Datum, Diff, GlobalId, RelationDesc, Row, RowArena, Timestamp};
+use mz_repr::{
+    ColumnType, Datum, Diff, GlobalId, RelationDesc, Row, RowArena, ScalarType, Timestamp,
+};
 use mz_sql::ast::{ExplainStage, IndexOptionName, ObjectType};
 use mz_sql::catalog::{
     CatalogCluster, CatalogDatabase, CatalogError, CatalogItemType, CatalogSchema,
@@ -83,7 +85,7 @@ use crate::coord::dataflows::{prep_relation_expr, prep_scalar_expr, ExprPrepStyl
 use crate::coord::id_bundle::CollectionIdBundle;
 use crate::coord::peek::{FastPathPlan, PlannedPeek};
 use crate::coord::read_policy::SINCE_GRANULARITY;
-use crate::coord::timeline::TimelineContext;
+use crate::coord::timeline::{TimelineContext, WriteTimestamp};
 use crate::coord::timestamp_selection::{TimestampContext, TimestampSource};
 use crate::coord::{
     introspection, peek, Coordinator, Message, PeekStage, PeekStageFinish, PeekStageTimestamp,
@@ -2860,6 +2862,7 @@ impl Coordinator {
     fn sequence_send_diffs(
         session: &mut Session,
         mut plan: SendDiffsPlan,
+        write_ts: Option<WriteTimestamp>,
     ) -> Result<ExecuteResponse, AdapterError> {
         let affected_rows = {
             let mut affected_rows = Diff::from(0);
@@ -2905,6 +2908,7 @@ impl Coordinator {
         session.add_transaction_ops(TransactionOps::Writes(vec![WriteOp {
             id: plan.id,
             rows: plan.updates,
+            write_ts,
         }]))?;
         if !plan.returning.is_empty() {
             let finishing = RowSetFinishing {
@@ -3036,7 +3040,7 @@ impl Coordinator {
                     returning: Vec::new(),
                     max_result_size: catalog.system_config().max_result_size(),
                 };
-                Self::sequence_send_diffs(session, diffs_plan)
+                Self::sequence_send_diffs(session, diffs_plan, None /* no write_ts */)
             }
             None => panic!(
                 "tried using sequence_insert_constant on non-constant MirRelationExpr {:?}",
@@ -3160,12 +3164,27 @@ impl Coordinator {
 
         let (peek_tx, peek_rx) = oneshot::channel();
         let peek_client_tx = ClientTransmitter::new(peek_tx, self.internal_cmd_tx.clone());
+
+        let (read_ts, write_ts) = self.get_local_read_then_write_ts().await;
+
+        let as_of_datum = Datum::UInt64(read_ts.into());
+        let as_of_row = Row::pack(&[as_of_datum]);
+        let as_of = MirScalarExpr::Literal(
+            Ok(as_of_row),
+            ColumnType {
+                scalar_type: ScalarType::UInt64,
+                nullable: false,
+            },
+        );
+
+        info!(read_ts = ?read_ts, write_ts = ?write_ts, "determined read/write timestamps for read-then-write");
+
         self.sequence_peek(
             peek_client_tx,
             session,
             PeekPlan {
                 source: selection,
-                when: QueryWhen::Freshest,
+                when: QueryWhen::AtTimestamp(as_of),
                 finishing,
                 copy_to: None,
             },
@@ -3372,6 +3391,7 @@ impl Coordinator {
                                 returning: returning_rows,
                                 max_result_size,
                             },
+                            Some(write_ts),
                         ),
                         session,
                     );

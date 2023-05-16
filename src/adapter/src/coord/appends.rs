@@ -237,6 +237,7 @@ impl Coordinator {
 
         let _should_block = pending_writes.iter().any(|write| write.should_block());
 
+        let mut requested_write_ts = None;
         let mut staged_appends: BTreeMap<GlobalId, Vec<(Row, Diff)>> = BTreeMap::new();
         for pending_write_txn in pending_writes.iter() {
             match pending_write_txn {
@@ -245,7 +246,15 @@ impl Coordinator {
                     write_lock_guard: _,
                     pending_txn: _,
                 } => {
-                    for WriteOp { id, rows } in writes {
+                    for WriteOp { id, rows, write_ts } in writes {
+                        if let Some(write_ts) = write_ts {
+                            let prev = requested_write_ts.replace(write_ts.clone());
+                            assert!(
+                                prev.is_none(),
+                                "got multiple write ops with a timestamp request"
+                            );
+                        }
+
                         // If the table that some write was targeting has been deleted while the
                         // write was waiting, then the write will be ignored and we respond to the
                         // client that the write was successful. This is only possible if the write
@@ -277,7 +286,10 @@ impl Coordinator {
         let WriteTimestamp {
             timestamp,
             advance_to,
-        } = self.get_local_write_ts().await;
+        } = match requested_write_ts {
+            Some(write_ts) => write_ts,
+            None => self.get_local_write_ts().await,
+        };
 
         for (_, updates) in &mut staged_appends {
             differential_dataflow::consolidation::consolidate(updates);

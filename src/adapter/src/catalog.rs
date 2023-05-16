@@ -4314,10 +4314,32 @@ impl Catalog {
         timeline: &Timeline,
         proposed_write_ts: mz_repr::Timestamp,
     ) -> Result<mz_repr::Timestamp, Error> {
-        self.storage()
+        let res = self
+            .storage()
             .await
-            .allocate_write_ts(timeline, proposed_write_ts)
+            .allocate_read_then_write_ts(timeline, proposed_write_ts)
+            .await;
+
+        res.map(|(read_ts, write_ts)| write_ts)
+    }
+
+    /// Acquires a read timestamp along with the next available write timestamp. Writing at the
+    /// provided write timestamp ensures that no changes can happen in between.
+    ///
+    /// This timestamp will be strictly greater than all prior values of `self.read_ts()` and
+    /// `self.allocate_write_ts()`.
+    pub async fn allocate_read_then_write_ts(
+        &self,
+        timeline: &Timeline,
+        proposed_write_ts: mz_repr::Timestamp,
+    ) -> Result<(mz_repr::Timestamp, mz_repr::Timestamp), Error> {
+        let res = self
+            .storage()
             .await
+            .allocate_read_then_write_ts(timeline, proposed_write_ts)
+            .await;
+
+        res
     }
 
     /// Get the current read timestamp for the `timeline`.

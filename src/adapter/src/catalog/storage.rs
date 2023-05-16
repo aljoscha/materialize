@@ -9,7 +9,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
-use std::iter::once;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +36,7 @@ use mz_sql::names::{
 use mz_stash::{AppendBatch, Data, Id, Stash, StashError, TableTransaction, TypedCollection};
 use mz_storage_client::types::sources::Timeline;
 use timely::PartialOrder;
+use tracing::info;
 
 use crate::catalog;
 use crate::catalog::builtin::{
@@ -830,8 +830,8 @@ impl Connection {
 
         if !conn.stash.is_readonly() {
             // IMPORTANT: we durably record the new timestamp before using it.
-            let boot_ts = conn
-                .allocate_write_ts(&Timeline::EpochMilliseconds, boot_ts)
+            let (_read_ts, boot_ts) = conn
+                .allocate_read_then_write_ts(&Timeline::EpochMilliseconds, boot_ts)
                 .await?;
             migrate(
                 &mut conn.stash,
@@ -1274,16 +1274,18 @@ impl Connection {
             .collect())
     }
 
-    /// Allocates a new timestamp for writing.
+    /// Acquires a read timestamp along with the next available write timestamp. Writing at the
+    /// provided write timestamp ensures that no changes can happen in between. Callers are free to
+    /// ignore the read timestamp if all they're interested in is writing.
     ///
     /// This timestamp will be strictly greater than all prior values of `self.read_ts()` and
     /// `self.allocate_write_ts()`.
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn allocate_write_ts(
+    pub async fn allocate_read_then_write_ts(
         &mut self,
         timeline: &Timeline,
         mut proposed_write_ts: mz_repr::Timestamp,
-    ) -> Result<mz_repr::Timestamp, Error> {
+    ) -> Result<(mz_repr::Timestamp, mz_repr::Timestamp), Error> {
         let key = TimestampKey {
             id: timeline.to_string(),
         };
@@ -1316,13 +1318,25 @@ impl Connection {
                 }
             })
             .await??;
-        if let Some(prev) = prev {
-            assert!(
-                next.write_ts > prev.write_ts,
-                "global timestamp must always go up"
-            );
-        }
-        Ok(next.write_ts)
+
+        // A read-then-write transaction has to read at the last-allocated write timestamp, and
+        // write at the next available write timestamp to ensure that there are no updates in
+        // between.
+        let read_ts = match prev {
+            Some(prev) => {
+                assert!(
+                    next.write_ts > prev.write_ts,
+                    "global timestamp must always go up"
+                );
+
+                prev.write_ts
+            }
+            None => mz_repr::Timestamp::MIN,
+        };
+
+        info!(read_ts = ?read_ts, write_ts = ?next.write_ts, "allocated read/write timetamps");
+
+        Ok((read_ts, next.write_ts))
     }
 
     /// Get the current read timestamp for the `timeline`.

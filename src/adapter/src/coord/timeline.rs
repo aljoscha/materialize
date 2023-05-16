@@ -67,7 +67,7 @@ impl TimelineContext {
 }
 
 /// Timestamps used by writes in an Append command.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WriteTimestamp<T = mz_repr::Timestamp> {
     /// Timestamp that the write will take place on.
     pub(crate) timestamp: T,
@@ -144,6 +144,29 @@ impl<T: TimestampManipulation> TimestampOracle<T> {
             timestamp: write_ts,
             advance_to,
         }
+    }
+
+    /// Acquires a read timestamp along with the next available write timestamp. Writing at the
+    /// provided write timestamp ensures that no changes can happen in between.
+    ///
+    /// This timestamp will be strictly greater than all prior values of
+    /// `self.read_ts()` and `self.write_ts()`.
+    async fn read_then_write_ts<Fut>(
+        &mut self,
+        allocate_fn: impl Fn(T) -> Fut,
+    ) -> (T, WriteTimestamp<T>)
+    where
+        Fut: Future<Output = Result<(T, T), crate::catalog::Error>>,
+    {
+        let next = (self.next)();
+        let (read_ts, write_ts) = allocate_fn(next).await.expect("cannot allocate write_ts");
+        let advance_to = write_ts.step_forward();
+        let write_ts = WriteTimestamp {
+            timestamp: write_ts,
+            advance_to,
+        };
+
+        (read_ts, write_ts)
     }
 
     /// Peek the current write timestamp.
@@ -297,6 +320,24 @@ impl Coordinator {
                     .allocate_write_ts(&Timeline::EpochMilliseconds, proposed_ts)
             })
             .await
+    }
+
+    /// Acquires a read timestamp along with the next available write timestamp. Writing at the
+    /// provided write timestamp ensures that no changes can happen in between.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn get_local_read_then_write_ts(&mut self) -> (Timestamp, WriteTimestamp) {
+        let (read_ts, write_ts) = self
+            .global_timelines
+            .get_mut(&Timeline::EpochMilliseconds)
+            .expect("no realtime timeline")
+            .oracle
+            .read_then_write_ts(|proposed_ts| {
+                self.catalog
+                    .allocate_read_then_write_ts(&Timeline::EpochMilliseconds, proposed_ts)
+            })
+            .await;
+
+        (read_ts, write_ts)
     }
 
     /// Peek the current timestamp used for operations on local inputs. Used to determine how much

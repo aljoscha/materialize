@@ -35,6 +35,7 @@ use mz_storage_client::types::sources::Timeline;
 
 use crate::client::ConnectionId;
 use crate::coord::peek::PeekResponseUnary;
+use crate::coord::timeline::WriteTimestamp;
 use crate::coord::timestamp_selection::TimestampContext;
 use crate::error::AdapterError;
 use crate::AdapterNotice;
@@ -1016,4 +1017,7 @@ pub struct WriteOp {
     pub id: GlobalId,
     /// The data rows.
     pub rows: Vec<(Row, Diff)>,
+    /// The timestamp at which these updates _have_ to be written. If `None`, an arbitrary
+    /// timestamp can be selected.
+    pub write_ts: Option<WriteTimestamp>,
 }
