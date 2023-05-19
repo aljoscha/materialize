@@ -163,6 +163,9 @@ impl PersistConfig {
                 pubsub_client_enabled: AtomicBool::new(Self::DEFAULT_PUBSUB_CLIENT_ENABLED),
                 pubsub_push_diff_enabled: AtomicBool::new(Self::DEFAULT_PUBSUB_PUSH_DIFF_ENABLED),
                 rollup_threshold: AtomicUsize::new(Self::DEFAULT_ROLLUP_THRESHOLD),
+                inline_update_threshold_bytes: AtomicUsize::new(
+                    Self::DEFAULT_INLINE_UPDATE_THRESHOLD_BYTES,
+                ),
             }),
             compaction_enabled: !compaction_disabled,
             compaction_concurrency_limit: 5,
@@ -238,6 +241,8 @@ impl PersistConfig {
     pub const DEFAULT_PUBSUB_PUSH_DIFF_ENABLED: bool = true;
     /// Default value for [`DynamicConfig::rollup_threshold`].
     pub const DEFAULT_ROLLUP_THRESHOLD: usize = 128;
+    /// Default value for [`DynamicConfig::inline_update_threshold_bytes`].
+    pub const DEFAULT_INLINE_UPDATE_THRESHOLD_BYTES: usize = 0;
 
     /// Default value for [`PersistConfig::sink_minimum_batch_updates`].
     pub const DEFAULT_SINK_MINIMUM_BATCH_UPDATES: usize = 0;
@@ -346,6 +351,7 @@ pub struct DynamicConfig {
     pubsub_client_enabled: AtomicBool,
     pubsub_push_diff_enabled: AtomicBool,
     rollup_threshold: AtomicUsize,
+    inline_update_threshold_bytes: AtomicUsize,
 
     // NB: These parameters are not atomically updated together in LD.
     // We put them under a single RwLock to reduce the cost of reads
@@ -579,6 +585,12 @@ impl DynamicConfig {
             .expect("lock poisoned")
     }
 
+    /// The (exclusive) maximum size of a write that persist will inline in
+    /// metadata.
+    pub fn inline_update_threshold_bytes(&self) -> usize {
+        self.inline_update_threshold_bytes.load(Self::LOAD_ORDERING)
+    }
+
     // TODO: Get rid of these in favor of using PersistParameters at the
     // relevant callsites.
     #[cfg(test)]
@@ -659,6 +671,8 @@ pub struct PersistParameters {
     pub pubsub_push_diff_enabled: Option<bool>,
     /// Configures [`DynamicConfig::rollup_threshold`]
     pub rollup_threshold: Option<usize>,
+    /// Configures [`DynamicConfig::inline_update_threshold_bytes`]
+    pub inline_update_threshold_bytes: Option<usize>,
 }
 
 impl PersistParameters {
@@ -681,6 +695,7 @@ impl PersistParameters {
             pubsub_client_enabled: self_pubsub_client_enabled,
             pubsub_push_diff_enabled: self_pubsub_push_diff_enabled,
             rollup_threshold: self_rollup_threshold,
+            inline_update_threshold_bytes: self_inline_update_threshold_bytes,
         } = self;
         let Self {
             blob_target_size: other_blob_target_size,
@@ -697,6 +712,7 @@ impl PersistParameters {
             pubsub_client_enabled: other_pubsub_client_enabled,
             pubsub_push_diff_enabled: other_pubsub_push_diff_enabled,
             rollup_threshold: other_rollup_threshold,
+            inline_update_threshold_bytes: other_inline_update_threshold_bytes,
         } = other;
         if let Some(v) = other_blob_target_size {
             *self_blob_target_size = Some(v);
@@ -740,6 +756,9 @@ impl PersistParameters {
         if let Some(v) = other_rollup_threshold {
             *self_rollup_threshold = Some(v)
         }
+        if let Some(v) = other_inline_update_threshold_bytes {
+            *self_inline_update_threshold_bytes = Some(v)
+        }
     }
 
     /// Return whether all parameters are unset.
@@ -763,6 +782,7 @@ impl PersistParameters {
             pubsub_client_enabled,
             pubsub_push_diff_enabled,
             rollup_threshold,
+            inline_update_threshold_bytes,
         } = self;
         blob_target_size.is_none()
             && blob_cache_mem_limit_bytes.is_none()
@@ -778,6 +798,7 @@ impl PersistParameters {
             && pubsub_client_enabled.is_none()
             && pubsub_push_diff_enabled.is_none()
             && rollup_threshold.is_none()
+            && inline_update_threshold_bytes.is_none()
     }
 
     /// Applies the parameter values to persist's in-memory config object.
@@ -802,6 +823,7 @@ impl PersistParameters {
             pubsub_client_enabled,
             pubsub_push_diff_enabled,
             rollup_threshold,
+            inline_update_threshold_bytes,
         } = self;
         if let Some(blob_target_size) = blob_target_size {
             cfg.dynamic
@@ -881,6 +903,12 @@ impl PersistParameters {
                 .rollup_threshold
                 .store(*rollup_threshold, DynamicConfig::STORE_ORDERING);
         }
+        if let Some(inline_update_threshold_bytes) = inline_update_threshold_bytes {
+            cfg.dynamic.inline_update_threshold_bytes.store(
+                *inline_update_threshold_bytes,
+                DynamicConfig::STORE_ORDERING,
+            )
+        }
     }
 }
 
@@ -903,6 +931,7 @@ impl RustType<ProtoPersistParameters> for PersistParameters {
             pubsub_client_enabled: self.pubsub_client_enabled.into_proto(),
             pubsub_push_diff_enabled: self.pubsub_push_diff_enabled.into_proto(),
             rollup_threshold: self.rollup_threshold.into_proto(),
+            inline_update_threshold_bytes: self.inline_update_threshold_bytes.into_proto(),
         }
     }
 
@@ -924,6 +953,7 @@ impl RustType<ProtoPersistParameters> for PersistParameters {
             pubsub_client_enabled: proto.pubsub_client_enabled.into_rust()?,
             pubsub_push_diff_enabled: proto.pubsub_push_diff_enabled.into_rust()?,
             rollup_threshold: proto.rollup_threshold.into_rust()?,
+            inline_update_threshold_bytes: proto.inline_update_threshold_bytes.into_rust()?,
         })
     }
 }

@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::critical::CriticalReaderId;
 use crate::error::{Determinacy, InvalidUsage};
-use crate::internal::encoding::{parse_id, LazyPartStats};
+use crate::internal::encoding::{parse_id, LazyInlineBatchPart, LazyPartStats};
 use crate::internal::gc::GcReq;
 use crate::internal::paths::{PartialBatchKey, PartialRollupKey};
 use crate::internal::trace::{ApplyMergeResult, FueledMergeReq, FueledMergeRes, Trace};
@@ -155,6 +155,39 @@ pub struct HandleDebugState {
     pub purpose: String,
 }
 
+/// Part of the updates in a Batch.
+///
+/// Either a pointer to ones stored in Blob or the updates themselves inlined.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(tag = "type")]
+pub enum BatchPart {
+    Hollow(HollowBatchPart),
+    Inline(LazyInlineBatchPart),
+}
+
+impl BatchPart {
+    pub fn encoded_size_bytes(&self) -> usize {
+        match self {
+            BatchPart::Hollow(x) => x.encoded_size_bytes,
+            BatchPart::Inline(x) => x.encoded_size_bytes(),
+        }
+    }
+
+    pub fn key(&self) -> Option<&PartialBatchKey> {
+        match self {
+            BatchPart::Hollow(x) => Some(&x.key),
+            BatchPart::Inline(_) => None,
+        }
+    }
+
+    pub fn stats(&self) -> Option<&LazyPartStats> {
+        match self {
+            BatchPart::Hollow(x) => x.stats.as_ref(),
+            BatchPart::Inline(_) => None,
+        }
+    }
+}
+
 /// A subset of a [HollowBatch] corresponding 1:1 to a blob.
 #[derive(Arbitrary, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct HollowBatchPart {
@@ -176,7 +209,7 @@ pub struct HollowBatch<T> {
     /// Describes the times of the updates in the batch.
     pub desc: Description<T>,
     /// Pointers usable to retrieve the updates.
-    pub parts: Vec<HollowBatchPart>,
+    pub parts: Vec<BatchPart>,
     /// The number of updates in the batch.
     pub len: usize,
     /// Runs of sequential sorted batch parts, stored as indices into `parts`.
@@ -265,7 +298,7 @@ pub(crate) struct HollowBatchRunIter<'a, T> {
 }
 
 impl<'a, T> Iterator for HollowBatchRunIter<'a, T> {
-    type Item = &'a [HollowBatchPart];
+    type Item = &'a [BatchPart];
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.batch.parts.is_empty() {
@@ -562,7 +595,7 @@ where
                 InvalidUsage::InvalidEmptyTimeInterval {
                     lower: batch.desc.lower().clone(),
                     upper: batch.desc.upper().clone(),
-                    keys: batch.parts.iter().map(|x| x.key.clone()).collect(),
+                    keys: batch.parts.iter().flat_map(|x| x.key().cloned()).collect(),
                 },
             ));
         }
@@ -1167,7 +1200,7 @@ where
 
                 let mut batch_size = 0;
                 for x in x.parts.iter() {
-                    batch_size += x.encoded_size_bytes;
+                    batch_size += x.encoded_size_bytes();
                 }
                 ret.largest_batch_bytes = std::cmp::max(ret.largest_batch_bytes, batch_size);
                 ret.state_batches_bytes += batch_size;
@@ -1482,6 +1515,8 @@ pub(crate) mod tests {
                 } else {
                     (Antichain::from_elem(t1), Antichain::from_elem(t0))
                 };
+                // WIP include InlineBatchParts too
+                let parts = parts.into_iter().map(BatchPart::Hollow).collect::<Vec<_>>();
                 let since = Antichain::from_elem(since);
                 let runs = if runs { vec![parts.len()] } else { vec![] };
                 HollowBatch {
@@ -1627,10 +1662,12 @@ pub(crate) mod tests {
             ),
             parts: keys
                 .iter()
-                .map(|x| HollowBatchPart {
-                    key: PartialBatchKey((*x).to_owned()),
-                    encoded_size_bytes: 0,
-                    stats: None,
+                .map(|x| {
+                    BatchPart::Hollow(HollowBatchPart {
+                        key: PartialBatchKey((*x).to_owned()),
+                        encoded_size_bytes: 0,
+                        stats: None,
+                    })
                 })
                 .collect(),
             len,

@@ -7556,6 +7556,7 @@ impl Catalog {
             pubsub_client_enabled: Some(config.persist_pubsub_client_enabled()),
             pubsub_push_diff_enabled: Some(config.persist_pubsub_push_diff_enabled()),
             rollup_threshold: Some(config.persist_rollup_threshold()),
+            inline_update_threshold_bytes: Some(config.persist_inline_part_threshold_bytes()),
         }
     }
 

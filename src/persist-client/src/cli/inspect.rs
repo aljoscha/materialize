@@ -506,14 +506,22 @@ pub async fn shard_stats(blob_uri: &str) -> anyhow::Result<()> {
         let writers = state.collections.writers.len();
 
         state.collections.trace.map_batches(|b| {
-            bytes += b.parts.iter().map(|p| p.encoded_size_bytes).sum::<usize>();
+            bytes += b
+                .parts
+                .iter()
+                .map(|p| p.encoded_size_bytes())
+                .sum::<usize>();
             parts += b.parts.len();
             batches += 1;
             if b.parts.is_empty() {
                 empty_batches += 1;
             }
             for run in b.runs() {
-                let largest_part = run.iter().map(|p| p.encoded_size_bytes).max().unwrap_or(0);
+                let largest_part = run
+                    .iter()
+                    .map(|p| p.encoded_size_bytes())
+                    .max()
+                    .unwrap_or(0);
                 runs += 1;
                 longest_run = longest_run.max(run.len());
                 byte_width += largest_part;
@@ -569,7 +577,9 @@ pub async fn unreferenced_blobs(args: &StateArgs) -> Result<impl serde::Serializ
         }
         for batch in v.collections.trace.batches() {
             for batch_part in &batch.parts {
-                known_parts.insert(batch_part.key.clone());
+                if let Some(key) = batch_part.key() {
+                    known_parts.insert(key.clone());
+                }
             }
         }
         for rollup in v.collections.rollups.values() {

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::anyhow;
+use bytes::Bytes;
 use differential_dataflow::difference::Semigroup;
 use differential_dataflow::lattice::Lattice;
 use differential_dataflow::trace::Description;
@@ -22,6 +23,7 @@ use mz_ore::cast::CastFrom;
 use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Blob, SeqNo};
 use mz_persist_types::{Codec, Codec64};
+use mz_proto::{ProtoType, RustType};
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
@@ -32,6 +34,7 @@ use crate::internal::encoding::{LazyPartStats, Schemas};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{Metrics, ReadMetrics, ShardMetrics};
 use crate::internal::paths::PartialBatchKey;
+use crate::internal::state::{BatchPart, HollowBatchPart};
 use crate::read::{LeasedReaderId, ReadHandle};
 use crate::ShardId;
 
@@ -192,13 +195,13 @@ where
         }
     };
 
-    let encoded_part = fetch_batch_part(
+    let encoded_part = EncodedPart::fetch(
+        &part.part,
         &part.shard_id,
         blob,
         &metrics,
         shard_metrics,
         read_metrics,
-        &part.key,
         &part.desc,
     )
     .await
@@ -225,7 +228,7 @@ where
         part: encoded_part,
         schemas,
         filter_pushdown_audit: if part.filter_pushdown_audit {
-            part.stats.clone()
+            part.part.stats().cloned()
         } else {
             None
         },
@@ -351,13 +354,11 @@ where
     pub(crate) reader_id: LeasedReaderId,
     pub(crate) metadata: SerdeLeasedBatchPartMetadata,
     pub(crate) desc: Description<T>,
-    pub(crate) key: PartialBatchKey,
-    pub(crate) encoded_size_bytes: usize,
+    pub(crate) part: BatchPart,
     /// The `SeqNo` from which this part originated; we track this value as
     /// long as necessary to ensure the `SeqNo` isn't garbage collected while a
     /// read still depends on it.
     pub(crate) leased_seqno: Option<SeqNo>,
-    pub(crate) stats: Option<LazyPartStats>,
     pub(crate) filter_pushdown_audit: bool,
 }
 
@@ -381,11 +382,9 @@ where
             lower: self.desc.lower().iter().map(T::encode).collect(),
             upper: self.desc.upper().iter().map(T::encode).collect(),
             since: self.desc.since().iter().map(T::encode).collect(),
-            key: self.key.clone(),
-            encoded_size_bytes: self.encoded_size_bytes,
+            part: (&self.part).into(),
             leased_seqno: self.leased_seqno,
             reader_id: self.reader_id.clone(),
-            stats: self.stats.clone(),
             filter_pushdown_audit: self.filter_pushdown_audit,
         };
         // If `x` has a lease, we've effectively transferred it to `r`.
@@ -413,7 +412,7 @@ where
 
     /// The encoded size of this part in bytes
     pub fn encoded_size_bytes(&self) -> usize {
-        self.encoded_size_bytes
+        self.part.encoded_size_bytes()
     }
 
     /// The filter has indicated we don't need this part, we can verify the
@@ -517,6 +516,36 @@ impl<T> EncodedPart<T>
 where
     T: Timestamp + Lattice + Codec64,
 {
+    pub async fn fetch(
+        part: &BatchPart,
+        shard_id: &ShardId,
+        blob: &(dyn Blob + Send + Sync),
+        metrics: &Metrics,
+        shard_metrics: &ShardMetrics,
+        read_metrics: &ReadMetrics,
+        registered_desc: &Description<T>,
+    ) -> Result<EncodedPart<T>, anyhow::Error> {
+        match part {
+            BatchPart::Hollow(x) => {
+                fetch_batch_part(
+                    shard_id,
+                    blob,
+                    metrics,
+                    shard_metrics,
+                    read_metrics,
+                    &x.key,
+                    registered_desc,
+                )
+                .await
+            }
+            BatchPart::Inline(x) => Ok(EncodedPart::new(
+                "inline",
+                registered_desc.clone(),
+                x.decode::<T>()?,
+            )),
+        }
+    }
+
     pub(crate) fn new(
         key: &str,
         registered_desc: Description<T>,
@@ -612,6 +641,29 @@ where
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+enum SerdeBatchPart {
+    Hollow {
+        key: PartialBatchKey,
+        encoded_size_bytes: usize,
+        stats: Option<LazyPartStats>,
+    },
+    Inline(Bytes),
+}
+
+impl From<&BatchPart> for SerdeBatchPart {
+    fn from(value: &BatchPart) -> Self {
+        match value {
+            BatchPart::Hollow(x) => SerdeBatchPart::Hollow {
+                key: x.key.clone(),
+                encoded_size_bytes: x.encoded_size_bytes,
+                stats: x.stats.clone(),
+            },
+            BatchPart::Inline(x) => SerdeBatchPart::Inline(x.into_proto()),
+        }
+    }
+}
+
 /// This represents the serde encoding for [`LeasedBatchPart`]. We expose the struct
 /// itself (unlike other encodable structs) to attempt to provide stricter drop
 /// semantics on `LeasedBatchPart`, i.e. `SerdeLeasedBatchPart` is exchangeable
@@ -627,11 +679,9 @@ pub struct SerdeLeasedBatchPart {
     lower: Vec<[u8; 8]>,
     upper: Vec<[u8; 8]>,
     since: Vec<[u8; 8]>,
-    key: PartialBatchKey,
-    encoded_size_bytes: usize,
+    part: SerdeBatchPart,
     leased_seqno: Option<SeqNo>,
     reader_id: LeasedReaderId,
-    stats: Option<LazyPartStats>,
     filter_pushdown_audit: bool,
 }
 
@@ -646,6 +696,20 @@ impl<T: Timestamp + Codec64> LeasedBatchPart<T> {
     ///
     /// For more details, see [`LeasedBatchPart`]'s documentation.
     pub(crate) fn from(x: SerdeLeasedBatchPart, metrics: Arc<Metrics>) -> Self {
+        let part = match x.part {
+            SerdeBatchPart::Hollow {
+                key,
+                encoded_size_bytes,
+                stats,
+            } => BatchPart::Hollow(HollowBatchPart {
+                key,
+                encoded_size_bytes,
+                stats,
+            }),
+            SerdeBatchPart::Inline(x) => {
+                BatchPart::Inline(x.into_rust().expect("inline part is valid"))
+            }
+        };
         LeasedBatchPart {
             metrics,
             shard_id: x.shard_id,
@@ -655,11 +719,9 @@ impl<T: Timestamp + Codec64> LeasedBatchPart<T> {
                 Antichain::from(x.upper.into_iter().map(T::decode).collect::<Vec<_>>()),
                 Antichain::from(x.since.into_iter().map(T::decode).collect::<Vec<_>>()),
             ),
-            key: x.key,
-            encoded_size_bytes: x.encoded_size_bytes,
+            part,
             leased_seqno: x.leased_seqno,
             reader_id: x.reader_id,
-            stats: x.stats,
             filter_pushdown_audit: x.filter_pushdown_audit,
         }
     }

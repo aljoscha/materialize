@@ -796,6 +796,16 @@ const STORAGE_PERSIST_SINK_MINIMUM_BATCH_UPDATES: ServerVar<usize> = ServerVar {
     internal: true
 };
 
+/// Controls [`mz_persist_client::cfg::PersistConfig::inline_update_threshold_bytes`].
+const PERSIST_INLINE_UPDATE_THRESHOLD_BYTES: ServerVar<usize> = ServerVar {
+    // WIP think more about this naming
+    name: UncasedStr::new("persist_inline_update_threshold_bytes"),
+    value: &PersistConfig::DEFAULT_INLINE_UPDATE_THRESHOLD_BYTES,
+    description: "The (exclusive) maximum size of a write that persist will \
+                  inline in metadata (Materialize)",
+    internal: false,
+};
+
 /// Controls [`mz_persist_client::cfg::DynamicConfig::stats_audit_percent`].
 const PERSIST_STATS_AUDIT_PERCENT: ServerVar<usize> = ServerVar {
     name: UncasedStr::new("persist_stats_audit_percent"),
@@ -1724,6 +1734,7 @@ impl SystemVars {
             .with_var(&PERSIST_PUBSUB_CLIENT_ENABLED)
             .with_var(&PERSIST_PUBSUB_PUSH_DIFF_ENABLED)
             .with_var(&PERSIST_ROLLUP_THRESHOLD)
+            .with_var(&PERSIST_INLINE_UPDATE_THRESHOLD_BYTES)
             .with_var(&METRICS_RETENTION)
             .with_var(&UNSAFE_MOCK_AUDIT_EVENT_TIMESTAMP)
             .with_var(&ENABLE_LD_RBAC_CHECKS)
@@ -2170,6 +2181,11 @@ impl SystemVars {
     /// Returns the `persist_stats_filter_enabled` configuration parameter.
     pub fn persist_stats_filter_enabled(&self) -> bool {
         *self.expect_value(&PERSIST_STATS_FILTER_ENABLED)
+    }
+
+    /// Returns the `persist_inline_part_threshold_bytes` configuration parameter.
+    pub fn persist_inline_part_threshold_bytes(&self) -> usize {
+        *self.expect_value(&PERSIST_INLINE_UPDATE_THRESHOLD_BYTES)
     }
 
     /// Returns the `persist_pubsub_client_enabled` configuration parameter.
@@ -3596,6 +3612,7 @@ fn is_persist_config_var(name: &str) -> bool {
         || name == PERSIST_STATS_FILTER_ENABLED.name()
         || name == PERSIST_PUBSUB_CLIENT_ENABLED.name()
         || name == PERSIST_PUBSUB_PUSH_DIFF_ENABLED.name()
+        || name == PERSIST_INLINE_UPDATE_THRESHOLD_BYTES.name()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

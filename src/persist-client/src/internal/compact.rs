@@ -25,6 +25,7 @@ use mz_ore::task::spawn;
 use mz_persist::location::Blob;
 use mz_persist_types::codec_impls::VecU8Schema;
 use mz_persist_types::{Codec, Codec64};
+use mz_proto::TryFromProtoError;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tokio::sync::mpsc::Sender;
@@ -40,7 +41,7 @@ use crate::internal::encoding::Schemas;
 use crate::internal::gc::GarbageCollector;
 use crate::internal::machine::{retry_external, Machine};
 use crate::internal::metrics::ShardMetrics;
-use crate::internal::state::{HollowBatch, HollowBatchPart};
+use crate::internal::state::{BatchPart, HollowBatch, HollowBatchPart};
 use crate::internal::trace::{ApplyMergeResult, FueledMergeRes};
 use crate::{Metrics, PersistConfig, ShardId, WriterId};
 
@@ -285,7 +286,7 @@ where
             .inputs
             .iter()
             .flat_map(|batch| batch.parts.iter())
-            .map(|parts| parts.encoded_size_bytes)
+            .map(|parts| parts.encoded_size_bytes())
             .sum::<usize>();
         let timeout = Duration::max(
             // either our minimum timeout
@@ -363,6 +364,10 @@ where
                         }
                         metrics.compaction.noop.inc();
                         for part in res.output.parts {
+                            let part = match part {
+                                BatchPart::Hollow(x) => x,
+                                BatchPart::Inline(_) => continue,
+                            };
                             let key = part.key.complete(&machine.shard_id());
                             retry_external(
                                 &metrics.retries.external.compaction_noop_delete,
@@ -541,7 +546,7 @@ where
         cfg: &CompactConfig,
         metrics: &Metrics,
         run_reserved_memory_bytes: usize,
-    ) -> Vec<(Vec<(&'a Description<T>, &'a [HollowBatchPart])>, usize)> {
+    ) -> Vec<(Vec<(&'a Description<T>, &'a [BatchPart])>, usize)> {
         let ordered_runs = Self::order_runs(req);
         let mut ordered_runs = ordered_runs.iter().peekable();
 
@@ -552,7 +557,7 @@ where
             let run_greatest_part_size = run
                 .1
                 .iter()
-                .map(|x| x.encoded_size_bytes)
+                .map(|x| x.encoded_size_bytes())
                 .max()
                 .unwrap_or(cfg.batch.blob_target_size);
             current_chunk.push(*run);
@@ -562,7 +567,7 @@ where
                 let next_run_greatest_part_size = next_run
                     .1
                     .iter()
-                    .map(|x| x.encoded_size_bytes)
+                    .map(|x| x.encoded_size_bytes())
                     .max()
                     .unwrap_or(cfg.batch.blob_target_size);
 
@@ -613,7 +618,7 @@ where
     ///     b1 runs=[C]                           output=[A, C, D, B, E, F]
     ///     b2 runs=[D, E, F]
     /// ```
-    fn order_runs(req: &CompactReq<T>) -> Vec<(&Description<T>, &[HollowBatchPart])> {
+    fn order_runs(req: &CompactReq<T>) -> Vec<(&Description<T>, &[BatchPart])> {
         let total_number_of_runs = req.inputs.iter().map(|x| x.runs.len() + 1).sum::<usize>();
 
         let mut batch_runs: VecDeque<_> = req
@@ -642,7 +647,7 @@ where
         cfg: &'a CompactConfig,
         shard_id: &'a ShardId,
         desc: &'a Description<T>,
-        runs: Vec<(&'a Description<T>, &'a [HollowBatchPart])>,
+        runs: Vec<(&'a Description<T>, &'a [BatchPart])>,
         blob: Arc<dyn Blob + Send + Sync>,
         metrics: Arc<Metrics>,
         shard_metrics: Arc<ShardMetrics>,
@@ -669,7 +674,14 @@ where
                     part_desc,
                     parts
                         .into_iter()
-                        .map(|x| CompactionPart::Queued(x))
+                        .map(|x| match x {
+                            BatchPart::Hollow(x) => CompactionPart::Queued(x),
+                            BatchPart::Inline(x) => {
+                                CompactionPart::Inline(x.decode::<T>().map(|part| {
+                                    EncodedPart::new("inline", part_desc.clone(), part)
+                                }))
+                            }
+                        })
                         .collect::<VecDeque<_>>(),
                 )
             })
@@ -866,6 +878,7 @@ impl Timings {
 enum CompactionPart<'a, T> {
     Queued(&'a HollowBatchPart),
     Prefetched(usize, JoinHandle<Result<EncodedPart<T>, anyhow::Error>>),
+    Inline(Result<EncodedPart<T>, TryFromProtoError>),
 }
 
 impl<'a, T: Timestamp + Lattice + Codec64> CompactionPart<'a, T> {
@@ -873,6 +886,7 @@ impl<'a, T: Timestamp + Lattice + Codec64> CompactionPart<'a, T> {
         match self {
             CompactionPart::Queued(_) => false,
             CompactionPart::Prefetched(_, _) => true,
+            CompactionPart::Inline(_) => false,
         }
     }
 
@@ -885,6 +899,9 @@ impl<'a, T: Timestamp + Lattice + Codec64> CompactionPart<'a, T> {
         part_desc: &Description<T>,
     ) -> Result<EncodedPart<T>, anyhow::Error> {
         match self {
+            CompactionPart::Inline(x) => {
+                x.map_err(|err| anyhow!("inline part should be valid: {}", err))
+            }
             CompactionPart::Prefetched(_, task) => {
                 if task.is_finished() {
                     metrics.compaction.parts_prefetched.inc();
@@ -948,6 +965,7 @@ fn start_prefetches<T: Timestamp + Lattice + Codec64>(
             let part = match c_part {
                 CompactionPart::Queued(x) => x,
                 CompactionPart::Prefetched(_, _) => continue,
+                CompactionPart::Inline(_) => continue,
             };
             let cost_bytes = part.encoded_size_bytes;
             if prefetch_budget_bytes < cost_bytes {
@@ -1056,7 +1074,10 @@ mod tests {
         assert_eq!(res.output.desc, req.desc);
         assert_eq!(res.output.len, 1);
         assert_eq!(res.output.parts.len(), 1);
-        let part = &res.output.parts[0];
+        let part = match &res.output.parts[0] {
+            BatchPart::Hollow(x) => x,
+            BatchPart::Inline(_) => panic!("test outputs a hollow part"),
+        };
         let (part, updates) = expect_fetch_part(
             write.blob.as_ref(),
             &part.key.complete(&write.machine.shard_id()),
@@ -1142,7 +1163,10 @@ mod tests {
         assert_eq!(res.output.desc, req.desc);
         assert_eq!(res.output.len, 2);
         assert_eq!(res.output.parts.len(), 1);
-        let part = &res.output.parts[0];
+        let part = match &res.output.parts[0] {
+            BatchPart::Hollow(x) => x,
+            BatchPart::Inline(_) => panic!("test outputs a hollow part"),
+        };
         let (part, updates) = expect_fetch_part(
             write.blob.as_ref(),
             &part.key.complete(&write.machine.shard_id()),
@@ -1198,6 +1222,7 @@ mod tests {
                         .map(|x| match x {
                             CompactionPart::Queued(x) => format!(" {}", x.encoded_size_bytes),
                             CompactionPart::Prefetched(x, _) => format!("f{}", x),
+                            CompactionPart::Inline(_) => panic!("unused in test"),
                         })
                         .collect::<Vec<_>>()
                         .join(",")

@@ -27,6 +27,7 @@ use mz_persist::indexed::encoding::BlobTraceBatchPart;
 use mz_persist::location::{Atomicity, Blob};
 use mz_persist_types::stats::trim_to_budget;
 use mz_persist_types::{Codec, Codec64};
+use mz_proto::RustType;
 use mz_timely_util::order::Reverse;
 use semver::Version;
 use timely::progress::{Antichain, Timestamp};
@@ -36,11 +37,11 @@ use tracing::{debug, debug_span, error, instrument, trace_span, Instrument};
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::InvalidUsage;
-use crate::internal::encoding::{LazyPartStats, Schemas};
+use crate::internal::encoding::{LazyInlineBatchPart, LazyPartStats, Schemas};
 use crate::internal::machine::retry_external;
 use crate::internal::metrics::{BatchWriteMetrics, Metrics, ShardMetrics};
 use crate::internal::paths::{PartId, PartialBatchKey};
-use crate::internal::state::{HollowBatch, HollowBatchPart};
+use crate::internal::state::{BatchPart, HollowBatch, HollowBatchPart, ProtoInlineBatchPart};
 use crate::stats::PartStats;
 use crate::write::WriterEnrichedHollowBatch;
 use crate::{PersistConfig, ShardId, WriterId};
@@ -83,7 +84,7 @@ where
                 self.batch
                     .parts
                     .iter()
-                    .map(|x| &x.key.0)
+                    .flat_map(|x| x.key())
                     .collect::<Vec<_>>(),
             );
         }
@@ -199,6 +200,7 @@ pub enum Added {
 pub struct BatchBuilderConfig {
     pub(crate) blob_target_size: usize,
     pub(crate) batch_builder_max_outstanding_parts: usize,
+    pub(crate) inline_update_threshold_bytes: usize,
     pub(crate) stats_collection_enabled: bool,
     pub(crate) stats_budget: usize,
 }
@@ -210,6 +212,7 @@ impl From<&PersistConfig> for BatchBuilderConfig {
             batch_builder_max_outstanding_parts: value
                 .dynamic
                 .batch_builder_max_outstanding_parts(),
+            inline_update_threshold_bytes: value.dynamic.inline_update_threshold_bytes(),
             stats_collection_enabled: value.dynamic.stats_collection_enabled(),
             // TODO: Make a dynamic config for this? This initial constant is
             // the rough upper bound on what we see for the total serialized
@@ -677,8 +680,8 @@ pub(crate) struct BatchParts<T> {
     lower: Antichain<T>,
     blob: Arc<dyn Blob + Send + Sync>,
     cpu_heavy_runtime: Arc<CpuHeavyRuntime>,
-    writing_parts: VecDeque<(PartialBatchKey, JoinHandle<(usize, Option<LazyPartStats>)>)>,
-    finished_parts: Vec<HollowBatchPart>,
+    writing_parts: VecDeque<JoinHandle<BatchPart>>,
+    finished_parts: Vec<BatchPart>,
     batch_metrics: BatchWriteMetrics,
 }
 
@@ -737,12 +740,23 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
         let stats_collection_enabled = self.cfg.stats_collection_enabled;
         let stats_budget = self.cfg.stats_budget;
         let schemas = schemas.clone();
+        let cfg = self.cfg.clone();
 
         let write_span = debug_span!("batch::write_part", shard = %self.shard_id).or_current();
         let handle = mz_ore::task::spawn(
             || "batch::write_part",
             async move {
                 let goodbytes = updates.goodbytes();
+                if goodbytes < cfg.inline_update_threshold_bytes {
+                    let part = LazyInlineBatchPart::from(&ProtoInlineBatchPart {
+                        desc: Some(desc.into_proto()),
+                        index: index.into_proto(),
+                        updates: Some(updates.into_proto()),
+                    });
+                    // WIP metrics
+                    return BatchPart::Inline(part);
+                }
+
                 let batch = BlobTraceBatchPart {
                     desc,
                     updates: vec![updates],
@@ -806,48 +820,42 @@ impl<T: Timestamp + Codec64> BatchParts<T> {
                         .inc_by(stats_step_timing.as_secs_f64());
                     stats
                 });
-                (payload_len, stats)
+                BatchPart::Hollow(HollowBatchPart {
+                    key: partial_key,
+                    encoded_size_bytes: payload_len,
+                    stats,
+                })
             }
             .instrument(write_span),
         );
-        self.writing_parts.push_back((partial_key, handle));
+        self.writing_parts.push_back(handle);
 
         while self.writing_parts.len() > self.cfg.batch_builder_max_outstanding_parts {
             batch_metrics.write_stalls.inc();
-            let (key, handle) = self
+            let handle = self
                 .writing_parts
                 .pop_front()
                 .expect("pop failed when len was just > some usize");
-            let (encoded_size_bytes, stats) = match handle
+            let part = match handle
                 .instrument(debug_span!("batch::max_outstanding"))
                 .await
             {
                 Ok(x) => x,
-                Err(err) if err.is_cancelled() => (0, None),
                 Err(err) => panic!("part upload task failed: {}", err),
             };
-            self.finished_parts.push(HollowBatchPart {
-                key,
-                encoded_size_bytes,
-                stats,
-            });
+            self.finished_parts.push(part);
         }
     }
 
     #[instrument(level = "debug", name = "batch::finish_upload", skip_all, fields(shard = %self.shard_id))]
-    pub(crate) async fn finish(self) -> Vec<HollowBatchPart> {
+    pub(crate) async fn finish(self) -> Vec<BatchPart> {
         let mut parts = self.finished_parts;
-        for (key, handle) in self.writing_parts {
-            let (encoded_size_bytes, stats) = match handle.await {
+        for handle in self.writing_parts {
+            let part = match handle.await {
                 Ok(x) => x,
-                Err(err) if err.is_cancelled() => (0, None),
                 Err(err) => panic!("part upload task failed: {}", err),
             };
-            parts.push(HollowBatchPart {
-                key,
-                encoded_size_bytes,
-                stats,
-            });
+            parts.push(part);
         }
         parts
     }
@@ -1004,7 +1012,10 @@ mod tests {
 
         assert_eq!(batch.batch.parts.len(), 3);
         for part in &batch.batch.parts {
-            match BlobKey::parse_ids(&part.key.complete(&shard_id)) {
+            let Some(key) = part.key() else {
+                continue;
+            };
+            match BlobKey::parse_ids(&key.complete(&shard_id)) {
                 Ok((shard, PartialBlobKey::Batch(writer, _))) => {
                     assert_eq!(shard.to_string(), shard_id.to_string());
                     assert_eq!(writer.to_string(), write.writer_id.to_string());
@@ -1054,7 +1065,10 @@ mod tests {
 
         assert_eq!(batch.batch.parts.len(), 2);
         for part in &batch.batch.parts {
-            match BlobKey::parse_ids(&part.key.complete(&shard_id)) {
+            let Some(key) = part.key() else {
+                continue;
+            };
+            match BlobKey::parse_ids(&key.complete(&shard_id)) {
                 Ok((shard, PartialBlobKey::Batch(writer, _))) => {
                     assert_eq!(shard.to_string(), shard_id.to_string());
                     assert_eq!(writer.to_string(), write.writer_id.to_string());

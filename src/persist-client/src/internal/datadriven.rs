@@ -7,6 +7,8 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+#![allow(unused_imports)]
+
 //! Common abstractions for persist datadriven tests.
 
 use std::str::FromStr;
@@ -17,7 +19,7 @@ use timely::progress::Antichain;
 use tokio::sync::Mutex;
 
 use crate::internal::paths::PartialBatchKey;
-use crate::internal::state::{HollowBatch, HollowBatchPart};
+use crate::internal::state::{BatchPart, HollowBatch, HollowBatchPart};
 
 /// A [datadriven::TestCase] wrapper with helpers for parsing.
 #[derive(Debug)]
@@ -103,10 +105,12 @@ impl<'a> DirectiveArgs<'a> {
             len,
             parts: keys
                 .iter()
-                .map(|x| HollowBatchPart {
-                    key: PartialBatchKey((*x).to_owned()),
-                    encoded_size_bytes: 0,
-                    stats: None,
+                .map(|x| {
+                    BatchPart::Hollow(HollowBatchPart {
+                        key: PartialBatchKey((*x).to_owned()),
+                        encoded_size_bytes: 0,
+                        stats: None,
+                    })
                 })
                 .collect(),
             runs: vec![],

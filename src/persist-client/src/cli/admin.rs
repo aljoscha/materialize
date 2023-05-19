@@ -206,7 +206,7 @@ pub async fn force_compaction(
             let bytes = req
                 .inputs
                 .iter()
-                .flat_map(|x| x.parts.iter().map(|x| x.encoded_size_bytes))
+                .flat_map(|x| x.parts.iter().map(|x| x.encoded_size_bytes()))
                 .sum::<usize>();
             let start = Instant::now();
             info!(
@@ -248,7 +248,7 @@ pub async fn force_compaction(
                 res.output
                     .parts
                     .iter()
-                    .map(|x| x.encoded_size_bytes)
+                    .map(|x| x.encoded_size_bytes())
                     .sum::<usize>(),
                 start.elapsed(),
             );

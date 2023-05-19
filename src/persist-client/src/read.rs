@@ -736,9 +736,7 @@ where
             reader_id: self.reader_id.clone(),
             metadata: metadata.clone(),
             desc: batch.desc.clone(),
-            key: part.key,
-            stats: part.stats,
-            encoded_size_bytes: part.encoded_size_bytes,
+            part,
             leased_seqno: Some(self.lease_seqno()),
             filter_pushdown_audit: false,
         })

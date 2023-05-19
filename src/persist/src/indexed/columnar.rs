@@ -16,6 +16,10 @@ use std::{cmp, fmt};
 use arrow2::buffer::Buffer;
 use arrow2::offset::OffsetsBuffer;
 use arrow2::types::Index;
+use bytes::Bytes;
+use mz_proto::{ProtoType, RustType, TryFromProtoError};
+
+use crate::gen::persist::ProtoColumnarRecords;
 
 pub mod arrow;
 pub mod parquet;
@@ -474,6 +478,44 @@ impl ColumnarRecordsBuilder {
         (key_bytes_len + BYTES_PER_KEY_VAL_OFFSET)
             + (value_bytes_len + BYTES_PER_KEY_VAL_OFFSET)
             + (2 * size_of::<u64>()) // T and D
+    }
+}
+
+impl RustType<ProtoColumnarRecords> for ColumnarRecords {
+    fn into_proto(&self) -> ProtoColumnarRecords {
+        ProtoColumnarRecords {
+            len: self.len.into_proto(),
+            key_offsets: self.key_offsets.as_slice().to_vec(),
+            key_data: Bytes::from(self.key_data.as_slice().to_vec()),
+            val_offsets: self.val_offsets.as_slice().to_vec(),
+            val_data: Bytes::from(self.val_data.as_slice().to_vec()),
+            timestamps: self.timestamps.as_slice().to_vec(),
+            diffs: self.diffs.as_slice().to_vec(),
+        }
+    }
+
+    // TODO: All the clones here are a huge bummer. Once inline writes ships (or
+    // is ready to ship), we might want to change (or fork) ColumnarRecords to
+    // use Bytes and Vec instead of the arrow stuff.
+    fn from_proto(proto: ProtoColumnarRecords) -> Result<Self, TryFromProtoError> {
+        let ret = ColumnarRecords {
+            len: proto.len.into_rust()?,
+            key_offsets: OffsetsBuffer::try_from(proto.key_offsets).map_err(|err| {
+                TryFromProtoError::InvalidPersistState(format!("invalid key_offsets: {}", err))
+            })?,
+            key_data: Buffer::from(proto.key_data.as_ref().to_vec()),
+            val_offsets: OffsetsBuffer::try_from(proto.val_offsets).map_err(|err| {
+                TryFromProtoError::InvalidPersistState(format!("invalid key_offsets: {}", err))
+            })?,
+            val_data: Buffer::from(proto.val_data.as_ref().to_vec()),
+            timestamps: Buffer::from(proto.timestamps),
+            diffs: Buffer::from(proto.diffs),
+        };
+        let () = ret
+            .borrow()
+            .validate()
+            .map_err(TryFromProtoError::InvalidPersistState)?;
+        Ok(ret)
     }
 }
 

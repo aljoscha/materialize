@@ -40,6 +40,7 @@ use tracing::{debug, trace};
 
 use crate::cache::PersistClientCache;
 use crate::fetch::{FetchedPart, SerdeLeasedBatchPart};
+use crate::internal::state::BatchPart;
 use crate::read::ListenEvent;
 use crate::stats::PartStats;
 use crate::{PersistLocation, ShardId};
@@ -452,27 +453,33 @@ where
                                 for mut part_desc in std::mem::take(&mut batch_parts) {
                                     // TODO: Push the filter down into the Subscribe?
                                     if cfg.dynamic.stats_filter_enabled() {
-                                        let should_fetch = part_desc.stats.as_ref().map_or(true, |stats| {
+                                        let should_fetch = match &part_desc.part {
+                                            BatchPart::Hollow(x) => x.stats.as_ref().map_or(true, |stats| {
                                             should_fetch_part(&stats.decode())
-                                        });
-                                        let bytes = u64::cast_from(part_desc.encoded_size_bytes);
+                                        }),
+                                        BatchPart::Inline(_) => true,
+                                    };
+                                        let bytes = u64::cast_from(part_desc.encoded_size_bytes());
                                         if should_fetch {
                                             metrics.pushdown.parts_fetched_count.inc();
                                             metrics.pushdown.parts_fetched_bytes.inc_by(bytes);
                                         } else {
                                             metrics.pushdown.parts_filtered_count.inc();
                                             metrics.pushdown.parts_filtered_bytes.inc_by(bytes);
-                                            let should_audit = {
-                                                let mut h = DefaultHasher::new();
-                                                part_desc.key.hash(&mut h);
-                                                usize::cast_from(h.finish()) % 100 < cfg.dynamic.stats_audit_percent()
+                                            let should_audit = match &part_desc.part {
+                                                BatchPart::Inline(_) => false,
+                                                BatchPart::Hollow(x) => {
+                                                    let mut h = DefaultHasher::new();
+                                                        x.key.hash(&mut h);
+                                                        usize::cast_from(h.finish()) % 100 < cfg.dynamic.stats_audit_percent()
+                                                }
                                             };
                                             if should_audit {
                                                 metrics.pushdown.parts_audited_count.inc();
                                                 metrics.pushdown.parts_audited_bytes.inc_by(bytes);
                                                 part_desc.request_filter_pushdown_audit();
                                             } else {
-                                                debug!("skipping part because of stats filter {:?}", part_desc.stats);
+                                                debug!("skipping part because of stats filter {:?}", part_desc.part.stats());
                                                 lease_returner.return_leased_part(part_desc);
                                                 continue;
                                             }

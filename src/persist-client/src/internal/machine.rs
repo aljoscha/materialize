@@ -1075,12 +1075,13 @@ pub mod datadriven {
     use crate::batch::{
         validate_truncate_batch, BatchBuilder, BatchBuilderConfig, BatchBuilderInternal,
     };
-    use crate::fetch::fetch_batch_part;
+    use crate::fetch::EncodedPart;
     use crate::internal::compact::{CompactConfig, CompactReq, Compactor};
     use crate::internal::datadriven::DirectiveArgs;
     use crate::internal::encoding::Schemas;
     use crate::internal::gc::GcReq;
     use crate::internal::paths::{BlobKey, BlobKeyPrefix, PartialBlobKey};
+    use crate::internal::state::BatchPart;
     use crate::internal::state::TypedState;
     use crate::read::{Listen, ListenEvent};
     use crate::rpc::NoopPubSubSender;
@@ -1389,7 +1390,10 @@ pub mod datadriven {
         if let Some(size) = parts_size_override {
             let mut batch = batch.clone();
             for part in batch.parts.iter_mut() {
-                part.encoded_size_bytes = size;
+                match part {
+                    BatchPart::Hollow(part) => part.encoded_size_bytes = size,
+                    BatchPart::Inline(_) => {}
+                }
             }
             datadriven.batches.insert(output.to_owned(), batch);
         } else {
@@ -1408,27 +1412,29 @@ pub mod datadriven {
         let mut s = String::new();
         for (idx, part) in batch.parts.iter().enumerate() {
             write!(s, "<part {idx}>\n");
-            let blob_batch = datadriven
-                .client
-                .blob
-                .get(&part.key.complete(&datadriven.shard_id))
-                .await;
-            match blob_batch {
-                Ok(Some(_)) | Err(_) => {}
-                // don't try to fetch/print the keys of the batch part
-                // if the blob store no longer has it
-                Ok(None) => {
-                    s.push_str("<empty>\n");
-                    continue;
-                }
-            };
-            let mut part = fetch_batch_part(
+            if let BatchPart::Hollow(part) = part {
+                let blob_batch = datadriven
+                    .client
+                    .blob
+                    .get(&part.key.complete(&datadriven.shard_id))
+                    .await;
+                match blob_batch {
+                    Ok(Some(_)) | Err(_) => {}
+                    // don't try to fetch/print the keys of the batch part
+                    // if the blob store no longer has it
+                    Ok(None) => {
+                        s.push_str("<empty>\n");
+                        continue;
+                    }
+                };
+            }
+            let mut part = EncodedPart::fetch(
+                part,
                 &datadriven.shard_id,
                 datadriven.client.blob.as_ref(),
                 datadriven.client.metrics.as_ref(),
                 datadriven.machine.applier.shard_metrics.as_ref(),
                 &datadriven.client.metrics.read.batch_fetcher,
-                &part.key,
                 &batch.desc,
             )
             .await
@@ -1485,7 +1491,10 @@ pub mod datadriven {
         let size = args.expect("size");
         let batch = datadriven.batches.get_mut(input).expect("unknown batch");
         for part in batch.parts.iter_mut() {
-            part.encoded_size_bytes = size;
+            match part {
+                BatchPart::Hollow(x) => x.encoded_size_bytes = size,
+                BatchPart::Inline(_) => panic!("set_batch_parts_size only supports hollow parts"),
+            }
         }
         Ok("ok\n".to_string())
     }
@@ -1600,13 +1609,13 @@ pub mod datadriven {
         let mut updates = Vec::new();
         for batch in snapshot {
             for part in batch.parts {
-                let mut part = fetch_batch_part(
+                let mut part: EncodedPart<u64> = EncodedPart::fetch(
+                    &part,
                     &datadriven.shard_id,
                     datadriven.client.blob.as_ref(),
                     datadriven.client.metrics.as_ref(),
                     datadriven.machine.applier.shard_metrics.as_ref(),
                     &datadriven.client.metrics.read.batch_fetcher,
-                    &part.key,
                     &batch.desc,
                 )
                 .await

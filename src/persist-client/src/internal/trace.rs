@@ -1193,6 +1193,7 @@ impl<T: Timestamp + Lattice> MergeVariant<T> {
 #[cfg(test)]
 pub mod datadriven {
     use crate::internal::datadriven::DirectiveArgs;
+    use crate::internal::state::BatchPart;
 
     use super::*;
 
@@ -1229,7 +1230,10 @@ pub mod datadriven {
                     b.len,
                     b.parts
                         .iter()
-                        .map(|x| format!(" {}", x.key))
+                        .map(|x| match x {
+                            BatchPart::Hollow(x) => format!(" {}", x.key),
+                            BatchPart::Inline(_) => "inline".to_owned(),
+                        })
                         .collect::<Vec<_>>()
                         .join(""),
                 ),
@@ -1245,7 +1249,10 @@ pub mod datadriven {
                         parts
                             .iter()
                             .flat_map(|x| x.parts.iter())
-                            .map(|x| format!(" {}", x.key))
+                            .map(|x| match x {
+                                BatchPart::Hollow(x) => format!(" {}", x.key),
+                                BatchPart::Inline(_) => "inline".to_owned(),
+                            })
                             .collect::<Vec<_>>()
                             .join("")
                     )
@@ -1300,7 +1307,8 @@ pub mod datadriven {
                     .inputs
                     .iter()
                     .flat_map(|x| x.parts.iter())
-                    .map(|x| x.key.0.clone())
+                    .flat_map(|x| x.key())
+                    .map(|x| x.0.as_str())
                     .collect::<Vec<_>>()
                     .join(" ")
             );
