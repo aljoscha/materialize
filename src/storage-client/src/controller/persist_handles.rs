@@ -345,7 +345,7 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistWriteWorke
                                 // for it. If yes, we send them all in one go.
                                 for (id, write) in write_handles.iter_mut() {
                                     if let Some((span, updates, new_upper)) = commands.remove(id) {
-                                        let persist_upper = write.upper().clone();
+                                        let persist_upper = write.fetch_recent_upper().await.clone();
                                         let updates = updates
                                             .into_iter()
                                             .map(|u| ((SourceData(Ok(u.row)), ()), u.timestamp, u.diff));
