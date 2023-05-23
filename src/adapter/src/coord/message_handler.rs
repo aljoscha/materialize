@@ -61,6 +61,12 @@ impl Coordinator {
             Message::WriteLockGrant(write_lock_guard) => {
                 self.message_write_lock_grant(write_lock_guard).await;
             }
+            Message::MaybeAdvanceTimestamps {
+                advance_timelines_interval,
+            } => {
+                self.maybe_advance_timestamps(advance_timelines_interval)
+                    .await;
+            }
             Message::GroupCommitInitiate => {
                 self.try_group_commit().await;
             }

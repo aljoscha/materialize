@@ -147,6 +147,56 @@ impl Coordinator {
         self.advance_timelines_interval.reset();
     }
 
+    /// Advance timestamps for local/real-time tables, if needed.
+    #[tracing::instrument(level = "debug", skip(self))]
+    pub(crate) async fn maybe_advance_timestamps(&mut self, advance_timelines_interval: Duration) {
+        let write_ts = self.peek_local_write_ts().await;
+        let read_ts = self.get_local_read_ts().await;
+
+        let now = Timestamp::from((self.catalog().config().now)());
+
+        if Duration::from_millis(now.saturating_sub(write_ts).into()) < advance_timelines_interval {
+            tracing::trace!(
+                now = ?now,
+                write_ts = ?write_ts,
+                "not advancing real-time timelines because someone else already did it"
+            );
+            return;
+        }
+
+        // Wait for outstanding writes, but not too long!
+        if read_ts < write_ts
+            && Duration::from_millis(now.saturating_sub(write_ts).into())
+                < advance_timelines_interval * 10
+        {
+            tracing::trace!(
+                read_ts = ?read_ts,
+                write_ts = ?write_ts,
+                "not advancing real-time timelines to allow in-flight transactions to succeed"
+            );
+            return;
+        }
+
+        if write_ts > now {
+            // Cap retry time to 1s. In cases where the system clock has retreated by
+            // some large amount of time, this prevents against then waiting for that
+            // large amount of time in case the system clock then advances back to near
+            // what it was.
+            let remaining_ms = std::cmp::min(write_ts.saturating_sub(now), 1_000.into());
+            let internal_cmd_tx = self.internal_cmd_tx.clone();
+            task::spawn(|| "maybe_advance_timestamps", async move {
+                tokio::time::sleep(Duration::from_millis(remaining_ms.into())).await;
+                // It is not an error for this task to be running after `internal_cmd_rx` is dropped.
+                let result = internal_cmd_tx.send(Message::GroupCommitInitiate);
+                if let Err(e) = result {
+                    warn!("internal_cmd_rx dropped before we could send: {:?}", e);
+                }
+            });
+        } else {
+            self.group_commit_initiate(None).await;
+        }
+    }
+
     /// Attempts to commit all pending write transactions in a group commit. If the timestamp
     /// chosen for the writes is not ahead of `now()`, then we can execute and commit the writes
     /// immediately. Otherwise we must wait for `now()` to advance past the timestamp chosen for the

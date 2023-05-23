@@ -183,6 +183,10 @@ pub enum Message<T = mz_repr::Timestamp> {
     CreateSourceStatementReady(CreateSourceStatementReady),
     SinkConnectionReady(SinkConnectionReady),
     WriteLockGrant(tokio::sync::OwnedMutexGuard<()>),
+    /// Maybe advance real-time timestamps.
+    MaybeAdvanceTimestamps {
+        advance_timelines_interval: Duration,
+    },
     /// Initiates a group commit.
     GroupCommitInitiate,
     /// Makes a group commit visible to all clients.
@@ -1290,7 +1294,9 @@ impl Coordinator {
                 }
                 // `tick()` on `Interval` is cancel-safe:
                 // https://docs.rs/tokio/1.19.2/tokio/time/struct.Interval.html#cancel-safety
-                _ = self.advance_timelines_interval.tick() => Message::GroupCommitInitiate,
+                _ = self.advance_timelines_interval.tick() => Message::MaybeAdvanceTimestamps {
+                    advance_timelines_interval: self.advance_timelines_interval.period()
+                },
 
                 // Process the idle metric at the lowest priority to sample queue non-idle time.
                 // `recv()` on `Receiver` is cancellation safe:
