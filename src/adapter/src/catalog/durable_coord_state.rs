@@ -37,6 +37,8 @@ use mz_persist_types::codec_impls::UnitSchema;
 use mz_persist_types::Codec;
 
 use crate::catalog::storage::ConfigValue;
+use crate::catalog::storage::IdAllocKey;
+use crate::catalog::storage::IdAllocValue;
 use crate::catalog::storage::ItemKey;
 use crate::catalog::storage::ItemValue;
 use crate::catalog::storage::SettingKey;
@@ -48,6 +50,7 @@ pub struct DurableCoordState {
     // full diffs. And only collapse them down to a map when needed. And also
     // ensure that there is only one entry for a given `GlobalId` then.
     items: BTreeMap<ItemKey, ItemValue>,
+    id_alloc: BTreeMap<IdAllocKey, IdAllocValue>,
     config: BTreeMap<String, ConfigValue>,
     settings: BTreeMap<SettingKey, SettingValue>,
 
@@ -73,6 +76,7 @@ pub struct Transaction<'a> {
     // sure that we always have an up-to-date view and can generate the correct differential state
     // updates.
     items: BTreeMap<ItemKey, ItemValue>,
+    id_alloc: BTreeMap<IdAllocKey, IdAllocValue>,
     config: BTreeMap<String, ConfigValue>,
     settings: BTreeMap<SettingKey, SettingValue>,
 
@@ -84,6 +88,7 @@ pub struct Transaction<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum StateUpdate {
     Item(ItemKey, ItemValue),
+    IdAlloc(IdAllocKey, IdAllocValue),
     Config(String, ConfigValue),
     Setting(SettingKey, SettingValue),
 }
@@ -181,6 +186,7 @@ impl DurableCoordState {
 
         let mut this = Self {
             items: BTreeMap::new(),
+            id_alloc: BTreeMap::new(),
             config: BTreeMap::new(),
             settings: BTreeMap::new(),
             trace: Vec::new(),
@@ -316,6 +322,7 @@ impl DurableCoordState {
         // in-memory cash of every type of collection every time we're applying
         // updates. It's easy and correct, though.
         self.items = BTreeMap::new();
+        self.id_alloc = BTreeMap::new();
         self.config = BTreeMap::new();
         self.settings = BTreeMap::new();
 
@@ -324,6 +331,9 @@ impl DurableCoordState {
                 (state_update, _ts, 1) => match state_update {
                     StateUpdate::Item(key, item) => {
                         self.items.insert(key.clone(), item.clone());
+                    }
+                    StateUpdate::IdAlloc(key, id) => {
+                        self.id_alloc.insert(key.clone(), id.clone());
                     }
                     StateUpdate::Config(key, value) => {
                         self.config.insert(key.clone(), value.clone());
@@ -353,6 +363,7 @@ impl<'a> Transaction<'a> {
     fn new(durable_coord_state: &mut DurableCoordState) -> Transaction {
         Transaction {
             items: durable_coord_state.items.clone(),
+            id_alloc: durable_coord_state.id_alloc.clone(),
             config: durable_coord_state.config.clone(),
             settings: durable_coord_state.settings.clone(),
             updates: Vec::new(),
@@ -366,6 +377,10 @@ impl<'a> Transaction<'a> {
 
     pub fn get_all_items(&self) -> BTreeMap<ItemKey, ItemValue> {
         self.items.clone()
+    }
+
+    pub fn get_id_alloc(&self, key: &IdAllocKey) -> Option<IdAllocValue> {
+        self.id_alloc.get(key).cloned()
     }
 
     pub fn get_config(&self, key: &String) -> Option<ConfigValue> {
@@ -416,6 +431,62 @@ impl<'a> Transaction<'a> {
                 self.items.remove(&key);
 
                 Some(current_item)
+            }
+            None => {
+                // Nothing to do!
+                None
+            }
+        }
+    }
+
+    pub fn upsert_id_alloc(
+        &mut self,
+        key: IdAllocKey,
+        id_alloc: IdAllocValue,
+    ) -> Option<IdAllocValue> {
+        let current_id_alloc = self.id_alloc.get(&key).cloned();
+
+        match current_id_alloc {
+            Some(current_id_alloc) if current_id_alloc == id_alloc => {
+                // No need to change anything!
+                Some(current_id_alloc)
+            }
+            Some(current_id_alloc) => {
+                // Need to retract the old mapping and insert a new mapping.
+                self.updates.push((
+                    StateUpdate::IdAlloc(key.clone(), current_id_alloc.clone()),
+                    -1,
+                ));
+                self.updates
+                    .push((StateUpdate::IdAlloc(key.clone(), id_alloc.clone()), 1));
+                self.id_alloc.insert(key, id_alloc);
+                Some(current_id_alloc)
+            }
+            None => {
+                // Only need to add the new mapping.
+                self.updates
+                    .push((StateUpdate::IdAlloc(key.clone(), id_alloc.clone()), 1));
+                self.id_alloc.insert(key, id_alloc);
+                None
+            }
+        }
+    }
+
+    #[allow(unused)]
+    pub fn remove_id_alloc(&mut self, key: IdAllocKey) -> Option<IdAllocValue> {
+        let current_id_alloc = self.id_alloc.get(&key).cloned();
+
+        match current_id_alloc {
+            Some(current_id_alloc) => {
+                // Need to retract the mapping.
+                self.updates.push((
+                    StateUpdate::IdAlloc(key.clone(), current_id_alloc.clone()),
+                    -1,
+                ));
+
+                self.id_alloc.remove(&key);
+
+                Some(current_id_alloc)
             }
             None => {
                 // Nothing to do!
