@@ -62,7 +62,7 @@ impl Display for DurableStateVersion {
     }
 }
 
-pub static DURABLE_STATE_VERSION: DurableStateVersion = DurableStateVersion(0);
+pub static DURABLE_STATE_VERSION: DurableStateVersion = DurableStateVersion(1);
 
 #[derive(Debug)]
 pub struct DurableCoordState {

@@ -1444,7 +1444,8 @@ pub static MZ_TABLES: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {
         .with_column("oid", ScalarType::Oid.nullable(false))
         .with_column("schema_id", ScalarType::UInt64.nullable(false))
         .with_column("name", ScalarType::String.nullable(false))
-        .with_column("owner_id", ScalarType::String.nullable(false)),
+        .with_column("owner_id", ScalarType::String.nullable(false))
+        .with_column("dummy", ScalarType::String.nullable(true)),
     is_retained_metrics_object: false,
 });
 pub static MZ_CONNECTIONS: Lazy<BuiltinTable> = Lazy::new(|| BuiltinTable {

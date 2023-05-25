@@ -400,6 +400,7 @@ impl CatalogState {
                 Datum::UInt64(schema_id.into()),
                 Datum::String(name),
                 Datum::String(&owner_id.to_string()),
+                Datum::String("hello"),
             ]),
             diff,
         }]
