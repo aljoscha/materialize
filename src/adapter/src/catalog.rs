@@ -1653,7 +1653,9 @@ impl CatalogState {
                         StateUpdate::Item(key, v) => {
                             item_additions.push((key.gid, v));
                         }
-                        StateUpdate::Config(_, _) | StateUpdate::Setting(_, _) => {
+                        StateUpdate::Config(_, _)
+                        | StateUpdate::Setting(_, _)
+                        | StateUpdate::IdAlloc(_, _) => {
                             // We're ignoring these here!
                         }
                     }
@@ -1663,7 +1665,9 @@ impl CatalogState {
                         StateUpdate::Item(key, value) => {
                             item_drops.push((key.gid, value));
                         }
-                        StateUpdate::Config(_, _) | StateUpdate::Setting(_, _) => {
+                        StateUpdate::Config(_, _)
+                        | StateUpdate::Setting(_, _)
+                        | StateUpdate::IdAlloc(_, _) => {
                             // We're ignoring these here!
                         }
                     }
