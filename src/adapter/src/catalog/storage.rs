@@ -94,27 +94,27 @@ async fn migrate(
         &'a BootstrapArgs,
     ) -> Result<(), catalog::error::Error>] = &[
         |txn: &mut Transaction<'_>, now, bootstrap_args| {
-            txn.id_allocator.insert(
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: "user".into(),
                 },
                 IdAllocValue { next_id: 1 },
-            )?;
-            txn.id_allocator.insert(
+            );
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: "system".into(),
                 },
                 IdAllocValue { next_id: 1 },
-            )?;
-            txn.id_allocator.insert(
+            );
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: DATABASE_ID_ALLOC_KEY.into(),
                 },
                 IdAllocValue {
                     next_id: MATERIALIZE_DATABASE_ID + 1,
                 },
-            )?;
-            txn.id_allocator.insert(
+            );
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: SCHEMA_ID_ALLOC_KEY.into(),
                 },
@@ -129,47 +129,47 @@ async fn migrate(
                     .expect("known to be non-empty")
                         + 1,
                 },
-            )?;
-            txn.id_allocator.insert(
+            );
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: USER_ROLE_ID_ALLOC_KEY.into(),
                 },
                 IdAllocValue { next_id: 1 },
-            )?;
-            txn.id_allocator.insert(
+            );
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: USER_CLUSTER_ID_ALLOC_KEY.into(),
                 },
                 IdAllocValue {
                     next_id: DEFAULT_USER_CLUSTER_ID.inner_id() + 1,
                 },
-            )?;
-            txn.id_allocator.insert(
+            );
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: SYSTEM_CLUSTER_ID_ALLOC_KEY.into(),
                 },
                 IdAllocValue { next_id: 1 },
-            )?;
-            txn.id_allocator.insert(
+            );
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: REPLICA_ID_ALLOC_KEY.into(),
                 },
                 IdAllocValue {
                     next_id: DEFAULT_REPLICA_ID + 1,
                 },
-            )?;
-            txn.id_allocator.insert(
+            );
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: AUDIT_LOG_ID_ALLOC_KEY.into(),
                 },
                 IdAllocValue { next_id: 1 },
-            )?;
-            txn.id_allocator.insert(
+            );
+            txn.durable_state_tx.upsert_id_alloc(
                 IdAllocKey {
                     name: STORAGE_USAGE_ID_ALLOC_KEY.into(),
                 },
                 IdAllocValue { next_id: 1 },
-            )?;
+            );
             txn.roles.insert(
                 RoleKey {
                     id: MZ_SYSTEM_ROLE_ID,
@@ -426,11 +426,6 @@ async fn migrate(
         //
         // TODO(jkosh44) Can be cleared (patched to be empty) in v0.50.0
         |txn: &mut Transaction<'_>, now, _bootstrap_args| {
-            // Delete the system role id allocator. All system role ids will need
-            // to be hard-coded going forward.
-            txn.id_allocator
-                .delete(|id_alloc_key, _| id_alloc_key.name == "system_role");
-
             // Delete all system roles so we can re-insert them with known IDs.
             let sys_roles = txn.roles.delete(|role_key, _| role_key.id.is_system());
             assert_eq!(2, sys_roles.len(), "unexpected number of system roles");
@@ -1224,16 +1219,16 @@ impl Connection {
     }
 
     async fn get_next_id(&mut self, id_type: &str) -> Result<u64, Error> {
-        COLLECTION_ID_ALLOC
-            .peek_key_one(
-                &mut self.stash,
-                IdAllocKey {
-                    name: id_type.to_string(),
-                },
-            )
-            .await
-            .map(|x| x.expect("must exist").next_id)
-            .map_err(Into::into)
+        let key = IdAllocKey {
+            name: id_type.to_string(),
+        };
+
+        let read_tx = self.durable_state.begin_transaction().await;
+        let prev = read_tx.get_id_alloc(&key);
+
+        let prev = prev.unwrap_or_else(|| IdAllocValue { next_id: 1 });
+
+        Ok(prev.next_id)
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -1244,16 +1239,24 @@ impl Connection {
         let key = IdAllocKey {
             name: id_type.to_string(),
         };
-        let (prev, next) = COLLECTION_ID_ALLOC
-            .upsert_key(&mut self.stash, key, move |prev| {
-                let id = prev.expect("must exist").next_id;
-                match id.checked_add(amount) {
-                    Some(next_gid) => Ok(IdAllocValue { next_id: next_gid }),
-                    None => Err(Error::new(ErrorKind::IdExhaustion)),
-                }
-            })
-            .await??;
-        let id = prev.expect("must exist").next_id;
+
+        let mut tx = self.durable_state.begin_transaction().await;
+
+        let prev = tx
+            .get_id_alloc(&key)
+            .unwrap_or_else(|| IdAllocValue { next_id: 1 });
+
+        let next = match prev.next_id.checked_add(amount) {
+            Some(next_gid) => IdAllocValue { next_id: next_gid },
+            None => return Err(Error::new(ErrorKind::IdExhaustion)),
+        };
+
+        tx.upsert_id_alloc(key.clone(), next.clone());
+        tx.commit()
+            .await
+            .map_err(|err| ErrorKind::Unstructured(format!("unexpected stash state: {:?}", err)))?;
+
+        let id = prev.next_id;
         Ok((id..next.next_id).collect())
     }
 
@@ -1470,7 +1473,6 @@ pub async fn transaction<'a>(
         clusters,
         cluster_replicas,
         introspection_sources,
-        id_allocator,
         timestamps,
         system_gid_mapping,
         system_configurations,
@@ -1488,7 +1490,6 @@ pub async fn transaction<'a>(
                         tx.collection(COLLECTION_CLUSTER_INTROSPECTION_SOURCE_INDEX.name())
                             .await?,
                     ),
-                    tx.peek_one(tx.collection(COLLECTION_ID_ALLOC.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_TIMESTAMP.name()).await?),
                     tx.peek_one(tx.collection(COLLECTION_SYSTEM_GID_MAPPING.name()).await?),
                     tx.peek_one(
@@ -1515,7 +1516,6 @@ pub async fn transaction<'a>(
             a.cluster_id == b.cluster_id && a.name == b.name
         }),
         introspection_sources: TableTransaction::new(introspection_sources, |_a, _b| false),
-        id_allocator: TableTransaction::new(id_allocator, |_a, _b| false),
         timestamps: TableTransaction::new(timestamps, |_a, _b| false),
         system_gid_mapping: TableTransaction::new(system_gid_mapping, |_a, _b| false),
         system_configurations: TableTransaction::new(system_configurations, |_a, _b| false),
@@ -1535,7 +1535,6 @@ pub struct Transaction<'a> {
     cluster_replicas: TableTransaction<ClusterReplicaKey, ClusterReplicaValue>,
     introspection_sources:
         TableTransaction<ClusterIntrospectionSourceIndexKey, ClusterIntrospectionSourceIndexValue>,
-    id_allocator: TableTransaction<IdAllocKey, IdAllocValue>,
     timestamps: TableTransaction<TimestampKey, TimestampValue>,
     system_gid_mapping: TableTransaction<GidMappingKey, GidMappingValue>,
     system_configurations: TableTransaction<ServerConfigurationKey, ServerConfigurationValue>,
@@ -1818,20 +1817,25 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn get_and_increment_id(&mut self, key: String) -> Result<u64, Error> {
-        let id = self
-            .id_allocator
-            .items()
-            .get(&IdAllocKey { name: key.clone() })
-            .unwrap_or_else(|| panic!("{key} id allocator missing"))
-            .next_id;
-        let next_id = id
-            .checked_add(1)
-            .ok_or_else(|| Error::new(ErrorKind::IdExhaustion))?;
+        let amount = 1;
+        let key = IdAllocKey {
+            name: key.to_string(),
+        };
+
         let prev = self
-            .id_allocator
-            .set(IdAllocKey { name: key }, Some(IdAllocValue { next_id }))?;
-        assert!(prev.is_some());
-        Ok(id)
+            .durable_state_tx
+            .get_id_alloc(&key)
+            .unwrap_or_else(|| IdAllocValue { next_id: 1 });
+
+        let next = match prev.next_id.checked_add(amount) {
+            Some(next_gid) => IdAllocValue { next_id: next_gid },
+            None => return Err(Error::new(ErrorKind::IdExhaustion)),
+        };
+
+        self.durable_state_tx
+            .upsert_id_alloc(key.clone(), next.clone());
+
+        Ok(prev.next_id)
     }
 
     pub fn remove_database(&mut self, id: &DatabaseId) -> Result<(), Error> {
@@ -2298,7 +2302,6 @@ impl<'a> Transaction<'a> {
         let clusters = Arc::new(self.clusters.pending());
         let cluster_replicas = Arc::new(self.cluster_replicas.pending());
         let introspection_sources = Arc::new(self.introspection_sources.pending());
-        let id_allocator = Arc::new(self.id_allocator.pending());
         let timestamps = Arc::new(self.timestamps.pending());
         let system_gid_mapping = Arc::new(self.system_gid_mapping.pending());
         let system_configurations = Arc::new(self.system_configurations.pending());
@@ -2425,14 +2428,6 @@ impl<'a> Transaction<'a> {
                         &tx,
                         &mut batches,
                         &mut migration_retractions,
-                        &COLLECTION_ID_ALLOC,
-                        &id_allocator,
-                    )
-                    .await?;
-                    add_batch(
-                        &tx,
-                        &mut batches,
-                        &mut migration_retractions,
                         &COLLECTION_TIMESTAMP,
                         &timestamps,
                     )
@@ -2532,7 +2527,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                 // Query all collections in parallel. Makes for triplicated
                 // names, but runs quick.
                 let (
-                    id_alloc,
                     system_gid_mapping,
                     clusters,
                     cluster_introspection,
@@ -2545,7 +2539,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     audit_log,
                     storage_usage,
                 ) = futures::try_join!(
-                    add_batch(&tx, &COLLECTION_ID_ALLOC),
                     add_batch(&tx, &COLLECTION_SYSTEM_GID_MAPPING),
                     add_batch(&tx, &COLLECTION_CLUSTERS),
                     add_batch(&tx, &COLLECTION_CLUSTER_INTROSPECTION_SOURCE_INDEX),
@@ -2559,7 +2552,6 @@ pub async fn initialize_stash(stash: &mut Stash) -> Result<(), Error> {
                     add_batch(&tx, &COLLECTION_STORAGE_USAGE),
                 )?;
                 let batches: Vec<AppendBatch> = [
-                    id_alloc,
                     system_gid_mapping,
                     clusters,
                     cluster_introspection,
@@ -2743,8 +2735,6 @@ pub struct ServerConfigurationValue {
     value: String,
 }
 
-pub static COLLECTION_ID_ALLOC: TypedCollection<IdAllocKey, IdAllocValue> =
-    TypedCollection::new("id_alloc");
 pub static COLLECTION_SYSTEM_GID_MAPPING: TypedCollection<GidMappingKey, GidMappingValue> =
     TypedCollection::new("system_gid_mapping");
 pub static COLLECTION_CLUSTERS: TypedCollection<ClusterKey, ClusterValue> =
@@ -2772,7 +2762,6 @@ pub static COLLECTION_STORAGE_USAGE: TypedCollection<StorageUsageKey, ()> =
     TypedCollection::new("storage_usage");
 
 pub static ALL_COLLECTIONS: &[&str] = &[
-    COLLECTION_ID_ALLOC.name(),
     COLLECTION_SYSTEM_GID_MAPPING.name(),
     COLLECTION_CLUSTERS.name(),
     COLLECTION_CLUSTER_INTROSPECTION_SOURCE_INDEX.name(),

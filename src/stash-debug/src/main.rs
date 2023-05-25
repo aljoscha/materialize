@@ -286,7 +286,6 @@ impl Usage {
 
         match self {
             Usage::Catalog => {
-                dump_col!(catalog::COLLECTION_ID_ALLOC);
                 dump_col!(catalog::COLLECTION_SYSTEM_GID_MAPPING);
                 dump_col!(catalog::COLLECTION_CLUSTERS);
                 dump_col!(catalog::COLLECTION_CLUSTER_INTROSPECTION_SOURCE_INDEX);
@@ -342,7 +341,6 @@ impl Usage {
 
         match self {
             Usage::Catalog => {
-                edit_col!(catalog::COLLECTION_ID_ALLOC);
                 edit_col!(catalog::COLLECTION_SYSTEM_GID_MAPPING);
                 edit_col!(catalog::COLLECTION_CLUSTERS);
                 edit_col!(catalog::COLLECTION_CLUSTER_INTROSPECTION_SOURCE_INDEX);
