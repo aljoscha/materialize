@@ -16,6 +16,8 @@
 //!  - As of right now, creating a "read transaction" requires mutable access to DurableCoordState.
 
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt::Display;
 use std::sync::Arc;
 
 use differential_dataflow::consolidation;
@@ -44,6 +46,23 @@ use crate::catalog::storage::ItemValue;
 use crate::catalog::storage::SettingKey;
 use crate::catalog::storage::SettingValue;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DurableStateVersion(u64);
+
+impl Default for DurableStateVersion {
+    fn default() -> Self {
+        DurableStateVersion(0)
+    }
+}
+
+impl Display for DurableStateVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "state version {}", self.0)
+    }
+}
+
+pub static DURABLE_STATE_VERSION: DurableStateVersion = DurableStateVersion(0);
+
 #[derive(Debug)]
 pub struct DurableCoordState {
     // TODO(aljoscha): We should keep these collections as a _trace_, with the
@@ -53,6 +72,7 @@ pub struct DurableCoordState {
     id_alloc: BTreeMap<IdAllocKey, IdAllocValue>,
     config: BTreeMap<String, ConfigValue>,
     settings: BTreeMap<SettingKey, SettingValue>,
+    fence_version: DurableStateVersion,
 
     trace: Vec<(StateUpdate, u64, i64)>,
 
@@ -79,10 +99,36 @@ pub struct Transaction<'a> {
     id_alloc: BTreeMap<IdAllocKey, IdAllocValue>,
     config: BTreeMap<String, ConfigValue>,
     settings: BTreeMap<SettingKey, SettingValue>,
+    fence_version: DurableStateVersion,
 
     updates: Vec<(StateUpdate, i64)>,
 
     durable_coord_state: &'a mut DurableCoordState,
+}
+
+#[derive(Debug)]
+pub enum TransactionError {
+    Fenced(DurableStateVersion),
+    UpperMismatch(UpperMismatch<u64>),
+}
+
+impl Error for TransactionError {}
+
+impl Display for TransactionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactionError::Fenced(fence_version) => {
+                write!(
+                    f,
+                    "we have been fenced off, our version: {}, fence: {}",
+                    DURABLE_STATE_VERSION, fence_version
+                )
+            }
+            TransactionError::UpperMismatch(upper_mismatch) => {
+                write!(f, "upper mismatch: {}", upper_mismatch)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -91,6 +137,7 @@ pub enum StateUpdate {
     IdAlloc(IdAllocKey, IdAllocValue),
     Config(String, ConfigValue),
     Setting(SettingKey, SettingValue),
+    Fence(DurableStateVersion),
 }
 
 impl Codec for StateUpdate {
@@ -189,6 +236,7 @@ impl DurableCoordState {
             id_alloc: BTreeMap::new(),
             config: BTreeMap::new(),
             settings: BTreeMap::new(),
+            fence_version: DurableStateVersion::default(),
             trace: Vec::new(),
             upper: restart_as_of,
             pending_updates: Vec::new(),
@@ -201,21 +249,37 @@ impl DurableCoordState {
         debug!("syncing to {:?}", upper);
         this.sync(upper).await;
 
+        if DURABLE_STATE_VERSION >= this.fence_version {
+            // Loop until we succeed in fencing out older versions.
+            loop {
+                let mut tx = this
+                    .begin_transaction()
+                    .await
+                    .expect("cannot have been fenced");
+                tx.upsert_fence_version(DURABLE_STATE_VERSION);
+                match tx.commit().await {
+                    Ok(_) => break,
+                    Err(_) => continue,
+                }
+            }
+        }
+
         // Drain away the updates that we know already!
         let _updates = this.drain_pending_updates();
 
         this
     }
 
-    pub async fn begin_transaction(&mut self) -> Transaction {
+    pub async fn begin_transaction(&mut self) -> Result<Transaction, TransactionError> {
         self.sync_to_recent_upper().await;
-        Transaction::new(self)
+
+        Ok(Transaction::new(self))
     }
 
     pub(crate) async fn commit_updates(
         &mut self,
         updates: Vec<(StateUpdate, i64)>,
-    ) -> Result<(), UpperMismatch<u64>> {
+    ) -> Result<(), TransactionError> {
         debug!("commit_updates {:?}", updates);
 
         let current_upper = self.upper.clone();
@@ -254,7 +318,7 @@ impl DurableCoordState {
                 // in-memory maps/traces.
                 self.sync(next_upper).await;
             }
-            Err(upper_mismatch) => return Err(upper_mismatch),
+            Err(upper_mismatch) => return Err(TransactionError::UpperMismatch(upper_mismatch)),
         }
 
         Ok(())
@@ -341,6 +405,9 @@ impl DurableCoordState {
                     StateUpdate::Setting(key, value) => {
                         self.settings.insert(key.clone(), value.clone());
                     }
+                    StateUpdate::Fence(fence_version) => {
+                        self.fence_version = *fence_version;
+                    }
                 },
                 invalid_update => {
                     panic!("invalid update in consolidated trace: {:?}", invalid_update);
@@ -366,6 +433,7 @@ impl<'a> Transaction<'a> {
             id_alloc: durable_coord_state.id_alloc.clone(),
             config: durable_coord_state.config.clone(),
             settings: durable_coord_state.settings.clone(),
+            fence_version: durable_coord_state.fence_version,
             updates: Vec::new(),
             durable_coord_state,
         }
@@ -389,6 +457,10 @@ impl<'a> Transaction<'a> {
 
     pub fn get_setting(&self, key: &SettingKey) -> Option<SettingValue> {
         self.settings.get(key).cloned()
+    }
+
+    pub fn get_fence_version(&self) -> DurableStateVersion {
+        self.fence_version
     }
 
     pub fn upsert_item(&mut self, key: ItemKey, item: ItemValue) -> Option<ItemValue> {
@@ -593,13 +665,43 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub async fn commit(self) -> Result<(), UpperMismatch<u64>> {
+    pub fn upsert_fence_version(
+        &mut self,
+        new_version: DurableStateVersion,
+    ) -> DurableStateVersion {
+        let current_version = self.fence_version;
+
+        if new_version > current_version {
+            // Need to retract the old version and insert new new version.
+            self.updates.push((StateUpdate::Fence(current_version), -1));
+            self.updates.push((StateUpdate::Fence(new_version), 1));
+            current_version
+        } else if current_version == DurableStateVersion::default() {
+            // The genesis Fence!
+            self.updates.push((StateUpdate::Fence(new_version), 1));
+            current_version
+        } else if new_version == current_version {
+            // No-op!
+            current_version
+        } else {
+            panic!(
+                "tried to update version to a version that is older than the current version; \
+                new_version {new_version}, current_version {current_version}"
+            );
+        }
+    }
+
+    pub async fn commit(self) -> Result<(), TransactionError> {
+        if self.fence_version > DURABLE_STATE_VERSION {
+            return Err(TransactionError::Fenced(self.fence_version));
+        }
+
         self.durable_coord_state.commit_updates(self.updates).await
     }
 
     pub async fn commit_and_drain_updates(
         self,
-    ) -> Result<Vec<(StateUpdate, u64, i64)>, UpperMismatch<u64>> {
+    ) -> Result<Vec<(StateUpdate, u64, i64)>, TransactionError> {
         self.durable_coord_state
             .commit_updates(self.updates)
             .await?;
@@ -649,7 +751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_basic_usage() {
+    async fn test_basic_usage() -> Result<(), TransactionError> {
         let log_shard_id = ShardId::new();
 
         let mut durable_state = make_test_state(log_shard_id).await;
@@ -666,21 +768,21 @@ mod tests {
             owner_id: None,
         };
 
-        let mut tx = durable_state.begin_transaction().await;
+        let mut tx = durable_state.begin_transaction().await?;
 
         tx.upsert_item(item_key.clone(), item_value.clone());
 
         let res = tx.commit().await;
         assert!(matches!(res, Ok(())));
 
-        let read_tx = durable_state.begin_transaction().await;
+        let read_tx = durable_state.begin_transaction().await?;
         let stored_item = read_tx.get_item(&item_key);
         assert_eq!(stored_item, Some(item_value.clone()));
 
         // Re-create our durable state.
         let mut durable_state = make_test_state(log_shard_id).await;
 
-        let read_tx = durable_state.begin_transaction().await;
+        let read_tx = durable_state.begin_transaction().await?;
         let stored_item = read_tx.get_item(&item_key);
         assert_eq!(stored_item, Some(item_value.clone()));
 
@@ -695,7 +797,7 @@ mod tests {
             owner_id: None,
         };
 
-        let mut tx = durable_state.begin_transaction().await;
+        let mut tx = durable_state.begin_transaction().await?;
         tx.upsert_item(item_key.clone(), new_item_value.clone());
 
         let res = tx.commit().await;
@@ -704,8 +806,10 @@ mod tests {
         // Re-create our durable state.
         let mut durable_state = make_test_state(log_shard_id).await;
 
-        let read_tx = durable_state.begin_transaction().await;
+        let read_tx = durable_state.begin_transaction().await?;
         let stored_item = read_tx.get_item(&item_key);
         assert_eq!(stored_item, Some(new_item_value));
+
+        Ok(())
     }
 }
