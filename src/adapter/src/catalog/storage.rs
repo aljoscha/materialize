@@ -884,9 +884,9 @@ impl Connection {
 
         tx.upsert_setting(key, value);
 
-        tx.commit().await.map_err(|err| {
-            ErrorKind::Unstructured(format!("unexpected stash state: {:?}", err)).into()
-        })
+        tx.commit().await?;
+
+        Ok(())
     }
 
     pub async fn get_catalog_content_version(&mut self) -> Result<Option<String>, Error> {
@@ -1253,9 +1253,7 @@ impl Connection {
         };
 
         tx.upsert_id_alloc(key.clone(), next.clone());
-        tx.commit()
-            .await
-            .map_err(|err| ErrorKind::Unstructured(format!("unexpected stash state: {:?}", err)))?;
+        tx.commit().await?;
 
         let id = prev.next_id;
         Ok((id..next.next_id).collect())
