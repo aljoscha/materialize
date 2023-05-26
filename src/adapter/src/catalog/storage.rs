@@ -36,7 +36,7 @@ use mz_sql::names::{
 use mz_stash::{AppendBatch, Data, Id, Stash, StashError, TableTransaction, TypedCollection};
 use mz_storage_client::types::sources::Timeline;
 use timely::PartialOrder;
-use tracing::info;
+use tracing::trace;
 
 use crate::catalog;
 use crate::catalog::builtin::{
@@ -1334,7 +1334,7 @@ impl Connection {
             None => mz_repr::Timestamp::MIN,
         };
 
-        info!(read_ts = ?read_ts, write_ts = ?next.write_ts, "allocated read/write timetamps");
+        trace!(read_ts = ?read_ts, write_ts = ?next.write_ts, "allocated read/write timetamps");
 
         Ok((read_ts, next.write_ts))
     }
