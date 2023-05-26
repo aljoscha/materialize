@@ -796,7 +796,8 @@ impl Connection {
         // The `user_version` field stores the index of the last migration that
         // was run.
         let skip = {
-            let read_tx = durable_state.begin_transaction().await;
+            let read_tx = durable_state.begin_transaction().await?;
+
             read_tx
                 .get_config(&USER_VERSION.to_string())
                 .map(|version| version.value + 1)
@@ -864,7 +865,7 @@ impl Connection {
         let key = SettingKey {
             name: key.to_string(),
         };
-        let read_tx = self.durable_state.begin_transaction().await;
+        let read_tx = self.durable_state.begin_transaction().await?;
 
         let setting_value = read_tx.get_setting(&key);
         let setting_value = setting_value.map(|s| s.value);
@@ -879,7 +880,7 @@ impl Connection {
         let value = SettingValue {
             value: value.into(),
         };
-        let mut tx = self.durable_state.begin_transaction().await;
+        let mut tx = self.durable_state.begin_transaction().await?;
 
         tx.upsert_setting(key, value);
 
@@ -1223,7 +1224,7 @@ impl Connection {
             name: id_type.to_string(),
         };
 
-        let read_tx = self.durable_state.begin_transaction().await;
+        let read_tx = self.durable_state.begin_transaction().await?;
         let prev = read_tx.get_id_alloc(&key);
 
         let prev = prev.unwrap_or_else(|| IdAllocValue { next_id: 1 });
@@ -1240,7 +1241,7 @@ impl Connection {
             name: id_type.to_string(),
         };
 
-        let mut tx = self.durable_state.begin_transaction().await;
+        let mut tx = self.durable_state.begin_transaction().await?;
 
         let prev = tx
             .get_id_alloc(&key)
@@ -1501,7 +1502,7 @@ pub async fn transaction<'a>(
         })
         .await?;
 
-    let durable_state_tx = durable_state.begin_transaction().await;
+    let durable_state_tx = durable_state.begin_transaction().await?;
 
     Ok(Transaction {
         stash,

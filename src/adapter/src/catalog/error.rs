@@ -13,6 +13,8 @@ use mz_ore::str::StrExt;
 use mz_repr::GlobalId;
 use mz_sql::catalog::CatalogError as SqlCatalogError;
 
+use crate::catalog::durable_coord_state;
+
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct Error {
@@ -82,6 +84,8 @@ pub enum ErrorKind {
     Unstructured(String),
     #[error(transparent)]
     Stash(#[from] mz_stash::StashError),
+    #[error(transparent)]
+    DurableState(#[from] durable_coord_state::TransactionError),
     #[error("stash in unexpected state")]
     UnexpectedStashState,
     #[error(transparent)]
@@ -134,6 +138,12 @@ impl From<mz_stash::StashError> for Error {
 
 impl From<uuid::Error> for Error {
     fn from(e: uuid::Error) -> Error {
+        Error::new(ErrorKind::from(e))
+    }
+}
+
+impl From<durable_coord_state::TransactionError> for Error {
+    fn from(e: durable_coord_state::TransactionError) -> Error {
         Error::new(ErrorKind::from(e))
     }
 }
