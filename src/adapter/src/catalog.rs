@@ -1655,7 +1655,8 @@ impl CatalogState {
                         }
                         StateUpdate::Config(_, _)
                         | StateUpdate::Setting(_, _)
-                        | StateUpdate::IdAlloc(_, _) => {
+                        | StateUpdate::IdAlloc(_, _)
+                        | StateUpdate::Fence(_) => {
                             // We're ignoring these here!
                         }
                     }
@@ -1667,7 +1668,8 @@ impl CatalogState {
                         }
                         StateUpdate::Config(_, _)
                         | StateUpdate::Setting(_, _)
-                        | StateUpdate::IdAlloc(_, _) => {
+                        | StateUpdate::IdAlloc(_, _)
+                        | StateUpdate::Fence(_) => {
                             // We're ignoring these here!
                         }
                     }
