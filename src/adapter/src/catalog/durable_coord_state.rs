@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use timely::progress::Antichain;
 use tracing::debug;
+use tracing::info;
 
 use mz_persist_client::error::UpperMismatch;
 use mz_persist_client::read::Listen;
@@ -370,6 +371,31 @@ impl DurableCoordState {
     // full diffs. And only collapse them down to a map when needed. And also
     // ensure that there is only one entry for a given `GlobalId` then.
     fn apply_updates(&mut self, mut updates: Vec<(StateUpdate, u64, i64)>) {
+        if self.fence_version > DURABLE_STATE_VERSION {
+            // We already know that we're in fenced-off/read-only mode. Just drop th updates on the
+            // floor and make sure we don't update our state anymore _AND_ that we don't report any
+            // new pending updates.
+            return;
+        }
+
+        // Sniff out if there are any incoming Fence updates.
+        let fenced = updates.iter().find_map(|update| match update {
+            (StateUpdate::Fence(fence_version), _ts, 1)
+                if *fence_version > DURABLE_STATE_VERSION =>
+            {
+                Some(fence_version)
+            }
+            _ => None,
+        });
+
+        if let Some(fence_version) = fenced {
+            info!("oh boy! We have been fenced. Better go to read-only mode and not mess up things... 🙊");
+            // We have been fenced! Don't apply any new updates _AND_ don't report them from
+            // `drain_pending_updates()`.
+            self.fence_version = *fence_version;
+            return;
+        }
+
         self.pending_updates.extend(updates.iter().cloned());
         self.trace.append(&mut updates);
 
