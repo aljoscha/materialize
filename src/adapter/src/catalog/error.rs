@@ -114,13 +114,21 @@ impl Error {
             ErrorKind::ReservedClusterName(_) => {
                 Some("The prefixes \"mz_\" and \"pg_\" are reserved for system clusters.".into())
             }
+            ErrorKind::DurableState(durable_coord_state::TransactionError::Fenced(_fence_error)) => {
+                Some("It's highly likely that an updated ADAPTER did an incompatible change to our shared durable state.".into())
+            }
             _ => None,
         }
     }
 
     /// Reports a hint for the user about how the error could be fixed.
     pub fn hint(&self) -> Option<String> {
-        None
+        match &self.kind {
+            ErrorKind::DurableState(durable_coord_state::TransactionError::Fenced(
+                _fence_error,
+            )) => Some(format!("Sit tight!")),
+            _ => None,
+        }
     }
 }
 

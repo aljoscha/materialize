@@ -120,7 +120,7 @@ impl Display for TransactionError {
             TransactionError::Fenced(fence_version) => {
                 write!(
                     f,
-                    "we have been fenced off, our version: {}, fence: {}",
+                    "We have been fenced off; Our version: {}, fence: {}",
                     DURABLE_STATE_VERSION, fence_version
                 )
             }
