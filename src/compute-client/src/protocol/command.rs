@@ -344,7 +344,9 @@ impl Arbitrary for ComputeCommand<mz_repr::Timestamp> {
 ///
 /// Parameters can be set (`Some`) or unset (`None`).
 /// Unset parameters should be interpreted to mean "use the previous value".
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Arbitrary)]
+#[derive(
+    Clone, Debug, Default, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, Arbitrary,
+)]
 pub struct ComputeParameters {
     /// The maximum allowed size in bytes for results of peeks and subscribes.
     ///
@@ -427,7 +429,7 @@ impl RustType<ProtoComputeParameters> for ComputeParameters {
 /// Subsequent commands may arbitrarily compact the arrangements;
 /// the dataflow runners are responsible for ensuring that they can
 /// correctly answer the `Peek`.
-#[derive(Arbitrary, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Arbitrary, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peek<T = mz_repr::Timestamp> {
     /// The identifier of the arrangement.
     pub id: GlobalId,

@@ -567,7 +567,7 @@ pub type DataflowDesc = DataflowDescription<OptimizedMirRelationExpr, ()>;
 
 /// An index storing processed updates so they can be queried
 /// or reused in other computations
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+#[derive(Arbitrary, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize, Hash)]
 pub struct IndexDesc {
     /// Identity of the collection the index is on.
     pub on_id: GlobalId,
@@ -593,7 +593,7 @@ impl RustType<ProtoIndexDesc> for IndexDesc {
 }
 
 /// An association of a global identifier to an expression.
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Arbitrary, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BuildDesc<P> {
     pub id: GlobalId,
     pub plan: P,

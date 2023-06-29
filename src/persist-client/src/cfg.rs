@@ -358,7 +358,7 @@ pub struct DynamicConfig {
     consensus_connection_pool_ttl_stagger: Duration,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Arbitrary, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Eq, PartialOrd, Ord, PartialEq, Arbitrary, Serialize, Deserialize)]
 pub struct RetryParameters {
     pub initial_backoff: Duration,
     pub multiplier: u32,
@@ -627,7 +627,9 @@ impl BlobKnobs for PersistConfig {
 ///
 /// Parameters can be set (`Some`) or unset (`None`). Unset parameters should be
 /// interpreted to mean "use the previous value".
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Arbitrary)]
+#[derive(
+    Clone, Debug, Default, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, Arbitrary,
+)]
 pub struct PersistParameters {
     /// Configures [`DynamicConfig::blob_target_size`].
     pub blob_target_size: Option<usize>,

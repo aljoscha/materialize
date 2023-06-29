@@ -85,7 +85,7 @@ impl RustType<ProtoComputeSinkDesc> for ComputeSinkDesc<CollectionMetadata, mz_r
     }
 }
 
-#[derive(Arbitrary, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Arbitrary, Clone, Debug, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq)]
 pub enum ComputeSinkConnection<S: 'static = ()> {
     Subscribe(SubscribeSinkConnection),
     Persist(PersistSinkConnection<S>),
@@ -133,10 +133,12 @@ impl RustType<ProtoComputeSinkConnection> for ComputeSinkConnection<CollectionMe
     }
 }
 
-#[derive(Arbitrary, Default, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(
+    Arbitrary, Default, Clone, Debug, Serialize, Deserialize, Ord, PartialOrd, Eq, PartialEq,
+)]
 pub struct SubscribeSinkConnection {}
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Arbitrary, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistSinkConnection<S> {
     pub value_desc: RelationDesc,
     pub storage_metadata: S,

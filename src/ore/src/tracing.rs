@@ -536,7 +536,7 @@ where
 /// An OpenTelemetry context.
 ///
 /// Allows associating [`tracing`] spans across task or thread boundaries.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialOrd, Ord, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OpenTelemetryContext {
     inner: BTreeMap<String, String>,
 }

@@ -2787,7 +2787,7 @@ impl JoinInputCharacteristics {
 /// keywords), whereas much of the rest of SQL is defined in terms of unordered
 /// multisets. But as it turns out, the same idea can be used to optimize
 /// trivial peeks.
-#[derive(Arbitrary, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Arbitrary, Debug, Clone, Serialize, Deserialize, PartialOrd, Ord, PartialEq, Eq)]
 pub struct RowSetFinishing {
     /// Order rows by the given columns.
     pub order_by: Vec<ColumnOrder>,

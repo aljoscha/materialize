@@ -25,7 +25,7 @@ include!(concat!(
 /// This includes a description of the source, but additionally any
 /// context-dependent options like the ability to apply filtering and
 /// projection to the records as they emerge.
-#[derive(Arbitrary, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Arbitrary, Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceInstanceDesc<M> {
     /// Arguments for this instantiation of the source.
     pub arguments: SourceInstanceArguments,
@@ -60,7 +60,7 @@ impl RustType<ProtoSourceInstanceDesc> for SourceInstanceDesc<CollectionMetadata
 }
 
 /// Per-source construction arguments.
-#[derive(Arbitrary, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Arbitrary, Debug, Clone, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceInstanceArguments {
     /// Linear operators to be applied record-by-record.
     pub operators: Option<mz_expr::MapFilterProject>,

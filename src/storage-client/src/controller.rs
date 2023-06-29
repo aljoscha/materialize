@@ -599,7 +599,7 @@ impl<T: Timestamp> ReadPolicy<T> {
 }
 
 /// Metadata required by a storage instance to read a storage collection
-#[derive(Arbitrary, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Arbitrary, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionMetadata {
     /// The persist location where the shards are located.
     pub persist_location: PersistLocation,
