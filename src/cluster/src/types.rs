@@ -12,7 +12,9 @@
 use std::sync::Arc;
 
 use mz_cluster_client::client::{ClusterStartupEpoch, TimelyConfig};
+use mz_compute_client::controller::ComputeInstanceId;
 use mz_persist_client::cache::PersistClientCache;
+use mz_persist_client::PersistLocation;
 use timely::worker::Worker as TimelyWorker;
 
 /// A trait for letting specific server implementations hook
@@ -38,6 +40,8 @@ pub trait AsRunnableWorker<C, R> {
             crossbeam_channel::Sender<Self::Activatable>,
         )>,
         persist_clients: Arc<PersistClientCache>,
+        instance_id: Option<ComputeInstanceId>,
+        persist_location: Option<PersistLocation>,
     );
 }
 
@@ -46,28 +50,60 @@ pub trait AsRunnableWorker<C, R> {
 pub trait TryIntoTimelyConfig {
     /// Attempt to unpack `self` into a `(TimelyConfig, ClusterStartupEpoch)`. Otherwise,
     /// fail and return `self` back.
-    fn try_into_timely_config(self) -> Result<(TimelyConfig, ClusterStartupEpoch), Self>
+    fn try_into_timely_config(
+        self,
+    ) -> Result<
+        (
+            TimelyConfig,
+            ClusterStartupEpoch,
+            Option<ComputeInstanceId>,
+            Option<PersistLocation>,
+        ),
+        Self,
+    >
     where
         Self: Sized;
 }
 
 impl TryIntoTimelyConfig for mz_compute_client::protocol::command::ComputeCommand {
-    fn try_into_timely_config(self) -> Result<(TimelyConfig, ClusterStartupEpoch), Self> {
+    fn try_into_timely_config(
+        self,
+    ) -> Result<
+        (
+            TimelyConfig,
+            ClusterStartupEpoch,
+            Option<ComputeInstanceId>,
+            Option<PersistLocation>,
+        ),
+        Self,
+    > {
         match self {
             mz_compute_client::protocol::command::ComputeCommand::CreateTimely {
                 config,
                 epoch,
-            } => Ok((config, epoch)),
+                instance_id,
+                persist_location,
+            } => Ok((config, epoch, Some(instance_id), Some(persist_location))),
             cmd => Err(cmd),
         }
     }
 }
 
 impl TryIntoTimelyConfig for mz_storage_client::client::StorageCommand {
-    fn try_into_timely_config(self) -> Result<(TimelyConfig, ClusterStartupEpoch), Self> {
+    fn try_into_timely_config(
+        self,
+    ) -> Result<
+        (
+            TimelyConfig,
+            ClusterStartupEpoch,
+            Option<ComputeInstanceId>,
+            Option<PersistLocation>,
+        ),
+        Self,
+    > {
         match self {
             mz_storage_client::client::StorageCommand::CreateTimely { config, epoch } => {
-                Ok((config, epoch))
+                Ok((config, epoch, None, None))
             }
             cmd => Err(cmd),
         }

@@ -16,11 +16,13 @@ use anyhow::{anyhow, Error};
 use async_trait::async_trait;
 use futures::future;
 use mz_cluster_client::client::{ClusterStartupEpoch, TimelyConfig};
+use mz_compute_client::controller::ComputeInstanceId;
 use mz_ore::cast::CastFrom;
 use mz_ore::error::ErrorExt;
 use mz_ore::halt;
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist_client::cache::PersistClientCache;
+use mz_persist_client::PersistLocation;
 use mz_service::client::{GenericClient, Partitionable, Partitioned};
 use mz_service::local::LocalClient;
 use timely::communication::initialize::WorkerGuards;
@@ -143,6 +145,8 @@ where
         config: TimelyConfig,
         epoch: ClusterStartupEpoch,
         persist_clients: Arc<PersistClientCache>,
+        instance_id: Option<ComputeInstanceId>,
+        persist_location: Option<PersistLocation>,
         tokio_executor: Handle,
     ) -> Result<TimelyContainer<C, R, Worker::Activatable>, Error> {
         info!("Building timely container with config {config:?}");
@@ -180,6 +184,8 @@ where
                 timely_worker,
                 client_rx,
                 persist_clients,
+                instance_id,
+                persist_location.clone(),
             )
         })
         .map_err(|e| anyhow!("{e}"))?;
@@ -195,6 +201,8 @@ where
         &mut self,
         config: TimelyConfig,
         epoch: ClusterStartupEpoch,
+        instance_id: Option<ComputeInstanceId>,
+        persist_location: Option<PersistLocation>,
     ) -> Result<(), Error> {
         let workers = config.workers;
 
@@ -222,8 +230,16 @@ where
                 existing
             }
             None => {
-                let build_timely_result =
-                    Self::build_timely(worker_config, config, epoch, persist_clients, handle).await;
+                let build_timely_result = Self::build_timely(
+                    worker_config,
+                    config,
+                    epoch,
+                    persist_clients,
+                    instance_id,
+                    persist_location,
+                    handle,
+                )
+                .await;
                 match build_timely_result {
                     Err(e) => {
                         warn!("timely initialization failed: {}", e.display_with_causes());
@@ -288,7 +304,10 @@ where
         // Changing this debug statement requires changing the replica-isolation test
         tracing::debug!("ClusterClient send={:?}", &cmd);
         match cmd.try_into_timely_config() {
-            Ok((config, epoch)) => self.build(config, epoch).await,
+            Ok((config, epoch, instance_id, persist_location)) => {
+                self.build(config, epoch, instance_id, persist_location)
+                    .await
+            }
             Err(cmd) => self.inner.as_mut().expect("initialized").send(cmd).await,
         }
     }

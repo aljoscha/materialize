@@ -20,6 +20,7 @@ use mz_cluster_client::client::ClusterStartupEpoch;
 use mz_expr::RowSetFinishing;
 use mz_ore::cast::CastFrom;
 use mz_ore::tracing::OpenTelemetryContext;
+use mz_persist_client::PersistLocation;
 use mz_repr::{GlobalId, Row};
 use mz_storage_client::controller::{ReadPolicy, StorageController};
 use thiserror::Error;
@@ -29,7 +30,7 @@ use uuid::Uuid;
 
 use crate::controller::error::CollectionMissing;
 use crate::controller::replica::{Replica, ReplicaConfig};
-use crate::controller::{CollectionState, ComputeControllerResponse, ReplicaId};
+use crate::controller::{CollectionState, ComputeControllerResponse, ComputeInstanceId, ReplicaId};
 use crate::logging::LogVariant;
 use crate::metrics::InstanceMetrics;
 use crate::metrics::UIntGauge;
@@ -247,6 +248,8 @@ where
         envd_epoch: NonZeroI64,
         metrics: InstanceMetrics,
         durable_cmd_protocol: DurableProtocol<T>,
+        instance_id: ComputeInstanceId,
+        persist_location: PersistLocation,
     ) -> Self {
         let collections = arranged_logs
             .iter()
@@ -277,6 +280,8 @@ where
         instance.send(ComputeCommand::CreateTimely {
             config: Default::default(),
             epoch: ClusterStartupEpoch::new(envd_epoch, 0),
+            instance_id,
+            persist_location,
         });
 
         let dummy_logging_config = Default::default();

@@ -292,7 +292,13 @@ impl CommandSpecialization {
             *logging = self.logging_config.clone();
         }
 
-        if let ComputeCommand::CreateTimely { config, epoch } = command {
+        if let ComputeCommand::CreateTimely {
+            config,
+            epoch,
+            instance_id: _,
+            persist_location: _,
+        } = command
+        {
             *config = self.timely_config.clone();
             *epoch = self.epoch;
         }

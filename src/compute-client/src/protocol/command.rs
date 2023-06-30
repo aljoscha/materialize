@@ -15,6 +15,7 @@ use mz_cluster_client::client::{ClusterStartupEpoch, TimelyConfig};
 use mz_expr::RowSetFinishing;
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_persist_client::cfg::PersistParameters;
+use mz_persist_client::PersistLocation;
 use mz_proto::{any_uuid, IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
 use mz_repr::{GlobalId, Row};
 use mz_storage_client::client::ProtoAllowCompaction;
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use timely::progress::frontier::Antichain;
 use uuid::Uuid;
 
+use crate::controller::ComputeInstanceId;
 use crate::logging::LoggingConfig;
 use crate::types::dataflows::DataflowDescription;
 
@@ -60,6 +62,8 @@ pub enum ComputeCommand<T = mz_repr::Timestamp> {
     CreateTimely {
         config: TimelyConfig,
         epoch: ClusterStartupEpoch,
+        instance_id: ComputeInstanceId,
+        persist_location: PersistLocation,
     },
 
     /// `CreateInstance` must be sent after `CreateTimely` to complete the [Creation Stage] of the
@@ -229,9 +233,17 @@ impl RustType<ProtoComputeCommand> for ComputeCommand<mz_repr::Timestamp> {
         use proto_compute_command::*;
         ProtoComputeCommand {
             kind: Some(match self {
-                ComputeCommand::CreateTimely { config, epoch } => CreateTimely(ProtoCreateTimely {
+                ComputeCommand::CreateTimely {
+                    config,
+                    epoch,
+                    instance_id,
+                    persist_location,
+                } => CreateTimely(ProtoCreateTimely {
                     config: Some(config.into_proto()),
                     epoch: Some(epoch.into_proto()),
+                    instance_id: Some(instance_id.into_proto()),
+                    persist_blob_uri: persist_location.blob_uri.clone(),
+                    persist_consensus_uri: persist_location.consensus_uri.clone(),
                 }),
                 ComputeCommand::CreateInstance(logging) => CreateInstance(logging.into_proto()),
                 ComputeCommand::InitializationComplete => InitializationComplete(()),
@@ -260,10 +272,22 @@ impl RustType<ProtoComputeCommand> for ComputeCommand<mz_repr::Timestamp> {
         use proto_compute_command::Kind::*;
         use proto_compute_command::*;
         match proto.kind {
-            Some(CreateTimely(ProtoCreateTimely { config, epoch })) => {
+            Some(CreateTimely(ProtoCreateTimely {
+                config,
+                epoch,
+                instance_id,
+                persist_blob_uri: blob_uri,
+                persist_consensus_uri: consensus_uri,
+            })) => {
+                let persist_location = PersistLocation {
+                    blob_uri,
+                    consensus_uri,
+                };
                 Ok(ComputeCommand::CreateTimely {
                     config: config.into_rust_if_some("ProtoCreateTimely::config")?,
                     epoch: epoch.into_rust_if_some("ProtoCreateTimely::epoch")?,
+                    instance_id: instance_id.into_rust_if_some("ProtoCreateTimely::instance_id")?,
+                    persist_location,
                 })
             }
             Some(CreateInstance(logging)) => {

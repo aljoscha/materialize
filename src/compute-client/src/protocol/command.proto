@@ -20,6 +20,7 @@ import "repr/src/row.proto";
 import "cluster-client/src/client.proto";
 import "storage-client/src/client.proto";
 import "storage-client/src/types/parameters.proto";
+import "storage-client/src/types/instances.proto";
 
 import "google/protobuf/empty.proto";
 
@@ -37,6 +38,9 @@ message ProtoComputeCommand {
     message ProtoCreateTimely {
         mz_cluster_client.client.ProtoTimelyConfig config = 1;
         mz_cluster_client.client.ProtoClusterStartupEpoch epoch = 2;
+        mz_storage_client.types.instances.ProtoStorageInstanceId instance_id = 3;
+        string persist_blob_uri = 4;
+        string persist_consensus_uri = 5;
     }
 
     oneof kind {

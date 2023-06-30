@@ -18,6 +18,7 @@ use std::sync::Arc;
 use anyhow::Error;
 use crossbeam_channel::{RecvError, TryRecvError};
 use mz_cluster::server::TimelyContainerRef;
+use mz_compute_client::controller::ComputeInstanceId;
 use mz_compute_client::protocol::command::ComputeCommand;
 use mz_compute_client::protocol::history::ComputeCommandHistory;
 use mz_compute_client::protocol::response::ComputeResponse;
@@ -26,6 +27,7 @@ use mz_compute_client::types::dataflows::{BuildDesc, DataflowDescription};
 use mz_ore::cast::CastFrom;
 use mz_ore::halt;
 use mz_persist_client::cache::PersistClientCache;
+use mz_persist_client::PersistLocation;
 use timely::communication::Allocate;
 use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::generic::source;
@@ -144,6 +146,12 @@ struct Worker<'w, A: Allocate> {
     /// A process-global cache of (blob_uri, consensus_uri) -> PersistClient.
     /// This is intentionally shared between workers
     persist_clients: Arc<PersistClientCache>,
+    /// Things we were told when starting the cluster/replica. We need those to connect to the
+    /// durable control log.
+    instance_id: ComputeInstanceId,
+    /// Things we were told when starting the cluster/replica. We need those to connect to the
+    /// durable control log.
+    persist_location: PersistLocation,
 }
 
 impl mz_cluster::types::AsRunnableWorker<ComputeCommand, ComputeResponse> for Config {
@@ -157,6 +165,8 @@ impl mz_cluster::types::AsRunnableWorker<ComputeCommand, ComputeResponse> for Co
             ActivatorSender,
         )>,
         persist_clients: Arc<PersistClientCache>,
+        instance_id: Option<ComputeInstanceId>,
+        persist_location: Option<PersistLocation>,
     ) {
         Worker {
             timely_worker,
@@ -165,6 +175,8 @@ impl mz_cluster::types::AsRunnableWorker<ComputeCommand, ComputeResponse> for Co
             compute_metrics: config.compute_metrics,
             persist_clients,
             compute_state: None,
+            instance_id: instance_id.expect("must have instance_id for compute cluster"),
+            persist_location: persist_location.expect("must have instance_id for compute cluster"),
         }
         .run()
     }

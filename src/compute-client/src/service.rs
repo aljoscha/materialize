@@ -234,12 +234,24 @@ where
         //  * Forward `CreateTimely` commands to all shards.
         //  * Forward all other commands to the first shard only.
         match command {
-            ComputeCommand::CreateTimely { config, epoch } => {
+            ComputeCommand::CreateTimely {
+                config,
+                epoch,
+                instance_id,
+                persist_location,
+            } => {
                 let timely_cmds = config.split_command(self.parts);
 
                 timely_cmds
                     .into_iter()
-                    .map(|config| Some(ComputeCommand::CreateTimely { config, epoch }))
+                    .map(|config| {
+                        Some(ComputeCommand::CreateTimely {
+                            config,
+                            epoch,
+                            instance_id,
+                            persist_location: persist_location.clone(),
+                        })
+                    })
                     .collect()
             }
             command => {

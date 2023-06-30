@@ -281,6 +281,8 @@ where
                 self.envd_epoch,
                 self.metrics.for_instance(id),
                 durable_cmd_protocol,
+                id,
+                self.persist_location.clone(),
             ),
         );
 
