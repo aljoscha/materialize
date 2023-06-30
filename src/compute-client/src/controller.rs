@@ -32,6 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroI64;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -43,6 +44,8 @@ use mz_expr::RowSetFinishing;
 use mz_orchestrator::ServiceProcessMetrics;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::tracing::OpenTelemetryContext;
+use mz_persist_client::cache::PersistClientCache;
+use mz_persist_client::PersistLocation;
 use mz_repr::{GlobalId, Row};
 use mz_storage_client::controller::{ReadPolicy, StorageController};
 use mz_storage_client::types::instances::StorageInstanceId;
@@ -62,6 +65,7 @@ use crate::controller::replica::ReplicaConfig;
 use crate::logging::{LogVariant, LoggingConfig};
 use crate::metrics::ComputeControllerMetrics;
 use crate::protocol::command::ComputeParameters;
+use crate::protocol::durable_protocol;
 use crate::protocol::response::{ComputeResponse, PeekResponse, SubscribeResponse};
 use crate::service::{ComputeClient, ComputeGrpcClient};
 use crate::types::dataflows::DataflowDescription;
@@ -142,7 +146,7 @@ impl ComputeReplicaLogging {
 }
 
 /// A controller for the compute layer.
-pub struct ComputeController<T> {
+pub struct ComputeController<T: Timestamp> {
     instances: BTreeMap<ComputeInstanceId, Instance<T>>,
     build_info: &'static BuildInfo,
     /// Set to `true` once `initialization_complete` has been called.
@@ -160,15 +164,21 @@ pub struct ComputeController<T> {
     stats_update_ticker: tokio::time::Interval,
     /// Set to `true` if `process` should produce a `ReplicaWriteFrontiers` next.
     stats_update_pending: bool,
+    /// The persist location where all storage collections are being written to
+    persist_location: PersistLocation,
+    /// A persist client used to write to storage collections
+    persist: Arc<PersistClientCache>,
     /// The compute controller metrics
     metrics: ComputeControllerMetrics,
 }
 
-impl<T> ComputeController<T> {
+impl<T: Timestamp> ComputeController<T> {
     /// Construct a new [`ComputeController`].
     pub fn new(
         build_info: &'static BuildInfo,
         envd_epoch: NonZeroI64,
+        persist_location: PersistLocation,
+        persist_clients: Arc<PersistClientCache>,
         metrics_registry: MetricsRegistry,
     ) -> Self {
         let mut stats_update_ticker = tokio::time::interval(Duration::from_secs(1));
@@ -185,6 +195,8 @@ impl<T> ComputeController<T> {
             envd_epoch,
             stats_update_ticker,
             stats_update_pending: false,
+            persist_location,
+            persist: persist_clients,
             metrics: ComputeControllerMetrics::new(metrics_registry),
         }
     }
@@ -242,7 +254,7 @@ where
     ComputeGrpcClient: ComputeClient<T>,
 {
     /// Create a compute instance.
-    pub fn create_instance(
+    pub async fn create_instance(
         &mut self,
         id: ComputeInstanceId,
         arranged_logs: BTreeMap<LogVariant, GlobalId>,
@@ -251,6 +263,16 @@ where
             return Err(InstanceExists(id));
         }
 
+        let persist_client = self
+            .persist
+            .open(self.persist_location.clone())
+            .await
+            .unwrap();
+
+        let shard_id = mz_persist_client::PersistClient::COMPUTE_PROTOCOL_SHARD;
+        let durable_cmd_protocol: durable_protocol::DurableProtocol<T> =
+            durable_protocol::DurableProtocol::new(id, shard_id, persist_client).await;
+
         self.instances.insert(
             id,
             Instance::new(
@@ -258,6 +280,7 @@ where
                 arranged_logs,
                 self.envd_epoch,
                 self.metrics.for_instance(id),
+                durable_cmd_protocol,
             ),
         );
 
@@ -373,12 +396,12 @@ where
 }
 
 /// A wrapper around a [`ComputeController`] with a live connection to a storage controller.
-pub struct ActiveComputeController<'a, T> {
+pub struct ActiveComputeController<'a, T: Timestamp> {
     compute: &'a mut ComputeController<T>,
     storage: &'a mut dyn StorageController<Timestamp = T>,
 }
 
-impl<T> ActiveComputeController<'_, T> {
+impl<T: Timestamp> ActiveComputeController<'_, T> {
     pub fn instance_exists(&self, id: ComputeInstanceId) -> bool {
         self.compute.instance_exists(id)
     }
@@ -623,12 +646,12 @@ where
 
 /// A read-only handle to a compute instance.
 #[derive(Debug, Clone, Copy)]
-pub struct ComputeInstanceRef<'a, T> {
+pub struct ComputeInstanceRef<'a, T: Timestamp> {
     instance_id: ComputeInstanceId,
     instance: &'a Instance<T>,
 }
 
-impl<T> ComputeInstanceRef<'_, T> {
+impl<T: Timestamp> ComputeInstanceRef<'_, T> {
     /// Return the ID of this compute instance.
     pub fn instance_id(&self) -> ComputeInstanceId {
         self.instance_id

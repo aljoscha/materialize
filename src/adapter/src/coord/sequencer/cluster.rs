@@ -373,6 +373,7 @@ impl Coordinator {
                     arranged_logs: cluster.log_indexes.clone(),
                 },
             )
+            .await
             .expect("creating cluster must not fail");
 
         let replicas: Vec<_> = cluster

@@ -215,7 +215,7 @@ enum Readiness {
 }
 
 /// A client that maintains soft state and validates commands, in addition to forwarding them.
-pub struct Controller<T = mz_repr::Timestamp> {
+pub struct Controller<T: Timestamp = mz_repr::Timestamp> {
     pub storage: Box<dyn StorageController<Timestamp = T>>,
     pub compute: ComputeController<T>,
     /// The clusterd image to use when starting new cluster processes.
@@ -237,7 +237,7 @@ pub struct Controller<T = mz_repr::Timestamp> {
     persist_pubsub_url: String,
 }
 
-impl<T> Controller<T> {
+impl<T: Timestamp> Controller<T> {
     pub fn active_compute(&mut self) -> ActiveComputeController<T> {
         self.compute.activate(&mut *self.storage)
     }
@@ -345,8 +345,8 @@ where
         let storage_controller = mz_storage_client::controller::Controller::new(
             config.build_info,
             config.storage_stash_url,
-            config.persist_location,
-            config.persist_clients,
+            config.persist_location.clone(),
+            Arc::clone(&config.persist_clients),
             config.now,
             &config.postgres_factory,
             envd_epoch,
@@ -358,6 +358,8 @@ where
         let compute_controller = ComputeController::new(
             config.build_info,
             envd_epoch,
+            config.persist_location,
+            config.persist_clients,
             config.metrics_registry.clone(),
         );
         let (metrics_tx, metrics_rx) = mpsc::unbounded_channel();

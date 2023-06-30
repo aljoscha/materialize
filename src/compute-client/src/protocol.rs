@@ -113,5 +113,6 @@
 //! [`SubscribeResponse::DroppedAt`]: self::response::SubscribeResponse::DroppedAt
 
 pub mod command;
+pub mod durable_protocol;
 pub mod history;
 pub mod response;

@@ -52,7 +52,7 @@ use crate::util::{ComputeSinkId, ResultExt};
 use crate::{catalog, AdapterError, AdapterNotice};
 
 /// State provided to a catalog transaction closure.
-pub struct CatalogTxn<'a, T> {
+pub struct CatalogTxn<'a, T: timely::progress::Timestamp> {
     pub(crate) dataflow_client: &'a mz_controller::Controller<T>,
     pub(crate) catalog: &'a CatalogState,
 }

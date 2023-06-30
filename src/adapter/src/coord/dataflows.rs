@@ -50,7 +50,7 @@ use crate::util::{viewable_variables, ResultExt};
 use crate::{rbac, AdapterError};
 
 /// Borrows of catalog and indexes sufficient to build dataflow descriptions.
-pub struct DataflowBuilder<'a, T> {
+pub struct DataflowBuilder<'a, T: timely::progress::Timestamp> {
     pub catalog: &'a CatalogState,
     /// A handle to the compute abstraction, which describes indexes by identifier.
     ///
@@ -610,7 +610,7 @@ impl<'a> DataflowBuilder<'a, mz_repr::Timestamp> {
     }
 }
 
-impl<'a, T> CheckedRecursion for DataflowBuilder<'a, T> {
+impl<'a, T: timely::progress::Timestamp> CheckedRecursion for DataflowBuilder<'a, T> {
     fn recursion_guard(&self) -> &RecursionGuard {
         &self.recursion_guard
     }

@@ -3744,6 +3744,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "bytes",
  "bytesize",
  "chrono",
  "columnation",

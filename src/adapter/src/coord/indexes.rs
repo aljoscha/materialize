@@ -21,7 +21,7 @@ use crate::coord::{CollectionIdBundle, Coordinator};
 /// Answers questions about the indexes available on a particular compute
 /// instance.
 #[derive(Debug)]
-pub struct ComputeInstanceIndexOracle<'a, T> {
+pub struct ComputeInstanceIndexOracle<'a, T: timely::progress::Timestamp> {
     catalog: &'a CatalogState,
     compute: ComputeInstanceRef<'a, T>,
 }
@@ -43,7 +43,7 @@ impl Coordinator {
     }
 }
 
-impl<T: Copy> DataflowBuilder<'_, T> {
+impl<T: Copy + timely::progress::Timestamp> DataflowBuilder<'_, T> {
     /// Creates a new index oracle for the same compute instance as the dataflow
     /// builder.
     pub fn index_oracle(&self) -> ComputeInstanceIndexOracle<T> {

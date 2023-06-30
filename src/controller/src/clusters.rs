@@ -215,13 +215,15 @@ where
     /// A cluster is a combination of a storage instance and a compute instance.
     /// A cluster has zero or more replicas; each replica colocates the storage
     /// and compute layers on the same physical resources.
-    pub fn create_cluster(
+    pub async fn create_cluster(
         &mut self,
         id: ClusterId,
         config: ClusterConfig,
     ) -> Result<(), anyhow::Error> {
         self.storage.create_instance(id);
-        self.compute.create_instance(id, config.arranged_logs)?;
+        self.compute
+            .create_instance(id, config.arranged_logs)
+            .await?;
         Ok(())
     }
 

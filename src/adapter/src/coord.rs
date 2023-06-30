@@ -852,12 +852,14 @@ impl Coordinator {
         info!("coordinator init: creating compute replicas");
         let mut replicas_to_start = vec![];
         for instance in self.catalog.clusters() {
-            self.controller.create_cluster(
-                instance.id,
-                ClusterConfig {
-                    arranged_logs: instance.log_indexes.clone(),
-                },
-            )?;
+            self.controller
+                .create_cluster(
+                    instance.id,
+                    ClusterConfig {
+                        arranged_logs: instance.log_indexes.clone(),
+                    },
+                )
+                .await?;
             for (replica_id, replica) in instance.replicas_by_id.clone() {
                 let role = instance.role();
                 replicas_to_start.push(CreateReplicaConfig {

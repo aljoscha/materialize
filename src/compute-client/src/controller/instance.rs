@@ -34,6 +34,7 @@ use crate::logging::LogVariant;
 use crate::metrics::InstanceMetrics;
 use crate::metrics::UIntGauge;
 use crate::protocol::command::{ComputeCommand, ComputeParameters, Peek};
+use crate::protocol::durable_protocol::DurableProtocol;
 use crate::protocol::history::ComputeCommandHistory;
 use crate::protocol::response::{ComputeResponse, PeekResponse, SubscribeBatch, SubscribeResponse};
 use crate::service::{ComputeClient, ComputeGrpcClient};
@@ -93,7 +94,7 @@ pub(super) enum SubscribeTargetError {
 
 /// The state we keep for a compute instance.
 #[derive(Debug)]
-pub(super) struct Instance<T> {
+pub(super) struct Instance<T: Timestamp> {
     /// Build info for spawning replicas
     build_info: &'static BuildInfo,
     /// Whether instance initialization has been completed.
@@ -142,6 +143,8 @@ pub(super) struct Instance<T> {
     subscribes: BTreeMap<GlobalId, ActiveSubscribe<T>>,
     /// The command history, used when introducing new replicas or restarting existing replicas.
     history: ComputeCommandHistory<UIntGauge, T>,
+    /// Handle for writing to the durable protocol log.
+    durable_protocol: DurableProtocol<T>,
     /// IDs of replicas that have failed and require rehydration.
     failed_replicas: BTreeSet<ReplicaId>,
     /// Ready compute controller responses to be delivered.
@@ -154,7 +157,7 @@ pub(super) struct Instance<T> {
     metrics: InstanceMetrics,
 }
 
-impl<T> Instance<T> {
+impl<T: Timestamp> Instance<T> {
     /// Acquire a handle to the collection state associated with `id`.
     pub fn collection(&self, id: GlobalId) -> Result<&CollectionState<T>, CollectionMissing> {
         self.collections.get(&id).ok_or(CollectionMissing(id))
@@ -243,6 +246,7 @@ where
         arranged_logs: BTreeMap<LogVariant, GlobalId>,
         envd_epoch: NonZeroI64,
         metrics: InstanceMetrics,
+        durable_cmd_protocol: DurableProtocol<T>,
     ) -> Self {
         let collections = arranged_logs
             .iter()
@@ -262,6 +266,7 @@ where
             peeks: Default::default(),
             subscribes: Default::default(),
             history,
+            durable_protocol: durable_cmd_protocol,
             failed_replicas: Default::default(),
             ready_responses: Default::default(),
             envd_epoch,
@@ -314,6 +319,8 @@ where
     pub fn send(&mut self, cmd: ComputeCommand<T>) {
         // Record the command so that new replicas can be brought up to speed.
         self.history.push(cmd.clone(), &self.peeks);
+
+        self.durable_protocol.send(cmd.clone());
 
         // Clone the command for each active replica.
         for (id, replica) in self.replicas.iter_mut() {
@@ -389,7 +396,7 @@ where
 
 /// A wrapper around [`Instance`] with a live storage controller.
 #[derive(Debug)]
-pub(super) struct ActiveInstance<'a, T> {
+pub(super) struct ActiveInstance<'a, T: Timestamp> {
     compute: &'a mut Instance<T>,
     storage_controller: &'a mut dyn StorageController<Timestamp = T>,
 }
