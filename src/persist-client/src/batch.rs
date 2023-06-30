@@ -32,7 +32,7 @@ use semver::Version;
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tokio::task::JoinHandle;
-use tracing::{debug_span, error, instrument, trace_span, warn, Instrument};
+use tracing::{debug, debug_span, error, instrument, trace_span, Instrument};
 
 use crate::async_runtime::CpuHeavyRuntime;
 use crate::error::InvalidUsage;
@@ -77,7 +77,7 @@ where
 {
     fn drop(&mut self) {
         if self.batch.parts.len() > 0 {
-            warn!(
+            debug!(
                 "un-consumed Batch, with {} dangling blob keys: {:?}",
                 self.batch.parts.len(),
                 self.batch
