@@ -35,7 +35,7 @@ use crate::logging::LogVariant;
 use crate::metrics::InstanceMetrics;
 use crate::metrics::UIntGauge;
 use crate::protocol::command::{ComputeCommand, ComputeParameters, Peek};
-use crate::protocol::durable_protocol::DurableProtocol;
+use crate::protocol::durable_protocol::DurableProtocolWriter;
 use crate::protocol::history::ComputeCommandHistory;
 use crate::protocol::response::{ComputeResponse, PeekResponse, SubscribeBatch, SubscribeResponse};
 use crate::service::{ComputeClient, ComputeGrpcClient};
@@ -145,7 +145,7 @@ pub(super) struct Instance<T: Timestamp> {
     /// The command history, used when introducing new replicas or restarting existing replicas.
     history: ComputeCommandHistory<UIntGauge, T>,
     /// Handle for writing to the durable protocol log.
-    durable_protocol: DurableProtocol<T>,
+    durable_protocol: DurableProtocolWriter<T>,
     /// IDs of replicas that have failed and require rehydration.
     failed_replicas: BTreeSet<ReplicaId>,
     /// Ready compute controller responses to be delivered.
@@ -247,7 +247,7 @@ where
         arranged_logs: BTreeMap<LogVariant, GlobalId>,
         envd_epoch: NonZeroI64,
         metrics: InstanceMetrics,
-        durable_cmd_protocol: DurableProtocol<T>,
+        durable_cmd_protocol: DurableProtocolWriter<T>,
         instance_id: ComputeInstanceId,
         persist_location: PersistLocation,
     ) -> Self {

@@ -41,17 +41,17 @@ use crate::types::sinks::{ComputeSinkConnection, ComputeSinkDesc};
 use crate::types::sources::SourceInstanceDesc;
 
 #[derive(Debug)]
-pub struct DurableProtocol<T: Timestamp = mz_repr::Timestamp> {
+pub struct DurableProtocolWriter<T: Timestamp = mz_repr::Timestamp> {
     tx: UnboundedSender<(tracing::Span, ComputeCommand<T>)>,
 }
 
-impl<T: Timestamp> DurableProtocol<T> {
+impl<T: Timestamp> DurableProtocolWriter<T> {
     pub async fn new(
         instance_id: ComputeInstanceId,
         shard_id: ShardId,
         persist_client: PersistClient,
-    ) -> DurableProtocol<T> {
-        let purpose = "DurableCoordState".to_string();
+    ) -> DurableProtocolWriter<T> {
+        let purpose = "DurableProtocolWriter".to_string();
         let (mut write_handle, mut read_handle) = persist_client
             .open(
                 shard_id,

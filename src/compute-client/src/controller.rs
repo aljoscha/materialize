@@ -270,8 +270,8 @@ where
             .unwrap();
 
         let shard_id = mz_persist_client::PersistClient::COMPUTE_PROTOCOL_SHARD;
-        let durable_cmd_protocol: durable_protocol::DurableProtocol<T> =
-            durable_protocol::DurableProtocol::new(id, shard_id, persist_client).await;
+        let durable_cmd_protocol: durable_protocol::DurableProtocolWriter<T> =
+            durable_protocol::DurableProtocolWriter::new(id, shard_id, persist_client).await;
 
         self.instances.insert(
             id,
