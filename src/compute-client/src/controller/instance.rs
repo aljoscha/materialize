@@ -320,19 +320,27 @@ where
     }
 
     /// Sends a command to all replicas of this instance.
-    #[tracing::instrument(level = "debug", skip(self))]
     pub fn send(&mut self, cmd: ComputeCommand<T>) {
         // Record the command so that new replicas can be brought up to speed.
-        self.history.push(cmd.clone(), &self.peeks);
 
-        self.durable_protocol.send(cmd.clone());
+        let ephemeral_cmd = match &cmd {
+            create_timely @ ComputeCommand::CreateTimely { .. } => Some(create_timely),
+            create_instance @ ComputeCommand::CreateInstance(_) => Some(create_instance),
+            init_complete @ ComputeCommand::InitializationComplete => Some(init_complete),
+            _ => None,
+        };
 
-        // Clone the command for each active replica.
-        for (id, replica) in self.replicas.iter_mut() {
-            // If sending the command fails, the replica requires rehydration.
-            if replica.send(cmd.clone()).is_err() {
-                self.failed_replicas.insert(*id);
+        if let Some(ephemeral_cmd) = ephemeral_cmd {
+            self.history.push(ephemeral_cmd.clone(), &self.peeks);
+            // Clone the command for each active replica.
+            for (id, replica) in self.replicas.iter_mut() {
+                // If sending the command fails, the replica requires rehydration.
+                if replica.send(ephemeral_cmd.clone()).is_err() {
+                    self.failed_replicas.insert(*id);
+                }
             }
+        } else {
+            self.durable_protocol.send(cmd.clone());
         }
     }
 

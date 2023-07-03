@@ -20,6 +20,7 @@ use crossbeam_channel::{RecvError, TryRecvError};
 use mz_cluster::server::TimelyContainerRef;
 use mz_compute_client::controller::ComputeInstanceId;
 use mz_compute_client::protocol::command::ComputeCommand;
+use mz_compute_client::protocol::durable_protocol::DurableProtocolListener;
 use mz_compute_client::protocol::history::ComputeCommandHistory;
 use mz_compute_client::protocol::response::ComputeResponse;
 use mz_compute_client::service::ComputeClient;
@@ -28,14 +29,16 @@ use mz_ore::cast::CastFrom;
 use mz_ore::halt;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::PersistLocation;
+use mz_timely_util::builder_async::OperatorBuilder as AsyncOperatorBuilder;
 use timely::communication::Allocate;
-use timely::dataflow::channels::pact::Exchange;
+use timely::dataflow::channels::pact::{Exchange, Pipeline};
 use timely::dataflow::operators::generic::source;
-use timely::dataflow::operators::Operator;
+use timely::dataflow::operators::{Inspect, Operator};
 use timely::progress::{Antichain, Timestamp};
 use timely::scheduling::{Scheduler, SyncActivator};
 use timely::worker::Worker as TimelyWorker;
 use tokio::sync::mpsc;
+use tracing::info;
 
 use crate::compute_state::{ActiveComputeState, ComputeState, ReportedFrontier};
 use crate::logging::compute::ComputeEvent;
@@ -258,9 +261,14 @@ impl<'w, A: Allocate> Worker<'w, A> {
 
         {
             let cmd_queue = Rc::clone(&cmd_queue);
+            let cmd_queue_2 = Rc::clone(&cmd_queue);
+
+            let persist_clients = Arc::clone(&mut self.persist_clients);
+            let persist_location = self.persist_location.clone();
+            let instance_id = self.instance_id.clone();
 
             self.timely_worker.dataflow::<u64, _, _>(move |scope| {
-                source(scope, "CmdSource", |capability, info| {
+                let cmds = source(scope, "CmdSource", |capability, info| {
                     // Send activator for this operator back
                     let activator = scope.sync_activator_for(&info.address[..]);
                     activator_tx.send(activator).expect("activator_tx working");
@@ -306,14 +314,40 @@ impl<'w, A: Allocate> Worker<'w, A> {
                             cap_opt = None;
                         }
                     }
-                })
-                .unary_frontier::<Vec<()>, _, _, _>(
+                });
+
+                cmds.inspect(|(_, cmd)| match cmd {
+                    ComputeCommand::UpdateConfiguration(_) => {
+                        // Don't log!
+                    }
+                    ComputeCommand::CreateDataflows(dataflows) => {
+                        info!("ephemeral: {:?}", dataflows);
+                    }
+                    ComputeCommand::AllowCompaction(as_ofs) => {
+                        for (id, as_of) in as_ofs {
+                            if !id.is_system() {
+                                info!("ephemeral: {id}: {:?}", as_of);
+                            }
+                        }
+                    }
+                    ComputeCommand::Peek(peek) => {
+                        info!("ephemeral {:?}", peek);
+                    }
+                    ComputeCommand::CancelPeeks { uuids } => {
+                        info!("ephemeral: cancel peeks {:?}", uuids);
+                    }
+                    ComputeCommand::CreateTimely { .. } => (),
+                    ComputeCommand::CreateInstance(_) => (),
+                    ComputeCommand::InitializationComplete => (),
+                });
+
+                cmds.unary_frontier::<Vec<()>, _, _, _>(
                     Exchange::new(|(idx, _)| u64::cast_from(*idx)),
                     "CmdReceiver",
                     |_, _| {
                         let mut container = Default::default();
                         move |input, _| {
-                            let mut queue = cmd_queue.borrow_mut();
+                            let mut queue = cmd_queue_2.borrow_mut();
                             if input.frontier().is_empty() {
                                 queue.push_back(Err(TryRecvError::Disconnected))
                             }
@@ -326,6 +360,76 @@ impl<'w, A: Allocate> Worker<'w, A> {
                         }
                     },
                 );
+
+                let mut builder =
+                    AsyncOperatorBuilder::new(format!("cmd_protocol_listener"), scope.clone());
+
+                let (mut cmd_output, durable_cmd_stream) = builder.new_output();
+
+                let _shutdown_button = builder.build(move |mut capabilities| async move {
+                    let mut cap = capabilities.pop().expect("missing capability");
+
+                    let persist_client = persist_clients.open(persist_location).await.unwrap();
+
+                    let shard_id = mz_persist_client::PersistClient::COMPUTE_PROTOCOL_SHARD;
+
+                    let mut durable_protocol_listener =
+                        DurableProtocolListener::<mz_repr::Timestamp>::new(
+                            instance_id,
+                            shard_id,
+                            persist_client,
+                        )
+                        .await;
+
+                    loop {
+                        let mut cmds = durable_protocol_listener.fetch_next().await;
+                        cmd_output.give_container(&cap, &mut cmds).await;
+                        cap.downgrade(&(*cap.time() + 1));
+                    }
+                });
+
+                durable_cmd_stream.unary_frontier::<Vec<()>, _, _, _>(
+                    Pipeline,
+                    "DurableCmdReceiver",
+                    |_, _| {
+                        let mut container = Default::default();
+                        move |input, _| {
+                            let mut queue = cmd_queue.borrow_mut();
+                            if input.frontier().is_empty() {
+                                queue.push_back(Err(TryRecvError::Disconnected))
+                            }
+                            while let Some((_, data)) = input.next() {
+                                data.swap(&mut container);
+                                for cmd in container.drain(..) {
+                                    queue.push_back(Ok(cmd));
+                                }
+                            }
+                        }
+                    },
+                );
+
+                durable_cmd_stream.inspect(|cmd| match cmd {
+                    ComputeCommand::UpdateConfiguration(_) => {
+                        // Don't log!
+                    }
+                    ComputeCommand::CreateDataflows(dataflows) => {
+                        info!("durable: {:?}", dataflows);
+                    }
+                    ComputeCommand::AllowCompaction(as_ofs) => {
+                        for (id, as_of) in as_ofs {
+                            if !id.is_system() {
+                                info!("durable: {id}: {:?}", as_of);
+                            }
+                        }
+                    }
+                    ComputeCommand::Peek(peek) => {
+                        info!("durable {:?}", peek);
+                    }
+                    ComputeCommand::CancelPeeks { .. } => todo!(),
+                    ComputeCommand::CreateTimely { .. } => unreachable!(),
+                    ComputeCommand::CreateInstance(_) => unreachable!(),
+                    ComputeCommand::InitializationComplete => unreachable!(),
+                });
             });
         }
 
