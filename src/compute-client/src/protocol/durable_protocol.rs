@@ -22,8 +22,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info};
 
 use mz_persist_client::error::UpperMismatch;
-use mz_persist_client::read::Listen;
 use mz_persist_client::read::ListenEvent;
+use mz_persist_client::read::{Listen, Subscribe};
 use mz_persist_client::write::WriteHandle;
 use mz_persist_client::PersistClient;
 use mz_persist_client::ShardId;
@@ -508,7 +508,7 @@ impl<T: Timestamp> DurableProtocolWorker<T> {
     // full diffs. And only collapse them down to a map when needed. And also
     // ensure that there is only one entry for a given `GlobalId` then.
     fn apply_updates(&mut self, mut updates: Vec<(TargetedDurableComputeCommand<T>, u64, i64)>) {
-        let interesting_cmds = updates
+        let _interesting_cmds = updates
             .iter()
             .cloned()
             .filter(|(cmd, _ts, _diff)| cmd.0 == self.instance_id)
@@ -517,9 +517,9 @@ impl<T: Timestamp> DurableProtocolWorker<T> {
             })
             .map(|(cmd, _ts, diff)| (cmd.1, diff))
             .collect_vec();
-        if !interesting_cmds.is_empty() {
-            info!("durable protocol updates: {:?}", interesting_cmds);
-        }
+        // if !interesting_cmds.is_empty() {
+        //     info!("durable protocol updates: {:?}", interesting_cmds);
+        // }
 
         self.trace.append(&mut updates);
 
@@ -603,6 +603,176 @@ impl<T: Timestamp> DurableProtocolWorker<T> {
                 _ => (), // Ignore.
             }
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct DurableProtocolListener<T: Timestamp = mz_repr::Timestamp> {
+    instance_id: ComputeInstanceId,
+
+    // Current state corresponding to what's in the trace/shard.
+    current_configuration: Option<ComputeParameters>,
+    current_dataflows: BTreeMap<
+        DurableDataflowDescription<crate::plan::Plan<T>, CollectionMetadata, T>,
+        Vec<GlobalId>,
+    >,
+    current_as_ofs: BTreeMap<GlobalId, Antichain<T>>,
+    current_peeks: BTreeMap<uuid::Uuid, Peek<T>>,
+
+    stash: Vec<(DurableComputeCommand<T>, u64, i64)>,
+
+    subscribe: Subscribe<TargetedDurableComputeCommand<T>, (), u64, i64>,
+}
+
+impl<T: Timestamp> DurableProtocolListener<T> {
+    pub async fn new(
+        instance_id: ComputeInstanceId,
+        shard_id: ShardId,
+        persist_client: PersistClient,
+    ) -> DurableProtocolListener<T> {
+        let purpose = "DurableProtocolListener".to_string();
+        let read_handle = persist_client
+            .open_leased_reader(
+                shard_id,
+                &purpose,
+                Arc::new(TodoSchema::default()),
+                Arc::new(UnitSchema),
+            )
+            .await
+            .expect("invalid usage");
+
+        let since = read_handle.since().clone();
+        let subscribe = read_handle.subscribe(since).await.expect("invalid usage");
+
+        let this = DurableProtocolListener {
+            instance_id,
+            current_configuration: None,
+            current_dataflows: BTreeMap::new(),
+            current_as_ofs: BTreeMap::new(),
+            current_peeks: BTreeMap::new(),
+            subscribe,
+            stash: Vec::new(),
+        };
+
+        this
+    }
+
+    pub async fn fetch_next(&mut self) -> Vec<ComputeCommand<T>> {
+        let mut cmds = Vec::new();
+        let events = self.subscribe.fetch_next().await;
+
+        let mut ready_durable_cmds = Vec::new();
+        for event in events {
+            match event {
+                ListenEvent::Progress(progress) => {
+                    // Yeah, this is quite inefficient, all the allocations and whatnot.
+                    let ready_cmds = self
+                        .stash
+                        .iter()
+                        .filter(|(_cmd, ts, _diff)| !progress.less_equal(ts))
+                        .cloned();
+                    ready_durable_cmds.extend(ready_cmds);
+                    self.stash
+                        .retain(|(_cmd, ts, _diff)| progress.less_equal(ts));
+                }
+                ListenEvent::Updates(updates) => {
+                    let mut extracted_updated = updates
+                        .into_iter()
+                        .map(|((cmd, _unit), ts, diff)| (cmd.expect("decode error"), ts, diff))
+                        .filter(|(cmd, _ts, _diff)| cmd.0 == self.instance_id)
+                        .map(|(cmd, ts, diff)| (cmd.1, ts, diff))
+                        .collect_vec();
+                    self.stash.append(&mut extracted_updated);
+                }
+            }
+        }
+
+        // TODO: We should peel off commands by timestamps, to preserve ordering.
+        ready_durable_cmds.sort_by_key(|(_cmd, ts, _diff)| *ts);
+
+        // First handle as_ofs, so that we're up to date for dataflow descriptions.
+        for durable_cmd in ready_durable_cmds.iter() {
+            // Right now, we don't care about retractions.
+            let durable_cmd = match durable_cmd {
+                (cmd, _ts, 1) => cmd,
+                _ => continue,
+            };
+            match durable_cmd {
+                DurableComputeCommand::AsOf(id, as_of) => {
+                    match self.current_as_ofs.get(id) {
+                        Some(current_as_of) => {
+                            assert!(
+                                PartialOrder::less_equal(current_as_of, &as_of.0),
+                                "current {:?}, new {:?}",
+                                current_as_of,
+                                as_of.0
+                            );
+                        }
+                        None => {}
+                    };
+                    self.current_as_ofs.insert(id.clone(), as_of.0.clone());
+                    cmds.push(ComputeCommand::AllowCompaction(vec![(
+                        id.clone(),
+                        as_of.0.clone(),
+                    )]));
+                }
+                _ => {
+                    // Ignore!
+                }
+            }
+        }
+
+        // Then, the rest of the commands.
+        for durable_cmd in ready_durable_cmds {
+            // Right now, we don't care about retractions.
+            // TODO: We need to translate retractions of Peeks to CancelPeek commands.
+            let durable_cmd = match durable_cmd {
+                (cmd, _ts, 1) => cmd,
+                _ => continue,
+            };
+            match durable_cmd {
+                DurableComputeCommand::UpdateConfiguration(config) => {
+                    match &self.current_configuration {
+                        Some(current_config) if current_config == &config => {
+                            // Nothing to do!
+                        }
+                        _ => {
+                            self.current_configuration.replace(config.clone());
+                            cmds.push(ComputeCommand::UpdateConfiguration(config));
+                        }
+                    }
+                }
+                DurableComputeCommand::CreateDataflows(dataflow) => {
+                    match self.current_dataflows.get(&dataflow) {
+                        Some(_exports) => {
+                            // Nothing to do, we already know the dataflow.
+                        }
+                        None => {
+                            self.current_dataflows
+                                .insert(dataflow.clone(), dataflow.export_ids().collect_vec());
+                            let dataflow = dataflow.into(&self.current_as_ofs);
+                            cmds.push(ComputeCommand::CreateDataflows(vec![dataflow]))
+                        }
+                    }
+                }
+                DurableComputeCommand::Peek(peek) => {
+                    match self.current_peeks.get(&peek.uuid) {
+                        Some(_peek) => {
+                            // Nothing to do, we already know the peek.
+                        }
+                        None => {
+                            self.current_peeks.insert(peek.uuid.clone(), peek.clone());
+                            cmds.push(ComputeCommand::Peek(peek));
+                        }
+                    }
+                }
+                DurableComputeCommand::AsOf(_id, _as_of) => {
+                    // Handled above!
+                }
+            }
+        }
+
+        cmds
     }
 }
 
@@ -817,6 +987,81 @@ impl<P, S, T: Timestamp> DurableDataflowDescription<P, S, T> {
         };
 
         (durable_dataflow_desc, as_ofs)
+    }
+
+    fn into(self, as_ofs: &BTreeMap<GlobalId, Antichain<T>>) -> DataflowDescription<P, S, T> {
+        let export_ids = self.export_ids().collect_vec();
+
+        let DurableDataflowDescription {
+            source_imports,
+            index_imports,
+            objects_to_build,
+            index_exports,
+            sink_exports,
+            until,
+            debug_name,
+        } = self;
+
+        // Collect all the exploded export as_ofs into a combined "global" as of for the whole
+        // DataflowDescription.
+
+        let export_as_ofs = export_ids
+            .into_iter()
+            .map(|id| as_ofs.get(&id).cloned())
+            .collect_vec();
+
+        let mut combined_as_of: Option<Antichain<T>> = None;
+
+        for export_as_of in export_as_ofs {
+            let export_as_of = match export_as_of {
+                Some(as_of) => as_of,
+                None => continue,
+            };
+
+            match combined_as_of.as_mut() {
+                Some(combined_as_of) => {
+                    combined_as_of.extend(export_as_of.into_iter());
+                }
+                None => {
+                    combined_as_of.replace(export_as_of);
+                }
+            }
+        }
+
+        let sink_exports = sink_exports
+            .into_iter()
+            .map(|(id, desc)| {
+                let DurableComputeSinkDesc {
+                    from,
+                    from_desc,
+                    connection,
+                    with_snapshot,
+                    up_to,
+                } = desc;
+                let durable_desc = ComputeSinkDesc {
+                    from,
+                    from_desc,
+                    connection,
+                    with_snapshot,
+                    up_to: up_to.0,
+                };
+
+                (id, durable_desc)
+            })
+            .collect();
+
+        let dataflow_desc = DataflowDescription {
+            source_imports,
+            index_imports,
+            objects_to_build,
+            index_exports,
+            sink_exports,
+            as_of: combined_as_of,
+            until: until.0,
+            debug_name,
+        };
+
+        dataflow_desc
     }
 
     /// Identifiers of exported objects (indexes and sinks).
