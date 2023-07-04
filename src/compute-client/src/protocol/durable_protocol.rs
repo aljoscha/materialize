@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
 use timely::PartialOrder;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{debug, info};
+use tracing::{debug, info, Instrument};
 
 use mz_persist_client::error::UpperMismatch;
 use mz_persist_client::read::ListenEvent;
@@ -186,7 +186,7 @@ pub struct DurableProtocolWorker<T: Timestamp = mz_repr::Timestamp> {
 
 impl<T: Timestamp> DurableProtocolWorker<T> {
     async fn run(mut self) {
-        while let Some((_span, cmd)) = self.rx.recv().await {
+        while let Some((span, cmd)) = self.rx.recv().await {
             loop {
                 let durable_cmds = self.absorb(&cmd);
 
@@ -236,7 +236,7 @@ impl<T: Timestamp> DurableProtocolWorker<T> {
                     break;
                 }
 
-                let res = self.commit_updates(cmds).await;
+                let res = self.commit_updates(cmds).instrument(span.clone()).await;
 
                 match res {
                     Ok(_) => {
@@ -248,7 +248,7 @@ impl<T: Timestamp> DurableProtocolWorker<T> {
                             "error while trying to append durable commands: {:?}",
                             upper_mismatch
                         );
-                        self.sync_to_recent_upper().await;
+                        self.sync_to_recent_upper().instrument(span.clone()).await;
                     }
                 }
             }
