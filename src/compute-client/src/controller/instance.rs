@@ -26,6 +26,7 @@ use mz_storage_client::controller::{ReadPolicy, StorageController};
 use thiserror::Error;
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
 use timely::PartialOrder;
+use tracing::instrument;
 use uuid::Uuid;
 
 use crate::controller::error::CollectionMissing;
@@ -322,6 +323,7 @@ where
     }
 
     /// Sends a command to all replicas of this instance.
+    #[instrument(level = "info", name = "Instance::send", skip_all)]
     pub fn send(&mut self, cmd: ComputeCommand<T>) {
         // Record the command so that new replicas can be brought up to speed.
 
