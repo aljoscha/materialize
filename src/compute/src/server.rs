@@ -375,6 +375,12 @@ impl<'w, A: Allocate> Worker<'w, A> {
                 let _shutdown_button = builder.build(move |mut capabilities| async move {
                     let mut cap = capabilities.pop().expect("missing capability");
 
+                    if idx != 0 {
+                        // Only read and distribute commands from one worker.
+                        // TODO: Actually distribute commands to all workers.
+                        return;
+                    }
+
                     let persist_client = persist_clients.open(persist_location).await.unwrap();
 
                     let mut durable_protocol_listener =
