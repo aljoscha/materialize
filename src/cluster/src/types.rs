@@ -14,7 +14,7 @@ use std::sync::Arc;
 use mz_cluster_client::client::{ClusterStartupEpoch, TimelyConfig};
 use mz_compute_client::controller::ComputeInstanceId;
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::PersistLocation;
+use mz_persist_client::{PersistLocation, ShardId};
 use timely::worker::Worker as TimelyWorker;
 
 /// A trait for letting specific server implementations hook
@@ -42,6 +42,7 @@ pub trait AsRunnableWorker<C, R> {
         persist_clients: Arc<PersistClientCache>,
         instance_id: Option<ComputeInstanceId>,
         persist_location: Option<PersistLocation>,
+        cmd_shard_id: Option<ShardId>,
     );
 }
 
@@ -58,6 +59,7 @@ pub trait TryIntoTimelyConfig {
             ClusterStartupEpoch,
             Option<ComputeInstanceId>,
             Option<PersistLocation>,
+            Option<ShardId>,
         ),
         Self,
     >
@@ -74,6 +76,7 @@ impl TryIntoTimelyConfig for mz_compute_client::protocol::command::ComputeComman
             ClusterStartupEpoch,
             Option<ComputeInstanceId>,
             Option<PersistLocation>,
+            Option<ShardId>,
         ),
         Self,
     > {
@@ -83,7 +86,14 @@ impl TryIntoTimelyConfig for mz_compute_client::protocol::command::ComputeComman
                 epoch,
                 instance_id,
                 persist_location,
-            } => Ok((config, epoch, Some(instance_id), Some(persist_location))),
+                cmd_shard_id,
+            } => Ok((
+                config,
+                epoch,
+                Some(instance_id),
+                Some(persist_location),
+                Some(cmd_shard_id),
+            )),
             cmd => Err(cmd),
         }
     }
@@ -98,12 +108,13 @@ impl TryIntoTimelyConfig for mz_storage_client::client::StorageCommand {
             ClusterStartupEpoch,
             Option<ComputeInstanceId>,
             Option<PersistLocation>,
+            Option<ShardId>,
         ),
         Self,
     > {
         match self {
             mz_storage_client::client::StorageCommand::CreateTimely { config, epoch } => {
-                Ok((config, epoch, None, None))
+                Ok((config, epoch, None, None, None))
             }
             cmd => Err(cmd),
         }

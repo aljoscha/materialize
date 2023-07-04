@@ -297,6 +297,7 @@ impl CommandSpecialization {
             epoch,
             instance_id: _,
             persist_location: _,
+            cmd_shard_id: _,
         } = command
         {
             *config = self.timely_config.clone();

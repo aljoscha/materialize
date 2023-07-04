@@ -28,7 +28,7 @@ use mz_compute_client::types::dataflows::{BuildDesc, DataflowDescription};
 use mz_ore::cast::CastFrom;
 use mz_ore::halt;
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::PersistLocation;
+use mz_persist_client::{PersistLocation, ShardId};
 use mz_timely_util::builder_async::OperatorBuilder as AsyncOperatorBuilder;
 use timely::communication::Allocate;
 use timely::dataflow::channels::pact::{Exchange, Pipeline};
@@ -155,6 +155,8 @@ struct Worker<'w, A: Allocate> {
     /// Things we were told when starting the cluster/replica. We need those to connect to the
     /// durable control log.
     persist_location: PersistLocation,
+    /// [`ShardId`] for our durable command log.
+    cmd_shard_id: ShardId,
 }
 
 impl mz_cluster::types::AsRunnableWorker<ComputeCommand, ComputeResponse> for Config {
@@ -170,6 +172,7 @@ impl mz_cluster::types::AsRunnableWorker<ComputeCommand, ComputeResponse> for Co
         persist_clients: Arc<PersistClientCache>,
         instance_id: Option<ComputeInstanceId>,
         persist_location: Option<PersistLocation>,
+        cmd_shard_id: Option<ShardId>,
     ) {
         Worker {
             timely_worker,
@@ -179,7 +182,9 @@ impl mz_cluster::types::AsRunnableWorker<ComputeCommand, ComputeResponse> for Co
             persist_clients,
             compute_state: None,
             instance_id: instance_id.expect("must have instance_id for compute cluster"),
-            persist_location: persist_location.expect("must have instance_id for compute cluster"),
+            persist_location: persist_location
+                .expect("must have persist_location for compute cluster"),
+            cmd_shard_id: cmd_shard_id.expect("must have cmd_shard_id for compute cluster"),
         }
         .run()
     }
@@ -266,6 +271,7 @@ impl<'w, A: Allocate> Worker<'w, A> {
             let persist_clients = Arc::clone(&mut self.persist_clients);
             let persist_location = self.persist_location.clone();
             let instance_id = self.instance_id.clone();
+            let cmd_shard_id = self.cmd_shard_id.clone();
 
             self.timely_worker.dataflow::<u64, _, _>(move |scope| {
                 let cmds = source(scope, "CmdSource", |capability, info| {
@@ -371,12 +377,10 @@ impl<'w, A: Allocate> Worker<'w, A> {
 
                     let persist_client = persist_clients.open(persist_location).await.unwrap();
 
-                    let shard_id = mz_persist_client::PersistClient::COMPUTE_PROTOCOL_SHARD;
-
                     let mut durable_protocol_listener =
                         DurableProtocolListener::<mz_repr::Timestamp>::new(
                             instance_id,
-                            shard_id,
+                            cmd_shard_id,
                             persist_client,
                         )
                         .await;

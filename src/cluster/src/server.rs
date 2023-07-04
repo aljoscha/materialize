@@ -22,7 +22,7 @@ use mz_ore::error::ErrorExt;
 use mz_ore::halt;
 use mz_ore::metrics::MetricsRegistry;
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::PersistLocation;
+use mz_persist_client::{PersistLocation, ShardId};
 use mz_service::client::{GenericClient, Partitionable, Partitioned};
 use mz_service::local::LocalClient;
 use timely::communication::initialize::WorkerGuards;
@@ -147,6 +147,7 @@ where
         persist_clients: Arc<PersistClientCache>,
         instance_id: Option<ComputeInstanceId>,
         persist_location: Option<PersistLocation>,
+        cmd_shard_id: Option<ShardId>,
         tokio_executor: Handle,
     ) -> Result<TimelyContainer<C, R, Worker::Activatable>, Error> {
         info!("Building timely container with config {config:?}");
@@ -186,6 +187,7 @@ where
                 persist_clients,
                 instance_id,
                 persist_location.clone(),
+                cmd_shard_id,
             )
         })
         .map_err(|e| anyhow!("{e}"))?;
@@ -203,6 +205,7 @@ where
         epoch: ClusterStartupEpoch,
         instance_id: Option<ComputeInstanceId>,
         persist_location: Option<PersistLocation>,
+        cmd_shard_id: Option<ShardId>,
     ) -> Result<(), Error> {
         let workers = config.workers;
 
@@ -237,6 +240,7 @@ where
                     persist_clients,
                     instance_id,
                     persist_location,
+                    cmd_shard_id,
                     handle,
                 )
                 .await;
@@ -304,8 +308,8 @@ where
         // Changing this debug statement requires changing the replica-isolation test
         tracing::debug!("ClusterClient send={:?}", &cmd);
         match cmd.try_into_timely_config() {
-            Ok((config, epoch, instance_id, persist_location)) => {
-                self.build(config, epoch, instance_id, persist_location)
+            Ok((config, epoch, instance_id, persist_location, cmd_shard_id)) => {
+                self.build(config, epoch, instance_id, persist_location, cmd_shard_id)
                     .await
             }
             Err(cmd) => self.inner.as_mut().expect("initialized").send(cmd).await,

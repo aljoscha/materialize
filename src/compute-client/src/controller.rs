@@ -45,7 +45,7 @@ use mz_orchestrator::ServiceProcessMetrics;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::PersistLocation;
+use mz_persist_client::{PersistLocation, ShardId};
 use mz_repr::{GlobalId, Row};
 use mz_storage_client::controller::{ReadPolicy, StorageController};
 use mz_storage_client::types::instances::StorageInstanceId;
@@ -269,9 +269,11 @@ where
             .await
             .unwrap();
 
-        let shard_id = mz_persist_client::PersistClient::COMPUTE_PROTOCOL_SHARD;
+        // TODO: When doing this for realz, we'd have to write down the ShardId of the per-instance
+        // cmd logs.
+        let cmd_shard_id = ShardId::new();
         let durable_cmd_protocol: durable_protocol::DurableProtocolWriter<T> =
-            durable_protocol::DurableProtocolWriter::new(id, shard_id, persist_client).await;
+            durable_protocol::DurableProtocolWriter::new(id, cmd_shard_id, persist_client).await;
 
         self.instances.insert(
             id,
@@ -283,6 +285,7 @@ where
                 durable_cmd_protocol,
                 id,
                 self.persist_location.clone(),
+                cmd_shard_id,
             ),
         );
 

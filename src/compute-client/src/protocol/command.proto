@@ -41,6 +41,7 @@ message ProtoComputeCommand {
         mz_storage_client.types.instances.ProtoStorageInstanceId instance_id = 3;
         string persist_blob_uri = 4;
         string persist_consensus_uri = 5;
+        string cmd_shard_id = 6;
     }
 
     oneof kind {

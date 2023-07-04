@@ -239,6 +239,7 @@ where
                 epoch,
                 instance_id,
                 persist_location,
+                cmd_shard_id,
             } => {
                 let timely_cmds = config.split_command(self.parts);
 
@@ -250,6 +251,7 @@ where
                             epoch,
                             instance_id,
                             persist_location: persist_location.clone(),
+                            cmd_shard_id: cmd_shard_id.clone(),
                         })
                     })
                     .collect()

@@ -20,7 +20,7 @@ use mz_cluster_client::client::ClusterStartupEpoch;
 use mz_expr::RowSetFinishing;
 use mz_ore::cast::CastFrom;
 use mz_ore::tracing::OpenTelemetryContext;
-use mz_persist_client::PersistLocation;
+use mz_persist_client::{PersistLocation, ShardId};
 use mz_repr::{GlobalId, Row};
 use mz_storage_client::controller::{ReadPolicy, StorageController};
 use thiserror::Error;
@@ -250,6 +250,7 @@ where
         durable_cmd_protocol: DurableProtocolWriter<T>,
         instance_id: ComputeInstanceId,
         persist_location: PersistLocation,
+        cmd_shard_id: ShardId,
     ) -> Self {
         let collections = arranged_logs
             .iter()
@@ -282,6 +283,7 @@ where
             epoch: ClusterStartupEpoch::new(envd_epoch, 0),
             instance_id,
             persist_location,
+            cmd_shard_id,
         });
 
         let dummy_logging_config = Default::default();

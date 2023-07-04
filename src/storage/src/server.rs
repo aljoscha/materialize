@@ -15,7 +15,7 @@ use std::thread::Thread;
 use mz_cluster::server::TimelyContainerRef;
 use mz_ore::now::NowFn;
 use mz_persist_client::cache::PersistClientCache;
-use mz_persist_client::PersistLocation;
+use mz_persist_client::{PersistLocation, ShardId};
 use mz_storage_client::client::{StorageClient, StorageCommand, StorageResponse};
 use mz_storage_client::types::connections::ConnectionContext;
 use mz_storage_client::types::instances::StorageInstanceId;
@@ -107,6 +107,7 @@ impl mz_cluster::types::AsRunnableWorker<StorageCommand, StorageResponse> for Co
         persist_clients: Arc<PersistClientCache>,
         _instance_id: Option<StorageInstanceId>,
         _persist_location: Option<PersistLocation>,
+        _cmd_shard_id: Option<ShardId>,
     ) {
         Worker::new(
             timely_worker,

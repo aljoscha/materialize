@@ -15,7 +15,7 @@ use mz_cluster_client::client::{ClusterStartupEpoch, TimelyConfig};
 use mz_expr::RowSetFinishing;
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_persist_client::cfg::PersistParameters;
-use mz_persist_client::PersistLocation;
+use mz_persist_client::{PersistLocation, ShardId};
 use mz_proto::{any_uuid, IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
 use mz_repr::{GlobalId, Row};
 use mz_storage_client::client::ProtoAllowCompaction;
@@ -64,6 +64,7 @@ pub enum ComputeCommand<T = mz_repr::Timestamp> {
         epoch: ClusterStartupEpoch,
         instance_id: ComputeInstanceId,
         persist_location: PersistLocation,
+        cmd_shard_id: ShardId,
     },
 
     /// `CreateInstance` must be sent after `CreateTimely` to complete the [Creation Stage] of the
@@ -238,12 +239,14 @@ impl RustType<ProtoComputeCommand> for ComputeCommand<mz_repr::Timestamp> {
                     epoch,
                     instance_id,
                     persist_location,
+                    cmd_shard_id,
                 } => CreateTimely(ProtoCreateTimely {
                     config: Some(config.into_proto()),
                     epoch: Some(epoch.into_proto()),
                     instance_id: Some(instance_id.into_proto()),
                     persist_blob_uri: persist_location.blob_uri.clone(),
                     persist_consensus_uri: persist_location.consensus_uri.clone(),
+                    cmd_shard_id: cmd_shard_id.to_string(),
                 }),
                 ComputeCommand::CreateInstance(logging) => CreateInstance(logging.into_proto()),
                 ComputeCommand::InitializationComplete => InitializationComplete(()),
@@ -278,6 +281,7 @@ impl RustType<ProtoComputeCommand> for ComputeCommand<mz_repr::Timestamp> {
                 instance_id,
                 persist_blob_uri: blob_uri,
                 persist_consensus_uri: consensus_uri,
+                cmd_shard_id,
             })) => {
                 let persist_location = PersistLocation {
                     blob_uri,
@@ -288,6 +292,7 @@ impl RustType<ProtoComputeCommand> for ComputeCommand<mz_repr::Timestamp> {
                     epoch: epoch.into_rust_if_some("ProtoCreateTimely::epoch")?,
                     instance_id: instance_id.into_rust_if_some("ProtoCreateTimely::instance_id")?,
                     persist_location,
+                    cmd_shard_id: cmd_shard_id.try_into().expect("couldn't parse ShardId"),
                 })
             }
             Some(CreateInstance(logging)) => {
