@@ -244,7 +244,7 @@ impl<T: Timestamp> DurableProtocolWorker<T> {
                         break;
                     }
                     Err(upper_mismatch) => {
-                        debug!(
+                        info!(
                             "error while trying to append durable commands: {:?}",
                             upper_mismatch
                         );
