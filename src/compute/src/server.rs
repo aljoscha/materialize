@@ -38,7 +38,7 @@ use timely::progress::{Antichain, Timestamp};
 use timely::scheduling::{Scheduler, SyncActivator};
 use timely::worker::Worker as TimelyWorker;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, Instrument};
 
 use crate::compute_state::{ActiveComputeState, ComputeState, ReportedFrontier};
 use crate::logging::compute::ComputeEvent;
@@ -392,8 +392,31 @@ impl<'w, A: Allocate> Worker<'w, A> {
                         .await;
 
                     loop {
-                        let mut cmds = durable_protocol_listener.fetch_next().await;
-                        cmd_output.give_container(&cap, &mut cmds).await;
+                        let span = tracing::info_span!("durable_cmd_listener::fetch");
+                        let mut cmds = durable_protocol_listener
+                            .fetch_next()
+                            .instrument(span.clone())
+                            .await;
+
+                        let span = tracing::info_span!("durable_cmd_listener::fetched");
+
+                        // Try and sniff out a peek so we can get otel information as early as
+                        // possible.
+                        let sniffed_peek = cmds
+                            .iter()
+                            .find(|cmd| matches!(cmd, ComputeCommand::Peek(_)));
+
+                        if let Some(ComputeCommand::Peek(peek)) = sniffed_peek {
+                            let _guard = span.enter();
+                            peek.otel_ctx.attach_as_parent();
+                            tracing::info!("sniffed out peek!");
+                        }
+
+                        cmd_output
+                            .give_container(&cap, &mut cmds)
+                            .instrument(span.clone())
+                            .await;
+
                         cap.downgrade(&(*cap.time() + 1));
                     }
                 });
