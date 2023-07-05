@@ -242,7 +242,7 @@ impl PersistConfig {
     /// Default value for [`DynamicConfig::rollup_threshold`].
     pub const DEFAULT_ROLLUP_THRESHOLD: usize = 128;
     /// Default value for [`DynamicConfig::inline_update_threshold_bytes`].
-    pub const DEFAULT_INLINE_UPDATE_THRESHOLD_BYTES: usize = 0;
+    pub const DEFAULT_INLINE_UPDATE_THRESHOLD_BYTES: usize = 1 * MB;
 
     /// Default value for [`PersistConfig::sink_minimum_batch_updates`].
     pub const DEFAULT_SINK_MINIMUM_BATCH_UPDATES: usize = 0;
