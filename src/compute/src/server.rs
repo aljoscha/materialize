@@ -378,8 +378,14 @@ impl<'w, A: Allocate> Worker<'w, A> {
                     if idx != 0 {
                         // Only read and distribute commands from one worker.
                         // TODO: Actually distribute commands to all workers.
+                        info!("idx {idx} calling quits!");
                         return;
                     }
+
+                    info!(
+                        "{} start reading from cmd shard {}",
+                        instance_id, cmd_shard_id
+                    );
 
                     let persist_client = persist_clients.open(persist_location).await.unwrap();
 
