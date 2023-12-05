@@ -537,6 +537,8 @@ pub trait StorageController: Debug + Send {
     /// Returns the timestamp of the latest row for each id in the
     /// privatelink_connection_status_history table seen on startup
     fn get_privatelink_status_table_latest(&self) -> &Option<BTreeMap<GlobalId, DateTime<Utc>>>;
+
+    // pub fn get_table_write_worker() -> PersistTableWriteWorker<Self::Timestamp>;
 }
 
 /// Compaction policies for collections maintained by `Controller`.

@@ -27,16 +27,17 @@ use mz_persist_client::ShardId;
 use mz_persist_txn::txns::{Tidy, TxnsHandle};
 use mz_persist_types::Codec64;
 use mz_repr::{Diff, GlobalId, TimestampManipulation};
-use mz_storage_client::client::{StorageResponse, TimestamplessUpdate, Update};
+use mz_storage_types::controller::StorageError;
 use mz_storage_types::controller::TxnsCodecRow;
 use mz_storage_types::sources::SourceData;
+use mz_storage_types::PersistEpoch;
 use timely::order::TotalOrder;
 use timely::progress::{Antichain, Timestamp};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tracing::{debug, Instrument, Span};
 
-use crate::{PersistEpoch, StorageError};
+use crate::client::{StorageResponse, TimestamplessUpdate, Update};
 
 /// A wrapper that holds on to backing persist shards/collections that the
 /// storage controller is aware of. The handles hold back the since frontier and
@@ -62,7 +63,7 @@ enum PersistReadWorkerCmd<T: Timestamp + Lattice + Codec64> {
 }
 
 /// A newtype wrapper to hang a Debug impl off of.
-pub(crate) struct SnapshotStatsRes<T>(BoxFuture<'static, Result<SnapshotStats<T>, StorageError>>);
+pub struct SnapshotStatsRes<T>(BoxFuture<'static, Result<SnapshotStats<T>, StorageError>>);
 
 impl<T: Debug> Debug for SnapshotStatsRes<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -71,7 +72,7 @@ impl<T: Debug> Debug for SnapshotStatsRes<T> {
 }
 
 impl<T: Timestamp + Lattice + Codec64> PersistReadWorker<T> {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tracing::Span, _)>();
 
         mz_ore::task::spawn(|| "PersistWorker", async move {
@@ -175,7 +176,7 @@ impl<T: Timestamp + Lattice + Codec64> PersistReadWorker<T> {
         Self { tx }
     }
 
-    pub(crate) fn register(
+    pub fn register(
         &self,
         id: GlobalId,
         since_handle: SinceHandle<SourceData, (), T, Diff, PersistEpoch>,
@@ -191,7 +192,7 @@ impl<T: Timestamp + Lattice + Codec64> PersistReadWorker<T> {
     /// # Panics
     /// - If `id` is not currently associated with any since handle.
     #[allow(dead_code)]
-    pub(crate) fn update(
+    pub fn update(
         &self,
         id: GlobalId,
         since_handle: SinceHandle<SourceData, (), T, Diff, PersistEpoch>,
@@ -199,11 +200,11 @@ impl<T: Timestamp + Lattice + Codec64> PersistReadWorker<T> {
         self.send(PersistReadWorkerCmd::Update(id, since_handle))
     }
 
-    pub(crate) fn downgrade(&self, frontiers: BTreeMap<GlobalId, Antichain<T>>) {
+    pub fn downgrade(&self, frontiers: BTreeMap<GlobalId, Antichain<T>>) {
         self.send(PersistReadWorkerCmd::Downgrade(frontiers))
     }
 
-    pub(crate) async fn snapshot_stats(
+    pub async fn snapshot_stats(
         &self,
         id: GlobalId,
         as_of: Antichain<T>,
@@ -298,7 +299,7 @@ async fn append_work<T2: Timestamp + Lattice + Codec64>(
 }
 
 impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistTableWriteWorker<T> {
-    pub(crate) fn new_legacy(
+    pub fn new_legacy(
         frontier_responses: tokio::sync::mpsc::UnboundedSender<StorageResponse<T>>,
     ) -> Self {
         let (tx, rx) =
@@ -312,7 +313,7 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistTableWrite
         }
     }
 
-    pub(crate) fn new_txns(
+    pub fn new_txns(
         frontier_responses: tokio::sync::mpsc::UnboundedSender<StorageResponse<T>>,
         txns: TxnsHandle<SourceData, (), T, i64, PersistEpoch, TxnsCodecRow>,
         lazy_persist_txn_tables: bool,
@@ -334,7 +335,7 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistTableWrite
         }
     }
 
-    pub(crate) fn register(
+    pub fn register(
         &self,
         register_ts: T,
         ids_handles: Vec<(GlobalId, WriteHandle<SourceData, (), T, Diff>)>,
@@ -350,11 +351,11 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistTableWrite
     /// # Panics
     /// - If `id` is not currently associated with any write handle.
     #[allow(dead_code)]
-    pub(crate) fn update(&self, id: GlobalId, write_handle: WriteHandle<SourceData, (), T, Diff>) {
+    pub fn update(&self, id: GlobalId, write_handle: WriteHandle<SourceData, (), T, Diff>) {
         self.send(PersistTableWriteCmd::Update(id, write_handle))
     }
 
-    pub(crate) fn append(
+    pub fn append(
         &self,
         write_ts: T,
         advance_to: T,
@@ -380,7 +381,7 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistTableWrite
     ///
     /// Note that this does not perform any other cleanup, such as finalizing
     /// the handle's shard.
-    pub(crate) fn drop_handle(&self, id: GlobalId) {
+    pub fn drop_handle(&self, id: GlobalId) {
         self.send(PersistTableWriteCmd::DropHandle(id))
     }
 
@@ -800,9 +801,7 @@ enum PersistMonotonicWriteCmd<T: Timestamp + Lattice + Codec64> {
 }
 
 impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistMonotonicWriteWorker<T> {
-    pub(crate) fn new(
-        frontier_responses: tokio::sync::mpsc::UnboundedSender<StorageResponse<T>>,
-    ) -> Self {
+    pub fn new(frontier_responses: tokio::sync::mpsc::UnboundedSender<StorageResponse<T>>) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tracing::Span, _)>();
 
         mz_ore::task::spawn(|| "PersistMonotonicWriteWorker", async move {
@@ -952,11 +951,7 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistMonotonicW
         }
     }
 
-    pub(crate) fn register(
-        &self,
-        id: GlobalId,
-        write_handle: WriteHandle<SourceData, (), T, Diff>,
-    ) {
+    pub fn register(&self, id: GlobalId, write_handle: WriteHandle<SourceData, (), T, Diff>) {
         self.send(PersistMonotonicWriteCmd::Register(id, write_handle))
     }
 
@@ -968,7 +963,7 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistMonotonicW
     /// # Panics
     /// - If `id` is not currently associated with any write handle.
     #[allow(dead_code)]
-    pub(crate) fn update(&self, id: GlobalId, write_handle: WriteHandle<SourceData, (), T, Diff>) {
+    pub fn update(&self, id: GlobalId, write_handle: WriteHandle<SourceData, (), T, Diff>) {
         self.send(PersistMonotonicWriteCmd::Update(id, write_handle))
     }
 
@@ -989,7 +984,7 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistMonotonicW
     ///
     ///   Collections with empty uppers can continue receiving empty
     ///   updates, i.e. those used soley to advance collections' uppers.
-    pub(crate) fn monotonic_append(
+    pub fn monotonic_append(
         &self,
         updates: Vec<(GlobalId, Vec<TimestamplessUpdate>, T)>,
     ) -> tokio::sync::oneshot::Receiver<Result<(), StorageError>> {
@@ -1008,7 +1003,7 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistMonotonicW
     ///
     /// Note that this does not perform any other cleanup, such as finalizing
     /// the handle's shard.
-    pub(crate) fn drop_handle(&self, id: GlobalId) {
+    pub fn drop_handle(&self, id: GlobalId) {
         self.send(PersistMonotonicWriteCmd::DropHandle(id))
     }
 

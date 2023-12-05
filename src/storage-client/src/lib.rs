@@ -83,3 +83,4 @@ pub mod healthcheck;
 pub mod metrics;
 pub mod sink;
 pub mod util;
+pub mod persist_handles;

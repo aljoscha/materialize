@@ -107,7 +107,7 @@ use mz_persist_txn::metrics::Metrics as TxnMetrics;
 use mz_persist_txn::txn_read::TxnsRead;
 use mz_persist_txn::txns::TxnsHandle;
 use mz_persist_types::codec_impls::UnitSchema;
-use mz_persist_types::{Codec64, Opaque};
+use mz_persist_types::Codec64;
 use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
 use mz_repr::adt::timestamp::CheckedTimestamp;
 use mz_repr::{ColumnName, Datum, Diff, GlobalId, RelationDesc, Row, TimestampManipulation};
@@ -124,7 +124,7 @@ use mz_storage_client::controller::{
     StorageController,
 };
 use mz_storage_client::metrics::StorageControllerMetrics;
-use mz_storage_types::collections as proto;
+use mz_storage_client::persist_handles;
 use mz_storage_types::controller::{
     CollectionMetadata, DurableCollectionMetadata, PersistTxnTablesImpl, StorageError, TxnsCodecRow,
 };
@@ -135,6 +135,7 @@ use mz_storage_types::sinks::{
 };
 use mz_storage_types::sources::{IngestionDescription, SourceData, SourceExport};
 use mz_storage_types::AlterCompatible;
+use mz_storage_types::{collections as proto, PersistEpoch};
 use proptest::prelude::{any, Arbitrary, BoxedStrategy, Strategy};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -150,7 +151,6 @@ use crate::rehydration::RehydratingStorageClient;
 mod collection_mgmt;
 mod command_wals;
 mod healthcheck;
-mod persist_handles;
 mod rehydration;
 mod statistics;
 
@@ -2196,40 +2196,6 @@ where
 
     fn get_privatelink_status_table_latest(&self) -> &Option<BTreeMap<GlobalId, DateTime<Utc>>> {
         &self.privatelink_status_table_latest
-    }
-}
-
-/// A wrapper struct that presents the adapter token to a format that is understandable by persist
-/// and also allows us to differentiate between a token being present versus being set for the
-/// first time.
-// TODO(aljoscha): Make this crate-public again once the remap operator doesn't
-// hold a critical handle anymore.
-#[derive(PartialEq, Clone, Debug)]
-pub struct PersistEpoch(Option<NonZeroI64>);
-
-impl Opaque for PersistEpoch {
-    fn initial() -> Self {
-        PersistEpoch(None)
-    }
-}
-
-impl Codec64 for PersistEpoch {
-    fn codec_name() -> String {
-        "PersistEpoch".to_owned()
-    }
-
-    fn encode(&self) -> [u8; 8] {
-        self.0.map(NonZeroI64::get).unwrap_or(0).to_le_bytes()
-    }
-
-    fn decode(buf: [u8; 8]) -> Self {
-        Self(NonZeroI64::new(i64::from_le_bytes(buf)))
-    }
-}
-
-impl From<NonZeroI64> for PersistEpoch {
-    fn from(epoch: NonZeroI64) -> Self {
-        Self(Some(epoch))
     }
 }
 
