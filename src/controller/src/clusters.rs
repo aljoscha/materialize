@@ -28,9 +28,10 @@ use mz_orchestrator::{
     ServiceEvent, ServicePort,
 };
 use mz_ore::halt;
-use mz_ore::task::AbortOnDropHandle;
+use mz_ore::task::{AbortOnDropHandle};
+use mz_persist_types::Codec64;
 use mz_repr::adt::numeric::Numeric;
-use mz_repr::GlobalId;
+use mz_repr::{GlobalId, TimestampManipulation};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -290,7 +291,7 @@ pub struct CreateReplicaConfig {
 
 impl<T> Controller<T>
 where
-    T: Timestamp + Lattice,
+    T: Timestamp + Lattice + Codec64 + TimestampManipulation,
     ComputeGrpcClient: ComputeClient<T>,
 {
     /// Creates a cluster with the specified identifier and configuration.

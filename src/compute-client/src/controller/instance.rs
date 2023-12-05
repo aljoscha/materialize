@@ -25,7 +25,8 @@ use mz_compute_types::sources::SourceInstanceDesc;
 use mz_expr::RowSetFinishing;
 use mz_ore::cast::CastFrom;
 use mz_ore::tracing::OpenTelemetryContext;
-use mz_repr::{Datum, Diff, GlobalId, Row};
+use mz_persist_types::Codec64;
+use mz_repr::{Datum, Diff, GlobalId, Row, TimestampManipulation};
 use mz_storage_client::controller::{IntrospectionType, ReadPolicy, StorageController};
 use thiserror::Error;
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
@@ -522,7 +523,7 @@ pub(super) struct ActiveInstance<'a, T> {
 
 impl<'a, T> ActiveInstance<'a, T>
 where
-    T: Timestamp + Lattice,
+    T: Timestamp + Lattice + Codec64 + TimestampManipulation,
     ComputeGrpcClient: ComputeClient<T>,
 {
     /// Add a new instance replica, by ID.

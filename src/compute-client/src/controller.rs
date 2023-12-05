@@ -44,7 +44,8 @@ use mz_compute_types::ComputeInstanceId;
 use mz_expr::RowSetFinishing;
 use mz_ore::metrics::MetricsRegistry;
 use mz_ore::tracing::OpenTelemetryContext;
-use mz_repr::{Diff, GlobalId, Row};
+use mz_persist_types::Codec64;
+use mz_repr::{Diff, GlobalId, Row, TimestampManipulation};
 use mz_storage_client::controller::{IntrospectionType, ReadPolicy, StorageController};
 use serde::{Deserialize, Serialize};
 use timely::progress::frontier::{AntichainRef, MutableAntichain};
@@ -426,7 +427,7 @@ impl<T> ActiveComputeController<'_, T> {
 
 impl<T> ActiveComputeController<'_, T>
 where
-    T: Timestamp + Lattice,
+    T: Timestamp + Lattice + Codec64 + TimestampManipulation,
     ComputeGrpcClient: ComputeClient<T>,
 {
     /// Adds replicas of an instance.

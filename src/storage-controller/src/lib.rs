@@ -124,7 +124,7 @@ use mz_storage_client::controller::{
     StorageController,
 };
 use mz_storage_client::metrics::StorageControllerMetrics;
-use mz_storage_client::persist_handles;
+use mz_storage_client::persist_handles::{self, PersistTableWriteWorker};
 use mz_storage_types::controller::{
     CollectionMetadata, DurableCollectionMetadata, PersistTxnTablesImpl, StorageError, TxnsCodecRow,
 };
@@ -2196,6 +2196,11 @@ where
 
     fn get_privatelink_status_table_latest(&self) -> &Option<BTreeMap<GlobalId, DateTime<Utc>>> {
         &self.privatelink_status_table_latest
+    }
+
+    /// Returns a shared `PersistTableWriteWorker` for external use.
+    fn get_table_write_worker(&self) -> PersistTableWriteWorker<Self::Timestamp> {
+        self.persist_table_worker.clone()
     }
 }
 

@@ -261,7 +261,7 @@ impl<T> Controller<T> {
 
 impl<T> Controller<T>
 where
-    T: Timestamp + Lattice,
+    T: Timestamp + Lattice + Codec64 + TimestampManipulation,
     ComputeGrpcClient: ComputeClient<T>,
 {
     pub fn update_orchestrator_scheduling_config(

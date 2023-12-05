@@ -29,6 +29,7 @@ use mz_ore::collections::{CollectionExt, HashSet};
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_ore::vec::VecExt;
 use mz_ore::{soft_assert, task};
+use mz_persist_types::Codec64;
 use mz_repr::adt::jsonb::Jsonb;
 use mz_repr::adt::mz_acl_item::{MzAclItem, PrivilegeMap};
 use mz_repr::explain::json::json_string;
@@ -36,7 +37,10 @@ use mz_repr::explain::{
     ExplainFormat, ExprHumanizer, ExprHumanizerExt, TransientItem, UsedIndexes,
 };
 use mz_repr::role_id::RoleId;
-use mz_repr::{ColumnName, Datum, Diff, GlobalId, RelationDesc, Row, RowArena, Timestamp};
+use mz_repr::{
+    ColumnName, Datum, Diff, GlobalId, RelationDesc, Row, RowArena, Timestamp,
+    TimestampManipulation,
+};
 use mz_sql::ast::{ExplainStage, IndexOptionName};
 use mz_sql::catalog::{
     CatalogCluster, CatalogClusterReplica, CatalogDatabase, CatalogError,
@@ -6082,7 +6086,15 @@ struct CachedStatisticsOracle {
 }
 
 impl CachedStatisticsOracle {
-    pub async fn new<T: Clone + std::fmt::Debug + timely::PartialOrder + Send + Sync>(
+    pub async fn new<
+        T: Clone
+            + std::fmt::Debug
+            + timely::PartialOrder
+            + Send
+            + Sync
+            + TimestampManipulation
+            + Codec64,
+    >(
         ids: &BTreeSet<GlobalId>,
         as_of: &Antichain<T>,
         storage: &dyn mz_storage_client::controller::StorageController<Timestamp = T>,

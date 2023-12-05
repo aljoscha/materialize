@@ -45,6 +45,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::client::TimestamplessUpdate;
+use crate::persist_handles::PersistTableWriteWorker;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum IntrospectionType {
@@ -200,7 +201,7 @@ impl<T: Codec64 + Timestamp + Lattice> SnapshotCursor<T> {
 
 #[async_trait(?Send)]
 pub trait StorageController: Debug + Send {
-    type Timestamp;
+    type Timestamp: Codec64 + TimestampManipulation;
 
     /// Marks the end of any initialization commands.
     ///
@@ -538,7 +539,8 @@ pub trait StorageController: Debug + Send {
     /// privatelink_connection_status_history table seen on startup
     fn get_privatelink_status_table_latest(&self) -> &Option<BTreeMap<GlobalId, DateTime<Utc>>>;
 
-    // pub fn get_table_write_worker() -> PersistTableWriteWorker<Self::Timestamp>;
+    /// Returns a shared `PersistTableWriteWorker` for external use.
+    fn get_table_write_worker(&self) -> PersistTableWriteWorker<Self::Timestamp>;
 }
 
 /// Compaction policies for collections maintained by `Controller`.
