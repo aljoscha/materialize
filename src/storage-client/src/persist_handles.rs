@@ -35,7 +35,7 @@ use timely::order::TotalOrder;
 use timely::progress::{Antichain, Timestamp};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tracing::{debug, Instrument, Span};
+use tracing::{debug, info, Instrument, Span};
 
 use crate::client::{StorageResponse, TimestamplessUpdate, Update};
 
@@ -362,19 +362,15 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistTableWrite
         updates: Vec<(GlobalId, Vec<TimestamplessUpdate>)>,
     ) -> tokio::sync::oneshot::Receiver<Result<(), StorageError>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if updates.is_empty() {
-            tx.send(Ok(()))
-                .expect("rx has not been dropped at this point");
-            rx
-        } else {
-            self.send(PersistTableWriteCmd::Append {
-                write_ts,
-                advance_to,
-                updates,
-                tx,
-            });
-            rx
-        }
+
+        self.send(PersistTableWriteCmd::Append {
+            write_ts,
+            advance_to,
+            updates,
+            tx,
+        });
+
+        rx
     }
 
     /// Drops the handle associated with `id` from this worker.

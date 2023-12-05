@@ -133,7 +133,7 @@ use crate::catalog::{
 use crate::client::{Client, Handle};
 use crate::command::{Canceled, Command, ExecuteResponse};
 use crate::config::SystemParameterSyncConfig;
-use crate::coord::appends::{Deferred, GroupCommitPermit, PendingWriteTxn};
+use crate::coord::appends::{AppendClient, Deferred, GroupCommitPermit};
 use crate::coord::dataflows::dataflow_import_id_bundle;
 use crate::coord::id_bundle::CollectionIdBundle;
 use crate::coord::peek::PendingPeek;
@@ -185,8 +185,6 @@ pub enum Message<T = mz_repr::Timestamp> {
     CreateConnectionValidationReady(CreateConnectionValidationReady),
     AlterConnectionValidationReady(AlterConnectionValidationReady),
     WriteLockGrant(tokio::sync::OwnedMutexGuard<()>),
-    /// Initiates a group commit.
-    GroupCommitInitiate(Span, Option<GroupCommitPermit>),
     /// Makes a group commit visible to all clients.
     GroupCommitApply(
         /// Timestamp of the writes in the group commit.
@@ -256,7 +254,6 @@ impl Message {
             Message::PurifiedStatementReady(_) => "purified_statement_ready",
             Message::CreateConnectionValidationReady(_) => "create_connection_validation_ready",
             Message::WriteLockGrant(_) => "write_lock_grant",
-            Message::GroupCommitInitiate(..) => "group_commit_initiate",
             Message::GroupCommitApply(..) => "group_commit_apply",
             Message::AdvanceTimelines => "advance_timelines",
             Message::ClusterEvent(_) => "cluster_event",
@@ -992,7 +989,8 @@ pub struct Coordinator {
     /// Holds plans deferred due to write lock.
     write_lock_wait_group: VecDeque<Deferred>,
     /// Pending writes waiting for a group commit.
-    pending_writes: Vec<PendingWriteTxn>,
+    // pending_writes: Vec<PendingWriteTxn>,
+    append_client: AppendClient,
     /// For the realtime timeline, an explicit SELECT or INSERT on a table will bump the
     /// table's timestamps, but there are cases where timestamps are not bumped but
     /// we expect the closed timestamps to advance (`AS OF X`, SUBSCRIBing views over
@@ -2070,28 +2068,28 @@ impl Coordinator {
                         Message::ControllerReady
                     }
                     // See [`appends::GroupCommitWaiter`] for notes on why this is cancel safe.
-                    permit = group_commit_rx.ready() => {
-                        // If we happen to have batched exactly one user write, use
-                        // that span so the `emit_trace_id_notice` hooks up.
-                        // Otherwise, the best we can do is invent a new root span
-                        // and make it follow from all the Spans in the pending
-                        // writes.
-                        let user_write_spans = self.pending_writes.iter().flat_map(|x| match x {
-                            PendingWriteTxn::User{span, ..} => Some(span),
-                            PendingWriteTxn::System{..} => None,
-                        });
-                        let span = match user_write_spans.exactly_one() {
-                            Ok(span) => span.clone(),
-                            Err(user_write_spans) => {
-                                let span = info_span!(parent: None, "group_commit_notify");
-                                for s in user_write_spans {
-                                    span.follows_from(s);
-                                }
-                                span
-                            }
-                        };
-                        Message::GroupCommitInitiate(span, Some(permit))
-                    },
+                    // permit = group_commit_rx.ready() => {
+                    //     // If we happen to have batched exactly one user write, use
+                    //     // that span so the `emit_trace_id_notice` hooks up.
+                    //     // Otherwise, the best we can do is invent a new root span
+                    //     // and make it follow from all the Spans in the pending
+                    //     // writes.
+                    //     let user_write_spans = self.pending_writes.iter().flat_map(|x| match x {
+                    //         PendingWriteTxn::User{span, ..} => Some(span),
+                    //         PendingWriteTxn::System{..} => None,
+                    //     });
+                    //     let span = match user_write_spans.exactly_one() {
+                    //         Ok(span) => span.clone(),
+                    //         Err(user_write_spans) => {
+                    //             let span = info_span!(parent: None, "group_commit_notify");
+                    //             for s in user_write_spans {
+                    //                 span.follows_from(s);
+                    //             }
+                    //             span
+                    //         }
+                    //     };
+                    //     Message::GroupCommitInitiate(span, Some(permit))
+                    // },
                     // `recv()` on `UnboundedReceiver` is cancellation safe:
                     // https://docs.rs/tokio/1.8.0/tokio/sync/mpsc/struct.UnboundedReceiver.html#cancel-safety
                     m = cmd_rx.recv() => match m {
@@ -2112,11 +2110,12 @@ impl Coordinator {
                     }
                     // `tick()` on `Interval` is cancel-safe:
                     // https://docs.rs/tokio/1.19.2/tokio/time/struct.Interval.html#cancel-safety
-                    _ = self.advance_timelines_interval.tick() => {
-                        let span = info_span!(parent: None, "advance_timelines_interval");
-                        span.follows_from(Span::current());
-                        Message::GroupCommitInitiate(span, None)
-                    },
+                    // _ = self.advance_timelines_interval.tick() => {
+                    //     let span = info_span!(parent: None, "advance_timelines_interval");
+                    //     span.follows_from(Span::current());
+                    //     
+                    //     Message::GroupCommitInitiate(span, None)
+                    // },
 
                     // Process the idle metric at the lowest priority to sample queue non-idle time.
                     // `recv()` on `Receiver` is cancellation safe:
@@ -2387,6 +2386,27 @@ pub fn serve(
                 }
 
                 let caching_secrets_reader = CachingSecretsReader::new(secrets_controller.reader());
+
+                let table_timestamp_oracle = timestamp_oracles
+                    .get(&Timeline::EpochMilliseconds)
+                    .expect("missing EpochMillis oracle")
+                    .oracle
+                    .get_shared()
+                    .expect("timestamp oracle is not shareable");
+                let write_worker = dataflow_client.storage.get_table_write_worker();
+                let write_lock = Arc::new(tokio::sync::Mutex::new(()));
+                let append_client = handle.block_on(async {
+                    AppendClient::new(
+                        internal_cmd_tx.clone(),
+                        Arc::clone(&write_lock),
+                        write_worker,
+                        table_timestamp_oracle,
+                        catalog.config().now.clone(),
+                        tokio::time::interval(catalog.config().timestamp_interval),
+                    )
+                    .await
+                });
+
                 let mut coord = Coordinator {
                     controller: dataflow_client,
                     view_optimizer: Optimizer::logical_optimizer(
@@ -2406,9 +2426,9 @@ pub fn serve(
                     client_pending_peeks: BTreeMap::new(),
                     pending_real_time_recency_timestamp: BTreeMap::new(),
                     active_subscribes: BTreeMap::new(),
-                    write_lock: Arc::new(tokio::sync::Mutex::new(())),
+                    write_lock,
                     write_lock_wait_group: VecDeque::new(),
-                    pending_writes: Vec::new(),
+                    append_client,
                     advance_timelines_interval,
                     secrets_controller,
                     caching_secrets_reader,

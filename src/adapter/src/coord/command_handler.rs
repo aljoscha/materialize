@@ -717,20 +717,20 @@ impl Coordinator {
         if let Some(conn_meta) = self.active_conns.get(&conn_id) {
             // Cancel pending writes. There is at most one pending write per session.
             let mut maybe_ctx = None;
-            if let Some(idx) = self.pending_writes.iter().position(|pending_write_txn| {
-                matches!(pending_write_txn, PendingWriteTxn::User {
-                    pending_txn: PendingTxn { ctx, .. },
-                    ..
-                } if *ctx.session().conn_id() == conn_id)
-            }) {
-                if let PendingWriteTxn::User {
-                    pending_txn: PendingTxn { ctx, .. },
-                    ..
-                } = self.pending_writes.remove(idx)
-                {
-                    maybe_ctx = Some(ctx);
-                }
-            }
+            // if let Some(idx) = self.pending_writes.iter().position(|pending_write_txn| {
+            //     matches!(pending_write_txn, PendingWriteTxn::User {
+            //         pending_txn: PendingTxn { ctx, .. },
+            //         ..
+            //     } if *ctx.session().conn_id() == conn_id)
+            // }) {
+            //     if let PendingWriteTxn::User {
+            //         pending_txn: PendingTxn { ctx, .. },
+            //         ..
+            //     } = self.pending_writes.remove(idx)
+            //     {
+            //         maybe_ctx = Some(ctx);
+            //     }
+            // }
 
             // Cancel deferred writes. There is at most one deferred write per session.
             if let Some(idx) = self

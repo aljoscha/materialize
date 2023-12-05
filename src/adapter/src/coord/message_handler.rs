@@ -85,11 +85,6 @@ impl Coordinator {
                 Message::WriteLockGrant(write_lock_guard) => {
                     self.message_write_lock_grant(write_lock_guard).await;
                 }
-                Message::GroupCommitInitiate(span, permit) => {
-                    // Add an OpenTelemetry link to our current span.
-                    tracing::Span::current().add_link(span.context().span().span_context().clone());
-                    self.try_group_commit(permit).instrument(span).await
-                }
                 Message::GroupCommitApply(timestamp, responses, write_lock_guard, permit) => {
                     self.group_commit_apply(timestamp, responses, write_lock_guard, permit)
                         .await;
