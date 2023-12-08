@@ -831,26 +831,17 @@ impl AppendWorker {
     /// involved tables will be advanced to some timestamp larger than the timestamp of the write.
     #[tracing::instrument(level = "debug", skip_all)]
     async fn group_commit_initiate(&mut self) {
-        let (write_lock_guard, pending_writes): (_, Vec<_>) = if self
-            .pending_writes
-            .iter()
-            .all(|write| matches!(write, PendingWriteTxn::System { .. }))
-            || self.pending_writes.is_empty()
-        {
-            // If none of the pending transactions are for user tables, then we don't need the
-            // write lock.
-            (None, self.pending_writes.drain(..).collect())
-        } else if let Some(guard) = self
+        let (write_lock_guard, pending_writes): (_, Vec<_>) = if let Some(guard) = self
             .pending_writes
             .iter_mut()
             .find_map(|write| write.take_write_lock())
         {
             // If some pending transaction already holds the write lock, then we can execute a group
             // commit.
-            (Some(guard), self.pending_writes.drain(..).collect())
+            (guard, self.pending_writes.drain(..).collect())
         } else if let Ok(guard) = Arc::clone(&self.write_lock).try_lock_owned() {
             // If no pending transaction holds the write lock, then we need to acquire it.
-            (Some(guard), self.pending_writes.drain(..).collect())
+            (guard, self.pending_writes.drain(..).collect())
         } else {
             // If some running transaction already holds the write lock, then one of the
             // following things will happen:
@@ -864,12 +855,7 @@ impl AppendWorker {
             // Those writes that we don't traing will be re-attempted next time
             // through the worker loop.
 
-            // Without the write lock we can only apply writes to system tables.
-            let pending_writes = self
-                .pending_writes
-                .drain_filter_swapping(|w| matches!(w, PendingWriteTxn::System { .. }))
-                .collect();
-            (None, pending_writes)
+            return;
         };
 
         // The value returned here still might be ahead of `now()` if `now()` has gone backwards at
