@@ -1670,6 +1670,7 @@ where
             | ExecuteResponse::CreatedDatabase { .. }
             | ExecuteResponse::CreatedIndex { .. }
             | ExecuteResponse::CreatedMaterializedView { .. }
+            | ExecuteResponse::CreatedContinuallyInsert { .. }
             | ExecuteResponse::CreatedRole
             | ExecuteResponse::CreatedSchema { .. }
             | ExecuteResponse::CreatedSecret { .. }

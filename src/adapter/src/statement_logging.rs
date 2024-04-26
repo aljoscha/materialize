@@ -202,6 +202,7 @@ impl From<&ExecuteResponse> for StatementEndedExecutionReason {
             | ExecuteResponse::CreatedView
             | ExecuteResponse::CreatedViews
             | ExecuteResponse::CreatedMaterializedView
+            | ExecuteResponse::CreatedContinuallyInsert
             | ExecuteResponse::CreatedType
             | ExecuteResponse::Deallocate { .. }
             | ExecuteResponse::DeclaredCursor

@@ -119,6 +119,7 @@ pub enum Plan {
     CreateTable(CreateTablePlan),
     CreateView(CreateViewPlan),
     CreateMaterializedView(CreateMaterializedViewPlan),
+    CreateContinuallyInsert(CreateContinuallyInsertPlan),
     CreateIndex(CreateIndexPlan),
     CreateType(CreateTypePlan),
     Comment(CommentPlan),
@@ -243,6 +244,7 @@ impl Plan {
             StatementKind::CreateDatabase => &[PlanKind::CreateDatabase],
             StatementKind::CreateIndex => &[PlanKind::CreateIndex],
             StatementKind::CreateMaterializedView => &[PlanKind::CreateMaterializedView],
+            StatementKind::CreateContinuallyInsert => &[PlanKind::CreateContinuallyInsert],
             StatementKind::CreateRole => &[PlanKind::CreateRole],
             StatementKind::CreateSchema => &[PlanKind::CreateSchema],
             StatementKind::CreateSecret => &[PlanKind::CreateSecret],
@@ -310,6 +312,7 @@ impl Plan {
             Plan::CreateTable(_) => "create table",
             Plan::CreateView(_) => "create view",
             Plan::CreateMaterializedView(_) => "create materialized view",
+            Plan::CreateContinuallyInsert(_) => "create continual task",
             Plan::CreateIndex(_) => "create index",
             Plan::CreateType(_) => "create type",
             Plan::Comment(_) => "comment",
@@ -647,6 +650,19 @@ pub struct CreateMaterializedViewPlan {
     /// True if the materialized view contains an expression that can make the exact column list
     /// ambiguous. For example `NATURAL JOIN` or `SELECT *`.
     pub ambiguous_columns: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateContinuallyInsertPlan {
+    pub name: QualifiedItemName,
+    pub target_table_id: GlobalId,
+    pub retract_from_table_id: GlobalId,
+    pub continually_insert: ContinuallyInsert,
+    /// The ID of the object that this view is replacing, if any.
+    pub replace: Option<GlobalId>,
+    /// The IDs of all objects that need to be dropped. This includes `replace` and any dependents.
+    pub drop_ids: Vec<GlobalId>,
+    pub if_not_exists: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1429,6 +1445,13 @@ pub struct MaterializedView {
     pub compaction_window: Option<CompactionWindow>,
     pub refresh_schedule: Option<RefreshSchedule>,
     pub as_of: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContinuallyInsert {
+    pub create_sql: String,
+    pub expr: HirRelationExpr,
+    pub cluster_id: ClusterId,
 }
 
 #[derive(Clone, Debug)]

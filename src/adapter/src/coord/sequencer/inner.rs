@@ -101,6 +101,7 @@ use crate::{
     guard_write_critical_section, PeekResponseUnary, TimelineContext, TimestampExplanation,
 };
 
+mod create_continually_insert;
 mod create_index;
 mod create_materialized_view;
 mod create_view;

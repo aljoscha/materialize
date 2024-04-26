@@ -80,6 +80,7 @@ pub fn auto_run_on_introspection<'a, 's, 'p>(
         | Plan::CreateTable(_)
         | Plan::CreateView(_)
         | Plan::CreateMaterializedView(_)
+        | Plan::CreateContinuallyInsert(_)
         | Plan::CreateIndex(_)
         | Plan::CreateType(_)
         | Plan::Comment(_)
