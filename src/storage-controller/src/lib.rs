@@ -72,7 +72,7 @@ use mz_storage_types::parameters::StorageParameters;
 use mz_storage_types::read_policy::ReadPolicy;
 use mz_storage_types::sinks::{StorageSinkConnection, StorageSinkDesc};
 use mz_storage_types::sources::{IngestionDescription, SourceData, SourceExport};
-use mz_storage_types::AlterCompatible;
+use mz_storage_types::{AlterCompatible, PersistEpoch};
 use timely::order::{PartialOrder, TotalOrder};
 use timely::progress::frontier::MutableAntichain;
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
@@ -2302,40 +2302,6 @@ where
         );
 
         Ok(())
-    }
-}
-
-/// A wrapper struct that presents the adapter token to a format that is understandable by persist
-/// and also allows us to differentiate between a token being present versus being set for the
-/// first time.
-// TODO(aljoscha): Make this crate-public again once the remap operator doesn't
-// hold a critical handle anymore.
-#[derive(PartialEq, Clone, Debug)]
-pub struct PersistEpoch(Option<NonZeroI64>);
-
-impl Opaque for PersistEpoch {
-    fn initial() -> Self {
-        PersistEpoch(None)
-    }
-}
-
-impl Codec64 for PersistEpoch {
-    fn codec_name() -> String {
-        "PersistEpoch".to_owned()
-    }
-
-    fn encode(&self) -> [u8; 8] {
-        self.0.map(NonZeroI64::get).unwrap_or(0).to_le_bytes()
-    }
-
-    fn decode(buf: [u8; 8]) -> Self {
-        Self(NonZeroI64::new(i64::from_le_bytes(buf)))
-    }
-}
-
-impl From<NonZeroI64> for PersistEpoch {
-    fn from(epoch: NonZeroI64) -> Self {
-        Self(Some(epoch))
     }
 }
 
