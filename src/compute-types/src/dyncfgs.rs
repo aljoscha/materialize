@@ -251,7 +251,7 @@ pub const ENABLE_PEEK_RESPONSE_STASH: Config<bool> = Config::new(
 pub const PEEK_RESPONSE_STASH_THRESHOLD_BYTES: Config<usize> = Config::new(
     "compute_peek_response_stash_threshold_bytes",
     // 1024 * 1024 * 300, /* 300mb */
-    0, /* force-enable, for testing */
+    20, /* force-enable, for testing */
     "The threshold above which to use the peek response stash, for sending back large peek responses.",
 );
 

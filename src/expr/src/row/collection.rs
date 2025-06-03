@@ -245,13 +245,13 @@ pub struct EncodedRowMetadata {
     /// Offset into the binary blob of encoded rows.
     ///
     /// TODO(parkmycar): Consider making this a `u32`.
-    offset: usize,
+    pub offset: usize,
     /// Diff for the Row.
     ///
     /// TODO(parkmycar): Consider making this a smaller type, note that some compute introspection
     /// collections, e.g. `mz_scheduling_elapsed_raw`, encodes nano seconds in the diff field which
     /// requires a u64.
-    diff: NonZeroUsize,
+    pub diff: NonZeroUsize,
 }
 
 impl RustType<ProtoEncodedRowMetadata> for EncodedRowMetadata {

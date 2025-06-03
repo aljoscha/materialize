@@ -981,7 +981,7 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
                     .metrics
                     .stashed_peek_seconds
                     .observe(duration.as_secs_f64());
-                tracing::trace!(?peek_response.peek, ?duration, "finished stashing peek response in persist");
+                tracing::info!(?peek_response.peek, ?duration, "finished stashing peek response in persist");
 
                 self.send_peek_response(&peek_response.peek, response);
             } else {

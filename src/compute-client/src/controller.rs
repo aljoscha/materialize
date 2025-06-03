@@ -156,7 +156,7 @@ impl PeekNotification {
                 let num_rows = u64::cast_from(rows.count(offset, limit));
                 let result_size = u64::cast_from(rows.byte_len());
 
-                tracing::trace!(?num_rows, ?result_size, "inline peek result");
+                tracing::info!(?num_rows, ?result_size, "inline peek result");
 
                 Self::Success {
                     rows: num_rows,
@@ -167,7 +167,7 @@ impl PeekNotification {
                 let rows = stashed_response.num_rows(offset, limit);
                 let result_size = stashed_response.size_bytes();
 
-                tracing::trace!(?rows, ?result_size, "stashed peek result");
+                tracing::info!(?rows, ?result_size, "stashed peek result");
 
                 Self::Success {
                     rows: u64::cast_from(rows),

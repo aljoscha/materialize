@@ -807,25 +807,6 @@ impl crate::coord::Coordinator {
 
                         batches.push(batch);
                     }
-                    tracing::trace!(?batches, "stashed peek response");
-
-                    let as_of = Antichain::from_elem(mz_repr::Timestamp::default());
-                    let read_schemas: Schemas<SourceData, ()> = Schemas {
-                        id: None,
-                        key: Arc::new(response.relation_desc.clone()),
-                        val: Arc::new(UnitSchema),
-                    };
-
-                    let mut row_cursor = persist_client
-                        .read_batches_consolidated::<_, _, _, i64>(
-                            response.shard_id,
-                            as_of,
-                            read_schemas,
-                            batches,
-                            |_stats| true,
-                        )
-                        .await
-                        .expect("invalid usage");
 
                     // NOTE: Using the cursor creates Futures that are not Sync,
                     // so we can't drive them on the main Coordinator loop.
@@ -846,20 +827,71 @@ impl crate::coord::Coordinator {
                     // batches already, and so we piggy-back on that, even if it
                     // might not exist as of today.
                     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                    let response_relation_desc = response.relation_desc.clone();
                     mz_ore::task::spawn(|| "read_peek_batches", async move {
-                        // We always send our inline rows first. Ordering
-                        // doesn't matter because we can only be in this case
-                        // when there is no ORDER BY.
-                        //
-                        // We _could_ write these out as a Batch, and include it
-                        // in the batches we read via the Consolidator. If we
-                        // wanted to get a consistent ordering. That's not
-                        // needed for correctness! But might be nice for more
-                        // aesthetic reasons.
-                        let result = tx.send(response.inline_rows).await;
-                        if result.is_err() {
-                            tracing::error!("receiver went away");
+                        // If we have inline_rows, create a batch for them too
+                        if response.inline_rows.count(0, None) > 0 {
+                            tracing::info!(?response.inline_rows, "writing out inline rows");
+
+                            let write_schemas: Schemas<SourceData, ()> = Schemas {
+                                id: None,
+                                key: Arc::new(response_relation_desc.clone()),
+                                val: Arc::new(UnitSchema),
+                            };
+
+                            let result_ts = mz_repr::Timestamp::default();
+                            let lower = Antichain::from_elem(result_ts);
+                            let upper = Antichain::from_elem(result_ts.step_forward());
+
+                            let mut batch_builder = persist_client
+                                .batch_builder::<SourceData, (), mz_repr::Timestamp, i64>(
+                                    shard_id,
+                                    write_schemas,
+                                    lower,
+                                )
+                                .await;
+
+                            for i in 0..response.inline_rows.entries() {
+                                if let Some((row_ref, metadata)) = response.inline_rows.get(i) {
+                                    let row = row_ref.to_owned();
+                                    let diff = metadata.diff.get();
+                                    let diff_i64 =
+                                        i64::try_from(diff).expect("diff should fit in i64");
+
+                                    batch_builder
+                                        .add(
+                                            &SourceData(Ok(row)),
+                                            &(),
+                                            &mz_repr::Timestamp::default(),
+                                            &diff_i64,
+                                        )
+                                        .await
+                                        .expect("invalid usage");
+                                }
+                            }
+
+                            let inline_batch =
+                                batch_builder.finish(upper).await.expect("invalid usage");
+                            batches.push(inline_batch);
                         }
+
+                        let as_of = Antichain::from_elem(mz_repr::Timestamp::default());
+                        let read_schemas: Schemas<SourceData, ()> = Schemas {
+                            id: None,
+                            key: Arc::new(response_relation_desc.clone()),
+                            val: Arc::new(UnitSchema),
+                        };
+
+                        let mut row_cursor = persist_client
+                            .read_batches_consolidated::<_, _, _, i64>(
+                                response.shard_id,
+                                as_of,
+                                read_schemas,
+                                batches,
+                                |_stats| true,
+                            )
+                            .await
+                            .expect("invalid usage");
 
                         let mut current_batch = Vec::new();
                         let mut current_batch_size: usize = 0;
@@ -889,6 +921,7 @@ impl crate::coord::Coordinator {
                                     // slow path already, since we're returning a big
                                     // stashed result so this is worth the convenience
                                     // of that for now.
+                                    tracing::info!(?current_batch, "batch of rows");
                                     let result = tx
                                         .send(RowCollection::new(
                                             current_batch.drain(..).collect_vec(),
@@ -908,6 +941,7 @@ impl crate::coord::Coordinator {
                         }
 
                         if current_batch.len() > 0 {
+                            tracing::info!(?current_batch, "batch of rows");
                             let result = tx.send(RowCollection::new(current_batch, &[])).await;
                             if result.is_err() {
                                 tracing::error!("receiver went away");
@@ -926,7 +960,7 @@ impl crate::coord::Coordinator {
                         "can only get stashed responses when the finishing is streamable"
                     );
 
-                    tracing::trace!("query result is streamable!");
+                    tracing::info!("query result is streamable!");
 
                     let mut incremental_finishing = RowSetFinishingIncremental::new(
                         finishing,
