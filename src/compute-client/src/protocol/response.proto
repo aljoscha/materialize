@@ -66,6 +66,11 @@ message ProtoStashedPeekResponse {
   uint64 num_rows = 4;
   uint64 encoded_size_bytes = 5;
   mz_expr.row.collection.ProtoRowCollection inline_rows = 6;
+  ProtoPermutationInfo order_by_permutation = 7;
+}
+
+message ProtoPermutationInfo {
+  repeated uint64 permutation = 1;
 }
 
 message ProtoPeekResponse {

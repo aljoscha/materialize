@@ -36,8 +36,8 @@ use mz_repr::explain::{
     DummyHumanizer, ExplainConfig, ExprHumanizer, IndexUsageType, PlanRenderingContext,
 };
 use mz_repr::{
-    ColumnName, ColumnType, Datum, Diff, GlobalId, IntoRowIterator, RelationType, Row, RowIterator,
-    ScalarType,
+    ColumnName, ColumnType, Datum, Diff, GlobalId, IntoRowIterator, RelationDesc, RelationType,
+    Row, RowIterator, ScalarType,
 };
 use proptest::prelude::{Arbitrary, BoxedStrategy, any};
 use proptest::strategy::{Strategy, Union};
@@ -3696,6 +3696,78 @@ impl<L> RowSetFinishing<L> {
     pub fn is_streamable(&self, arity: usize) -> bool {
         self.order_by.is_empty() && self.project.iter().copied().eq(0..arity)
     }
+
+    /// True if the finishing can be streamed when the columns preserve their order.
+    ///
+    /// This is a more permissive version of `is_streamable` that allows ORDER BY
+    /// on columns that preserve their sort order when encoded.
+    ///
+    /// Returns None if not streamable, or Some((permutation, inverse_permutation)) if streamable.
+    /// The permutation brings the order_by columns to the front in the requested order.
+    pub fn is_streamable_with_order_by(
+        &self,
+        column_types: &[ColumnType],
+    ) -> Option<(Vec<usize>, Vec<usize>)> {
+        use mz_repr::preserves_order;
+
+        // First check the basic streamability conditions (project and offset)
+        if !self.project.iter().copied().eq(0..column_types.len()) {
+            return None;
+        }
+
+        // If no order_by, use the simpler check
+        if self.order_by.is_empty() {
+            // Identity permutation
+            let identity: Vec<usize> = (0..column_types.len()).collect();
+            return Some((identity.clone(), identity));
+        }
+
+        // Check that all order_by columns preserve order
+        for order in &self.order_by {
+            let col_type = &column_types.get(order.column)?;
+            if !preserves_order(&col_type.scalar_type) {
+                tracing::warn!(?col_type, "doesn't preserve order");
+                return None;
+            }
+            // Also check that nulls are handled correctly
+            if col_type.nullable && !order.nulls_last {
+                // If the column is nullable and we don't have nulls_last,
+                // we can't use the optimization because persist sorts nulls first
+                // but SQL default is nulls last for ASC
+                tracing::warn!("is nullable and persist sorts nulls first");
+                return None;
+            }
+            // desc is also not supported for now as persist always sorts ascending
+            if order.desc {
+                return None;
+            }
+        }
+
+        // Build the permutation: order_by columns first, then the rest
+        let mut permutation = Vec::with_capacity(column_types.len());
+        let mut used_columns = std::collections::BTreeSet::new();
+
+        // Add order_by columns in the specified order
+        for order in &self.order_by {
+            permutation.push(order.column);
+            used_columns.insert(order.column);
+        }
+
+        // Add remaining columns
+        for i in 0..column_types.len() {
+            if !used_columns.contains(&i) {
+                permutation.push(i);
+            }
+        }
+
+        // Build the inverse permutation
+        let mut inverse_permutation = vec![0; column_types.len()];
+        for (new_pos, &old_pos) in permutation.iter().enumerate() {
+            inverse_permutation[old_pos] = new_pos;
+        }
+
+        Some((permutation, inverse_permutation))
+    }
 }
 
 impl RowSetFinishing {
@@ -3774,6 +3846,8 @@ impl RowSetFinishing {
 /// on query result size.
 #[derive(Debug)]
 pub struct RowSetFinishingIncremental {
+    /// Order rows by the given columns.
+    pub order_by: Vec<ColumnOrder>,
     /// Include only as many rows (after offset).
     pub remaining_limit: Option<usize>,
     /// Omit as many rows.
@@ -3796,10 +3870,14 @@ impl RowSetFinishingIncremental {
     /// Panics if the result is not streamable, that is it has an ORDER BY.
     pub fn new(
         finishing: RowSetFinishing,
-        arity: usize,
+        response_desc: RelationDesc,
         max_returned_query_size: Option<u64>,
     ) -> Self {
-        assert!(finishing.is_streamable(arity));
+        assert!(
+            finishing
+                .is_streamable_with_order_by(&response_desc.typ().column_types)
+                .is_some()
+        );
 
         let limit = finishing.limit.map(|l| {
             let l = u64::from(l);
@@ -3808,6 +3886,7 @@ impl RowSetFinishingIncremental {
         });
 
         RowSetFinishingIncremental {
+            order_by: finishing.order_by,
             remaining_limit: limit,
             remaining_offset: finishing.offset,
             max_returned_query_size,
@@ -3819,7 +3898,7 @@ impl RowSetFinishingIncremental {
     /// Applies finishing actions to the given [`RowCollection`], and reports
     /// the total time it took to run.
     ///
-    /// Returns a [`SortedRowCollectionIter`] that contains all of the response
+    /// Returns a [`SortedRowCollectconIter`] that contains all of the response
     /// data.
     pub fn finish_incremental(
         &mut self,
@@ -3852,7 +3931,7 @@ impl RowSetFinishingIncremental {
 
         let batch_num_rows = rows.count(0, None);
 
-        let sorted_view = rows.sorted_view(&[]);
+        let sorted_view = rows.sorted_view(&self.order_by);
         let mut iter = sorted_view
             .into_row_iter()
             .apply_offset(self.remaining_offset)

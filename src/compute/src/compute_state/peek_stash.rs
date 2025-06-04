@@ -19,7 +19,7 @@ use mz_persist_client::Schemas;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_persist_types::{PersistLocation, ShardId};
-use mz_repr::{Diff, RelationDesc, Row, Timestamp};
+use mz_repr::{DatumVec, Diff, RelationDesc, RelationType, Row, Timestamp};
 use mz_storage_types::sources::SourceData;
 use timely::progress::Antichain;
 use tokio::sync::mpsc::error::TrySendError;
@@ -64,6 +64,7 @@ impl StashPeekResponse {
         persist_location: &PersistLocation,
         peek: Peek,
         mut trace_bundle: TraceBundle,
+        order_by_permutation: Option<Vec<usize>>,
     ) -> Self {
         let (rows_tx, rows_rx) = tokio::sync::mpsc::channel(10);
         let (result_tx, result_rx) = oneshot::channel::<(PeekResponse, Duration)>();
@@ -93,6 +94,7 @@ impl StashPeekResponse {
                 peek.uuid,
                 relation_desc,
                 rows_rx,
+                order_by_permutation,
             )
             .await;
 
@@ -124,6 +126,7 @@ impl StashPeekResponse {
         peek_uuid: Uuid,
         relation_desc: RelationDesc,
         mut rows_rx: tokio::sync::mpsc::Receiver<Result<Vec<(Row, NonZeroI64)>, String>>,
+        order_by_permutation: Option<Vec<usize>>,
     ) -> Result<PeekResponse, String> {
         let client = persist_clients
             .open(persist_location)
@@ -132,9 +135,28 @@ impl StashPeekResponse {
 
         let shard_id = format!("s{}", peek_uuid);
         let shard_id = ShardId::try_from(shard_id).expect("can parse");
+
+        // If we have a permutation, we need to create a modified relation_desc
+        // that reflects the permuted column order
+        let (write_relation_desc, permutation) = if let Some(perm) = &order_by_permutation {
+            let mut new_column_types = Vec::with_capacity(relation_desc.typ().column_types.len());
+            let mut new_column_names = Vec::with_capacity(relation_desc.typ().column_types.len());
+
+            for &idx in perm {
+                new_column_types.push(relation_desc.typ().column_types[idx].clone());
+                let column_name = relation_desc.get_name(idx).clone();
+                new_column_names.push(column_name);
+            }
+
+            let new_desc = RelationDesc::new(RelationType::new(new_column_types), new_column_names);
+            (new_desc, Some(perm.clone()))
+        } else {
+            (relation_desc.clone(), None)
+        };
+
         let write_schemas: Schemas<SourceData, ()> = Schemas {
             id: None,
-            key: Arc::new(relation_desc.clone()),
+            key: Arc::new(write_relation_desc.clone()),
             val: Arc::new(UnitSchema),
         };
 
@@ -154,6 +176,9 @@ impl StashPeekResponse {
 
         let mut num_rows: u64 = 0;
 
+        let mut datum_buf = DatumVec::new();
+        let mut row_buf = Row::default();
+
         loop {
             let row = rows_rx.recv().await;
             match row {
@@ -168,8 +193,25 @@ impl StashPeekResponse {
                             u64::from(NonZeroU64::try_from(diff).expect("diff fits into u64"));
                         let diff: i64 = diff.into();
 
+                        // Apply permutation if needed
+                        let row_to_write = if let Some(perm) = &permutation {
+                            let datums = datum_buf.borrow_with(&row);
+                            row_buf.packer().extend(perm.iter().map(|i| &datums[*i]));
+
+                            drop(datums);
+
+                            std::mem::replace(&mut row_buf, row)
+                        } else {
+                            row
+                        };
+
                         batch_builder
-                            .add(&SourceData(Ok(row)), &(), &Timestamp::default(), &diff)
+                            .add(
+                                &SourceData(Ok(row_to_write)),
+                                &(),
+                                &Timestamp::default(),
+                                &diff,
+                            )
                             .await
                             .expect("invalid usage");
                     }
@@ -186,10 +228,11 @@ impl StashPeekResponse {
         let stashed_response = StashedPeekResponse {
             num_rows: u64::cast_from(num_rows),
             encoded_size_bytes: batch.encoded_size_bytes(),
-            relation_desc,
+            relation_desc: write_relation_desc,
             shard_id,
             batches: vec![batch.into_transmittable_batch()],
             inline_rows: RowCollection::new(vec![], &[]),
+            order_by_permutation: order_by_permutation,
         };
         let result = PeekResponse::Stashed(stashed_response);
         Ok(result)

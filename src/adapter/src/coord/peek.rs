@@ -41,7 +41,10 @@ use mz_persist_client::Schemas;
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_repr::explain::text::DisplayText;
 use mz_repr::explain::{CompactScalars, IndexUsageType, PlanRenderingContext, UsedIndexes};
-use mz_repr::{Diff, GlobalId, IntoRowIterator, RelationType, Row, RowIterator, preserves_order};
+use mz_repr::{
+    DatumVec, Diff, GlobalId, IntoRowIterator, RelationDesc, RelationType, Row, RowIterator,
+    preserves_order,
+};
 use mz_storage_types::sources::SourceData;
 use serde::{Deserialize, Serialize};
 use timely::progress::{Antichain, Timestamp};
@@ -535,6 +538,14 @@ impl crate::coord::Coordinator {
             source_ids,
         } = plan;
 
+        // At this stage we don't know the real column names for the result.
+        let intermediate_result_column_names =
+            (0..intermediate_result_type.arity()).map(|i| format!("peek_{i}"));
+        let intermediate_result_desc = RelationDesc::new(
+            intermediate_result_type.clone(),
+            intermediate_result_column_names,
+        );
+
         // If the dataflow optimizes to a constant expression, we can immediately return the result.
         if let PeekPlan::FastPath(FastPathPlan::Constant(rows, _)) = fast_path {
             let mut rows = match rows {
@@ -747,6 +758,7 @@ impl crate::coord::Coordinator {
                 .get(self.catalog().system_config().dyncfgs());
 
         let peek_response_stream = Self::create_peek_response_stream(
+            intermediate_result_desc,
             rows_rx,
             finishing,
             max_result_size,
@@ -766,6 +778,7 @@ impl crate::coord::Coordinator {
     /// Creates an async stream that processes peek responses and yields rows.
     #[mz_ore::instrument(level = "debug")]
     fn create_peek_response_stream(
+        intermediate_result_desc: RelationDesc,
         rows_rx: tokio::sync::oneshot::Receiver<PeekResponse>,
         finishing: RowSetFinishing,
         max_result_size: u64,
@@ -799,6 +812,13 @@ impl crate::coord::Coordinator {
                 }
                 PeekResponse::Stashed(response) => {
                     let shard_id = response.shard_id;
+                    let inverse_permutation = response.order_by_permutation.as_ref().map(|perm| {
+                        let mut inverse = vec![0; perm.len()];
+                        for (new_pos, &old_pos) in perm.iter().enumerate() {
+                            inverse[old_pos] = new_pos;
+                        }
+                        inverse
+                    });
 
                     let mut batches = Vec::new();
                     for proto_batch in response.batches.into_iter() {
@@ -827,7 +847,10 @@ impl crate::coord::Coordinator {
                     // batches already, and so we piggy-back on that, even if it
                     // might not exist as of today.
                     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
                     let response_relation_desc = response.relation_desc.clone();
+                    let finishing_order_by = finishing.order_by.clone();
+
                     mz_ore::task::spawn(|| "read_peek_batches", async move {
                         // If we have inline_rows, create a batch for them too
                         if response.inline_rows.count(0, None) > 0 {
@@ -893,8 +916,20 @@ impl crate::coord::Coordinator {
                             .await
                             .expect("invalid usage");
 
+                        let to_row_collection =
+                            |row_vec: &mut Vec<(Row, NonZeroUsize)>| -> RowCollection {
+                                tracing::info!(?row_vec, "batch of rows");
+                                RowCollection::new(
+                                    row_vec.drain(..).collect_vec(),
+                                    &finishing_order_by,
+                                )
+                            };
+
                         let mut current_batch = Vec::new();
                         let mut current_batch_size: usize = 0;
+
+                        let mut datum_buf = DatumVec::new();
+                        let mut row_buf = Row::default();
 
                         'outer: while let Some(rows) = row_cursor.next().await {
                             for ((key, _val), _ts, diff) in rows {
@@ -910,9 +945,25 @@ impl crate::coord::Coordinator {
                                 if diff > 0 {
                                     let diff =
                                         NonZeroUsize::new(diff).expect("checked to be non-zero");
+
+                                    let row_to_send = if let Some(inv_perm) = &inverse_permutation {
+                                        tracing::info!(?row, ?inv_perm, "applying inv_perm");
+
+                                        let datums = datum_buf.borrow_with(&row);
+                                        row_buf
+                                            .packer()
+                                            .extend(inv_perm.iter().map(|i| &datums[*i]));
+
+                                        drop(datums);
+
+                                        std::mem::replace(&mut row_buf, row)
+                                    } else {
+                                        row
+                                    };
+
                                     current_batch_size =
-                                        current_batch_size.saturating_add(row.byte_len());
-                                    current_batch.push((row, diff));
+                                        current_batch_size.saturating_add(row_to_send.byte_len());
+                                    current_batch.push((row_to_send, diff));
                                 }
 
                                 if current_batch_size > peek_stash_read_batch_size_bytes {
@@ -921,13 +972,8 @@ impl crate::coord::Coordinator {
                                     // slow path already, since we're returning a big
                                     // stashed result so this is worth the convenience
                                     // of that for now.
-                                    tracing::info!(?current_batch, "batch of rows");
-                                    let result = tx
-                                        .send(RowCollection::new(
-                                            current_batch.drain(..).collect_vec(),
-                                            &[],
-                                        ))
-                                        .await;
+                                    let result =
+                                        tx.send(to_row_collection(&mut current_batch)).await;
                                     if result.is_err() {
                                         tracing::error!("receiver went away");
                                         // Don't return but break so we fall out to the
@@ -941,8 +987,7 @@ impl crate::coord::Coordinator {
                         }
 
                         if current_batch.len() > 0 {
-                            tracing::info!(?current_batch, "batch of rows");
-                            let result = tx.send(RowCollection::new(current_batch, &[])).await;
+                            let result = tx.send(to_row_collection(&mut current_batch)).await;
                             if result.is_err() {
                                 tracing::error!("receiver went away");
                             }
@@ -955,8 +1000,11 @@ impl crate::coord::Coordinator {
                         }
                     });
 
+                    let is_streamable = response.order_by_permutation.is_some()
+                        || finishing.is_streamable(intermediate_result_desc.arity());
+
                     assert!(
-                        finishing.is_streamable(response.relation_desc.arity()),
+                        is_streamable,
                         "can only get stashed responses when the finishing is streamable"
                     );
 
@@ -964,7 +1012,7 @@ impl crate::coord::Coordinator {
 
                     let mut incremental_finishing = RowSetFinishingIncremental::new(
                         finishing,
-                        response.relation_desc.arity(),
+                        intermediate_result_desc.clone(),
                         max_returned_query_size,
                     );
 

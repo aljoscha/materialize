@@ -99,7 +99,7 @@ pub enum ComputeResponse<T = mz_repr::Timestamp> {
     /// minimum time until the subscribe advances to the empty frontier or is
     /// dropped. The time intervals of consecutive [`Batch`]es must be increasing, contiguous,
     /// non-overlapping, and non-empty. All updates transmitted in a batch must be consolidated and
-    /// have times within that batch’s time interval. All updates' times must be greater than or
+    /// have times within that batch's time interval. All updates' times must be greater than or
     /// equal to `as_of`. The `upper` of the first [`Batch`] of a subscribe must not be less than
     /// that subscribe's initial `as_of` frontier.
     ///
@@ -107,7 +107,7 @@ pub enum ComputeResponse<T = mz_repr::Timestamp> {
     /// an [`AllowCompaction` command] that advanced its read frontier to the empty frontier. The
     /// [`DroppedAt`] frontier must be the upper frontier of the last emitted batch.
     ///
-    /// The replica must not send a [`DroppedAt`] response if the subscribe’s upper frontier
+    /// The replica must not send a [`DroppedAt`] response if the subscribe's upper frontier
     /// (reported by [`Batch`] responses) has advanced to the empty frontier (e.g. because its
     /// inputs advanced to the empty frontier).
     ///
@@ -256,7 +256,7 @@ pub struct FrontiersResponse<T = mz_repr::Timestamp> {
     /// The collection's new input frontier, if any.
     ///
     /// Upon receiving an updated `input_frontier`, the controller may assume that the replica has
-    /// finished reading from the collection’s inputs up to that frontier. Once it has reported the
+    /// finished reading from the collection's inputs up to that frontier. Once it has reported the
     /// `input_frontier` as the empty frontier, the replica must no longer read from the
     /// collection's inputs.
     pub input_frontier: Option<Antichain<T>>,
@@ -389,6 +389,10 @@ pub struct StashedPeekResponse {
     /// The sum of the encoded sizes of all batches in this response.
     pub encoded_size_bytes: usize,
     /// [RelationDesc] for the rows in these stashed batches of results.
+    ///
+    /// If there is an ORDER BY, this relation desc will not match the relation
+    /// desc for the intermediate result of the peek, columns are permuted to
+    /// accomodate the ORDER BY.
     pub relation_desc: RelationDesc,
     /// The [ShardId] under which result batches have been stashed.
     pub shard_id: ShardId,
@@ -401,6 +405,12 @@ pub struct StashedPeekResponse {
     /// We will have a mix of stashed responses and inline responses because the
     /// result sizes across different workers can and will vary.
     pub inline_rows: RowCollection,
+    /// Column permutation for ORDER BY.
+    ///
+    /// If Some, indicates that columns were permuted when storing rows to
+    /// support ORDER BY queries. The inverse permutation must be applied after
+    /// reading rows back from batches.
+    pub order_by_permutation: Option<Vec<usize>>,
 }
 
 impl StashedPeekResponse {
@@ -439,6 +449,11 @@ impl RustType<ProtoStashedPeekResponse> for StashedPeekResponse {
             num_rows: self.num_rows.into_proto(),
             encoded_size_bytes: self.encoded_size_bytes.into_proto(),
             inline_rows: Some(self.inline_rows.into_proto()),
+            order_by_permutation: self.order_by_permutation.as_ref().map(|p| {
+                ProtoPermutationInfo {
+                    permutation: p.into_proto(),
+                }
+            }),
         }
     }
 
@@ -458,6 +473,10 @@ impl RustType<ProtoStashedPeekResponse> for StashedPeekResponse {
             inline_rows: proto
                 .inline_rows
                 .into_rust_if_some("ProtoStashedPeekResponse::inline_rows")?,
+            order_by_permutation: proto
+                .order_by_permutation
+                .map(|pi| pi.permutation.into_rust())
+                .transpose()?,
         })
     }
 }

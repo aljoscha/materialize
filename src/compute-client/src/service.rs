@@ -365,6 +365,7 @@ where
                                     shard_id: self_shard_id,
                                     batches: mut self_batches,
                                     inline_rows: mut self_inline_rows,
+                                    order_by_permutation: self_permutation_info,
                                 } = stashed;
                                 let StashedPeekResponse {
                                     num_rows: other_num_rows,
@@ -373,10 +374,12 @@ where
                                     shard_id: other_shard_id,
                                     batches: mut other_batches,
                                     inline_rows: other_inline_rows,
+                                    order_by_permutation: other_permutation_info,
                                 } = other;
 
                                 assert_eq!(self_shard_id, other_shard_id);
                                 assert_eq!(self_relation_desc, other_relation_desc);
+                                assert_eq!(self_permutation_info, other_permutation_info);
 
                                 let total_inlined_size = self_inline_rows
                                     .byte_len()
@@ -404,6 +407,7 @@ where
                                         shard_id: self_shard_id,
                                         batches: self_batches,
                                         inline_rows: self_inline_rows,
+                                        order_by_permutation: self_permutation_info,
                                     };
 
                                     PeekResponse::Stashed(merged_response)

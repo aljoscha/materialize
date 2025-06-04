@@ -906,10 +906,21 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
     fn process_peek(&mut self, upper: &mut Antichain<Timestamp>, mut peek: PendingPeek) {
         let response = match &mut peek {
             PendingPeek::Index(peek) => {
-                let peek_stash_eligible = peek
+                // Check if peek is stash eligible using the new method
+                let order_by_permutation = peek
                     .peek
                     .finishing
-                    .is_streamable(peek.peek.result_desc.arity());
+                    .is_streamable_with_order_by(&peek.peek.result_desc.typ().column_types)
+                    .map(|(perm, _)| perm); // Extract only the permutation, not the inverse
+
+                let peek_stash_eligible = if order_by_permutation.is_some() {
+                    true
+                } else {
+                    // Fall back to old behavior
+                    peek.peek
+                        .finishing
+                        .is_streamable(peek.peek.result_desc.arity())
+                };
 
                 let peek_stash_enabled =
                     ENABLE_PEEK_RESPONSE_STASH.get(&self.compute_state.worker_config);
@@ -936,6 +947,7 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
                                 .expect("missing persist location for peek responses"),
                             peek.peek.clone(),
                             peek.trace_bundle.clone(),
+                            order_by_permutation.clone(),
                         );
                         self.compute_state
                             .pending_peek_responses
