@@ -36,6 +36,7 @@ use mz_compute_client::controller::{
     ComputeController, ComputeControllerResponse, ComputeControllerTimestamp, PeekNotification,
 };
 use mz_compute_client::protocol::response::SubscribeBatch;
+pub use mz_controller_types::ClusterId;
 use mz_controller_types::WatchSetId;
 use mz_dyncfg::{ConfigSet, ConfigUpdates};
 use mz_orchestrator::{NamespacedOrchestrator, Orchestrator, ServiceProcessMetrics};
@@ -102,6 +103,11 @@ pub struct ControllerConfig {
     pub secrets_args: SecretsReaderCliArgs,
     /// The connection context, to thread through to clusterd, with cli flags.
     pub connection_context: ConnectionContext,
+    /// Optional filter for clusters that this controller should manage.
+    ///
+    /// If Some, only clusters whose IDs are in this set will be created and managed.
+    /// If None, all clusters will be managed.
+    pub cluster_filter: Option<BTreeSet<ClusterId>>,
 }
 
 /// Responses that [`Controller`] can produce.
@@ -198,12 +204,38 @@ pub struct Controller<T: ComputeControllerTimestamp = mz_repr::Timestamp> {
 
     /// Dynamic system configuration.
     dyncfg: ConfigSet,
+    /// Optional filter for clusters that this controller should manage.
+    ///
+    /// If Some, only clusters whose IDs are in this set will be created and managed.
+    /// If None, all clusters will be managed.
+    cluster_filter: Option<BTreeSet<ClusterId>>,
 }
 
 impl<T: ComputeControllerTimestamp> Controller<T> {
     /// Update the controller configuration.
     pub fn update_configuration(&mut self, updates: ConfigUpdates) {
         updates.apply(&self.dyncfg);
+    }
+
+    /// Returns whether a cluster should be managed by this controller.
+    ///
+    /// If no filter is configured, all clusters are managed.
+    /// If a filter is configured, only clusters in the filter set are managed.
+    pub fn is_responsible_for_cluster(&self, cluster_id: &ClusterId) -> bool {
+        self.cluster_filter
+            .as_ref()
+            .map_or(true, |filter| filter.contains(cluster_id))
+    }
+
+    /// Returns the cluster filter.
+    ///
+    /// If no filter is configured, all clusters are managed.
+    /// If a filter is configured, only clusters in the filter set are managed.
+    pub fn cluster_filter(&self) -> Vec<ClusterId> {
+        self.cluster_filter
+            .as_ref()
+            .map(|f| f.iter().cloned().collect())
+            .unwrap_or_else(|| Vec::new())
     }
 
     /// Start sinking the compute controller's introspection data into storage.
@@ -259,6 +291,7 @@ impl<T: ComputeControllerTimestamp> Controller<T> {
             watch_set_id_gen: _,
             immediate_watch_sets,
             dyncfg: _,
+            cluster_filter: _,
         } = self;
 
         let compute = compute.dump().await?;
@@ -725,6 +758,7 @@ where
             watch_set_id_gen: Gen::default(),
             immediate_watch_sets: Vec::new(),
             dyncfg: mz_dyncfgs::all_dyncfgs(),
+            cluster_filter: config.cluster_filter,
         };
 
         if !this.read_only {

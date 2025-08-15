@@ -253,6 +253,16 @@ impl Coordinator {
         // Collect optimizer parameters.
         let catalog = self.owned_catalog();
         let cluster = catalog.resolve_target_cluster(target_cluster, session)?;
+
+        // Check if this cluster is managed by this controller
+        if !self.controller.is_responsible_for_cluster(&cluster.id()) {
+            return Err(AdapterError::NotResponsibleForCluster {
+                cluster_name: cluster.name().to_string(),
+                cluster_id: cluster.id(),
+                responsible_clusters: self.controller.cluster_filter(),
+            });
+        }
+
         let compute_instance = self
             .instance_snapshot(cluster.id())
             .expect("compute instance does not exist");
@@ -523,6 +533,10 @@ impl Coordinator {
             // There's a chance for index skew (indexes were created/deleted between stages) from the
             // original plan, but that seems acceptable for insights.
             for cluster in self.catalog().user_clusters() {
+                // Skip clusters that are not managed by this controller
+                if !self.controller.is_responsible_for_cluster(&cluster.id) {
+                    continue;
+                }
                 let snapshot = self.instance_snapshot(cluster.id).expect("must exist");
                 compute_instances.insert(cluster.name.clone(), snapshot);
             }

@@ -114,6 +114,12 @@ pub enum AdapterError {
         name: String,
         is_managed: bool,
     },
+    /// Target cluster is not the responsibility of this environmentd instance.
+    NotResponsibleForCluster {
+        cluster_name: String,
+        cluster_id: mz_controller_types::ClusterId,
+        responsible_clusters: Vec<mz_controller_types::ClusterId>,
+    },
     /// The named operation cannot be run in a transaction.
     OperationProhibitsTransaction(String),
     /// The named operation requires an active transaction.
@@ -413,6 +419,10 @@ impl AdapterError {
                     "Use CREATE CLUSTER REPLICA to attach cluster replicas to the cluster".into()
                 })
             }
+            AdapterError::NotResponsibleForCluster { cluster_name, cluster_id, responsible_clusters } => {
+                Some(format!("This endpoint is configured to only respond to queries on a specific set of clusters ({:?}). \
+                     The requested cluster ({}, {}) is not in that set.", responsible_clusters, cluster_name, cluster_id))
+            }
             AdapterError::UntargetedLogRead { .. } => Some(
                 "Use `SET cluster_replica = <replica-name>` to target a specific replica in the \
                  active cluster. Note that subsequent queries will only be answered by \
@@ -506,6 +516,7 @@ impl AdapterError {
             AdapterError::ConcurrentClusterDrop => SqlState::INVALID_TRANSACTION_STATE,
             AdapterError::ConcurrentDependencyDrop { .. } => SqlState::UNDEFINED_OBJECT,
             AdapterError::NoClusterReplicasAvailable { .. } => SqlState::FEATURE_NOT_SUPPORTED,
+            AdapterError::NotResponsibleForCluster { .. } => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::OperationProhibitsTransaction(_) => SqlState::ACTIVE_SQL_TRANSACTION,
             AdapterError::OperationRequiresTransaction(_) => SqlState::NO_ACTIVE_SQL_TRANSACTION,
             AdapterError::ParseError(_) => SqlState::SYNTAX_ERROR,
@@ -770,6 +781,13 @@ impl fmt::Display for AdapterError {
                     f,
                     "CLUSTER {} has no replicas available to service request",
                     name.quoted()
+                )
+            }
+            AdapterError::NotResponsibleForCluster { cluster_name, .. } => {
+                write!(
+                    f,
+                    "CLUSTER {} is not accessible from this endpoint",
+                    cluster_name.quoted()
                 )
             }
             AdapterError::OperationProhibitsTransaction(op) => {

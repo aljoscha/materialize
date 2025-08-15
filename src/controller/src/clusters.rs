@@ -357,11 +357,25 @@ where
     /// A cluster is a combination of a storage instance and a compute instance.
     /// A cluster has zero or more replicas; each replica colocates the storage
     /// and compute layers on the same physical resources.
+    ///
+    /// If a cluster filter is configured, the cluster will only be created if
+    /// its ID is in the allowed list.
     pub fn create_cluster(
         &mut self,
         id: ClusterId,
         config: ClusterConfig,
     ) -> Result<(), anyhow::Error> {
+        // Check if this cluster should be managed by this controller
+        if let Some(ref filter) = self.cluster_filter {
+            if !filter.contains(&id) {
+                info!(
+                    "Skipping cluster creation for cluster {} (not in filter list)",
+                    id
+                );
+                return Ok(());
+            }
+        }
+
         self.storage
             .create_instance(id, config.workload_class.clone());
         self.compute
@@ -370,11 +384,25 @@ where
     }
 
     /// Updates the workload class for a cluster.
+    ///
+    /// If a cluster filter is configured, the update will only be performed if
+    /// the cluster's ID is in the allowed list.
     pub fn update_cluster_workload_class(
         &mut self,
         id: ClusterId,
         workload_class: Option<String>,
     ) -> Result<(), anyhow::Error> {
+        // Check if this cluster should be managed by this controller
+        if let Some(ref filter) = self.cluster_filter {
+            if !filter.contains(&id) {
+                info!(
+                    "Skipping workload class update for cluster {} (not in filter list)",
+                    id
+                );
+                return Ok(());
+            }
+        }
+
         self.storage
             .update_instance_workload_class(id, workload_class.clone());
         self.compute
@@ -384,16 +412,33 @@ where
 
     /// Drops the specified cluster.
     ///
+    /// If a cluster filter is configured, the drop will only be performed if
+    /// the cluster's ID is in the allowed list.
+    ///
     /// # Panics
     ///
     /// Panics if the cluster still has replicas.
     pub fn drop_cluster(&mut self, id: ClusterId) {
+        // Check if this cluster should be managed by this controller
+        if let Some(ref filter) = self.cluster_filter {
+            if !filter.contains(&id) {
+                info!(
+                    "Skipping cluster drop for cluster {} (not in filter list)",
+                    id
+                );
+                return;
+            }
+        }
+
         self.storage.drop_instance(id);
         self.compute.drop_instance(id);
     }
 
     /// Creates a replica of the specified cluster with the specified identifier
     /// and configuration.
+    ///
+    /// If a cluster filter is configured, the replica will only be created if
+    /// the cluster's ID is in the allowed list.
     pub fn create_replica(
         &mut self,
         cluster_id: ClusterId,
@@ -404,6 +449,16 @@ where
         config: ReplicaConfig,
         enable_worker_core_affinity: bool,
     ) -> Result<(), anyhow::Error> {
+        // Check if this cluster should be managed by this controller
+        if let Some(ref filter) = self.cluster_filter {
+            if !filter.contains(&cluster_id) {
+                info!(
+                    "Skipping replica creation for cluster {} (not in filter list)",
+                    cluster_id
+                );
+                return Ok(());
+            }
+        }
         let storage_location: ClusterReplicaLocation;
         let compute_location: ClusterReplicaLocation;
         let metrics_task: Option<AbortOnDropHandle<()>>;
@@ -458,11 +513,24 @@ where
     }
 
     /// Drops the specified replica of the specified cluster.
+    ///
+    /// If a cluster filter is configured, the replica will only be dropped if
+    /// the cluster's ID is in the allowed list.
     pub fn drop_replica(
         &mut self,
         cluster_id: ClusterId,
         replica_id: ReplicaId,
     ) -> Result<(), anyhow::Error> {
+        // Check if this cluster should be managed by this controller
+        if let Some(ref filter) = self.cluster_filter {
+            if !filter.contains(&cluster_id) {
+                info!(
+                    "Skipping replica drop for cluster {} (not in filter list)",
+                    cluster_id
+                );
+                return Ok(());
+            }
+        }
         // We unconditionally deprovision even for unmanaged replicas to avoid
         // needing to keep track of which replicas are managed and which are
         // unmanaged. Deprovisioning is a no-op if the replica ID was never

@@ -12,10 +12,12 @@
 //! It listens for SQL connections on port 6875 (MTRL) and for HTTP connections
 //! on port 6876.
 
+use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::fs::File;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,7 +42,7 @@ use mz_aws_secrets_controller::AwsSecretsController;
 use mz_build_info::BuildInfo;
 use mz_catalog::config::ClusterReplicaSizeMap;
 use mz_cloud_resources::{AwsExternalIdPrefix, CloudResourceController};
-use mz_controller::ControllerConfig;
+use mz_controller::{ClusterId, ControllerConfig};
 use mz_frontegg_auth::{Authenticator as FronteggAuthenticator, FronteggCliArgs};
 use mz_license_keys::{ExpirationBehavior, ValidatedLicenseKey};
 use mz_orchestrator::Orchestrator;
@@ -337,6 +339,14 @@ pub struct Args {
     /// transition of power from the prior generation.
     #[clap(long, env = "DEPLOY_GENERATION", default_value = "0")]
     deploy_generation: u64,
+    /// Optional list of cluster IDs that this environmentd instance should manage.
+    ///
+    /// If specified, only the listed clusters will be created and managed by this
+    /// environmentd instance. This is useful for horizontally scaling environmentd
+    /// by having different instances manage different subsets of clusters.
+    /// The format is a comma-separated list of cluster IDs (e.g., "u1,u2,s1").
+    #[clap(long, env = "CLUSTER_FILTER", use_value_delimiter = true)]
+    cluster_filter: Option<Vec<String>>,
 
     /// Can be provided in place of both persist_consensus_url and
     /// timestamp_oracle_url in order to point both at the same backend
@@ -1023,6 +1033,20 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         cloud_resource_reader,
     );
     let orchestrator = Arc::new(TracingOrchestrator::new(orchestrator, args.tracing.clone()));
+
+    // Parse cluster filter if provided
+    let cluster_filter = if let Some(filter_list) = args.cluster_filter {
+        let mut filter_set = BTreeSet::new();
+        for cluster_str in filter_list {
+            let cluster_id = ClusterId::from_str(&cluster_str)
+                .with_context(|| format!("invalid cluster ID in filter: {}", cluster_str))?;
+            filter_set.insert(cluster_id);
+        }
+        Some(filter_set)
+    } else {
+        None
+    };
+
     let controller = ControllerConfig {
         build_info: &BUILD_INFO,
         orchestrator,
@@ -1047,6 +1071,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
             secrets_reader_aws_prefix: Some(aws_secrets_controller_prefix(&args.environment_id)),
             secrets_reader_name_prefix: args.orchestrator_kubernetes_name_prefix.clone(),
         },
+        cluster_filter,
     };
 
     let cluster_replica_sizes = ClusterReplicaSizeMap::parse_from_str(

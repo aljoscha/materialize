@@ -94,6 +94,10 @@ impl Coordinator {
     pub(super) async fn bootstrap_introspection_subscribes(&mut self) {
         let mut cluster_replicas = Vec::new();
         for cluster in self.catalog.clusters() {
+            // Skip clusters that are not managed by this controller
+            if !self.controller.is_responsible_for_cluster(&cluster.id) {
+                continue;
+            }
             for replica in cluster.replicas() {
                 cluster_replicas.push((cluster.id, replica.replica_id));
             }
@@ -111,6 +115,11 @@ impl Coordinator {
         cluster_id: ClusterId,
         replica_id: ReplicaId,
     ) {
+        // Skip if this cluster is not managed by this controller
+        if !self.controller.is_responsible_for_cluster(&cluster_id) {
+            return;
+        }
+
         let dyncfgs = self.catalog().system_config().dyncfgs();
         if !ENABLE_INTROSPECTION_SUBSCRIBES.get(dyncfgs) {
             return;

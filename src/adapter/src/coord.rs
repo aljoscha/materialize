@@ -2029,6 +2029,11 @@ impl Coordinator {
                         .extend(table.global_ids());
                 }
                 CatalogItem::Index(idx) => {
+                    // Skip indexes for clusters that are not managed by this controller
+                    if !self.controller.is_responsible_for_cluster(&idx.cluster_id) {
+                        continue;
+                    }
+
                     let policy_entry = policies_to_set
                         .entry(policy.expect("indexes have a compaction window"))
                         .or_insert_with(Default::default);
@@ -2076,6 +2081,14 @@ impl Coordinator {
                 }
                 CatalogItem::View(_) => (),
                 CatalogItem::MaterializedView(mview) => {
+                    // Skip materialized views for clusters that are not managed by this controller
+                    if !self
+                        .controller
+                        .is_responsible_for_cluster(&mview.cluster_id)
+                    {
+                        continue;
+                    }
+
                     policies_to_set
                         .entry(policy.expect("materialized views have a compaction window"))
                         .or_insert_with(Default::default)
@@ -2138,6 +2151,11 @@ impl Coordinator {
                     }
                 }
                 CatalogItem::ContinualTask(ct) => {
+                    // Skip continual tasks for clusters that are not managed by this controller
+                    if !self.controller.is_responsible_for_cluster(&ct.cluster_id) {
+                        continue;
+                    }
+
                     policies_to_set
                         .entry(policy.expect("continual tasks have a compaction window"))
                         .or_insert_with(Default::default)
@@ -2988,6 +3006,16 @@ impl Coordinator {
         for entry in ordered_catalog_entries {
             match entry.item() {
                 CatalogItem::Index(idx) => {
+                    // Skip indexes for clusters that are not managed by this controller
+                    if !self.controller.is_responsible_for_cluster(&idx.cluster_id) {
+                        info!(
+                            "Skipping bootstrap optimization for index {:?} on filtered cluster {}",
+                            entry.name(),
+                            idx.cluster_id
+                        );
+                        continue;
+                    }
+
                     // Collect optimizer parameters.
                     let compute_instance =
                         instance_snapshots.entry(idx.cluster_id).or_insert_with(|| {
@@ -3079,6 +3107,16 @@ impl Coordinator {
                     compute_instance.insert_collection(idx.global_id());
                 }
                 CatalogItem::MaterializedView(mv) => {
+                    // Skip materialized views for clusters that are not managed by this controller
+                    if !self.controller.is_responsible_for_cluster(&mv.cluster_id) {
+                        info!(
+                            "Skipping bootstrap optimization for materialized view {:?} on filtered cluster {}",
+                            entry.name(),
+                            mv.cluster_id
+                        );
+                        continue;
+                    }
+
                     // Collect optimizer parameters.
                     let compute_instance =
                         instance_snapshots.entry(mv.cluster_id).or_insert_with(|| {
@@ -3173,6 +3211,16 @@ impl Coordinator {
                     compute_instance.insert_collection(mv.global_id_writes());
                 }
                 CatalogItem::ContinualTask(ct) => {
+                    // Skip continual tasks for clusters that are not managed by this controller
+                    if !self.controller.is_responsible_for_cluster(&ct.cluster_id) {
+                        info!(
+                            "Skipping bootstrap optimization for continual task {:?} on filtered cluster {}",
+                            entry.name(),
+                            ct.cluster_id
+                        );
+                        continue;
+                    }
+
                     let compute_instance =
                         instance_snapshots.entry(ct.cluster_id).or_insert_with(|| {
                             self.instance_snapshot(ct.cluster_id)

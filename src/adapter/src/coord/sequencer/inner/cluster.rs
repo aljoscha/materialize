@@ -901,6 +901,11 @@ impl Coordinator {
     }
 
     async fn create_cluster(&mut self, cluster_id: ClusterId) {
+        if !self.controller.is_responsible_for_cluster(&cluster_id) {
+            tracing::info!("not responsible for cluster {cluster_id}, this is where I cut");
+            return;
+        }
+
         let Coordinator {
             catalog,
             controller,

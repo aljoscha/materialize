@@ -1165,6 +1165,7 @@ impl<'a> RunnerInner<'a> {
                     secrets_reader_name_prefix: None,
                 },
                 connection_context,
+                cluster_filter: None,
             },
             secrets_controller,
             cloud_resource_controller: None,

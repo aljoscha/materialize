@@ -97,6 +97,15 @@ impl Coordinator {
             .resolve_target_cluster(target_cluster, session)?;
         let cluster_id = cluster.id;
 
+        // Check if this cluster is managed by this controller
+        if !self.controller.is_responsible_for_cluster(&cluster_id) {
+            return Err(AdapterError::NotResponsibleForCluster {
+                cluster_name: cluster.name.clone(),
+                cluster_id,
+                responsible_clusters: self.controller.cluster_filter(),
+            });
+        }
+
         if cluster.replicas().next().is_none() {
             return Err(AdapterError::NoClusterReplicasAvailable {
                 name: cluster.name.clone(),
