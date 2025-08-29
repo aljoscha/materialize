@@ -415,18 +415,29 @@ impl Coordinator {
         let catalog = Arc::make_mut(catalog);
         let conn = conn_id.map(|id| active_conns.get(id).expect("connection must exist"));
 
+        let res = loop {
+            let inner_res = catalog
+                .transact(
+                    Some(&mut controller.storage_collections),
+                    oracle_write_ts,
+                    conn,
+                    ops.clone(),
+                )
+                .await;
+
+            match inner_res {
+                Ok(inner_res) => break inner_res,
+                Err(err) => {
+                    tracing::info!(?err, "transaction error, retrying...");
+                }
+            }
+        };
+
         let TransactionResult {
             builtin_table_updates,
             catalog_updates,
             audit_events,
-        } = catalog
-            .transact(
-                Some(&mut controller.storage_collections),
-                oracle_write_ts,
-                conn,
-                ops,
-            )
-            .await?;
+        } = res;
 
         for (cluster_id, replica_id) in &cluster_replicas_to_drop {
             cluster_replica_statuses.remove_cluster_replica_statuses(cluster_id, replica_id);
