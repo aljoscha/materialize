@@ -72,7 +72,6 @@ use crate::catalog::{
 use crate::coord::ConnMeta;
 use crate::coord::catalog_implications::parsed_state_updates::ParsedStateUpdate;
 use crate::coord::cluster_scheduling::SchedulingDecision;
-use crate::util::ResultExt;
 
 #[derive(Debug, Clone)]
 pub enum Op {
@@ -427,10 +426,16 @@ impl Catalog {
         let mut catalog_updates = vec![];
         let mut audit_events = vec![];
         let mut storage = self.storage().await;
-        let mut tx = storage
-            .transaction()
-            .await
-            .unwrap_or_terminate("starting catalog transaction");
+        // TODO: Handle concurrent catalog changes gracefully instead of fencing
+        let mut tx = match storage.transaction().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to start catalog transaction due to concurrent catalog changes: {e:?}"
+                );
+                return Err(e.into());
+            }
+        };
 
         let new_state = Self::transact_inner(
             storage_collections,
@@ -446,13 +451,17 @@ impl Catalog {
         )
         .await?;
 
-        // The user closure was successful, apply the updates. Terminate the
-        // process if this fails, because we have to restart envd due to
-        // indeterminate catalog state, which we only reconcile during catalog
-        // init.
-        tx.commit(oracle_write_ts)
-            .await
-            .unwrap_or_terminate("catalog storage transaction commit must succeed");
+        // The user closure was successful, apply the updates.
+        // TODO: Handle concurrent catalog changes gracefully instead of terminating the process
+        match tx.commit(oracle_write_ts).await {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to commit catalog transaction due to concurrent catalog changes: {e:?}"
+                );
+                return Err(e.into());
+            }
+        };
 
         // Dropping here keeps the mutable borrow on self, preventing us accidentally
         // mutating anything until after f is executed.

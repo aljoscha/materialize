@@ -321,6 +321,7 @@ impl ShouldTerminateGracefully for DurableCatalogError {
             | DurableCatalogError::DuplicateKey
             | DurableCatalogError::UniquenessViolation
             | DurableCatalogError::Storage(_)
+            | DurableCatalogError::UpperMismatch { .. }
             | DurableCatalogError::Internal(_) => false,
         }
     }

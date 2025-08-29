@@ -250,7 +250,7 @@ impl FenceableToken {
     /// returns `None`.
     fn generate_unfenced_token(
         &self,
-        mode: Mode,
+        _mode: Mode,
     ) -> Result<Option<(Vec<(StateUpdateKind, Diff)>, FenceableToken)>, DurableCatalogError> {
         let (durable_token, current_deploy_generation) = match self {
             FenceableToken::Initializing {
@@ -273,14 +273,16 @@ impl FenceableToken {
             .or_else(|| durable_token.as_ref().map(|token| token.deploy_generation))
             // We cannot initialize a catalog without a deploy generation.
             .ok_or(DurableCatalogError::Uninitialized)?;
-        let mut current_epoch = durable_token
+        let current_epoch = durable_token
             .map(|token| token.epoch)
             .unwrap_or(MIN_EPOCH)
             .get();
-        // Only writable catalogs attempt to increment the epoch.
-        if matches!(mode, Mode::Writable) {
-            current_epoch = current_epoch + 1;
-        }
+        // TODO: Remove epoch incrementing to allow concurrent environmentd instances
+        // Previously only writable catalogs attempted to increment the epoch, causing fencing.
+        // For now we keep the epoch the same to allow concurrent instances.
+        // if matches!(mode, Mode::Writable) {
+        //     current_epoch = current_epoch + 1;
+        // }
         let current_epoch = Epoch::new(current_epoch).expect("known to be non-zero");
         let current_token = FenceToken {
             deploy_generation: current_deploy_generation,
@@ -320,6 +322,27 @@ impl CompareAndAppendError {
             CompareAndAppendError::Fence(e) => e,
             e @ CompareAndAppendError::UpperMismatch { .. } => {
                 panic!("unexpected upper mismatch: {e:?}")
+            }
+        }
+    }
+
+    /// Convert to DurableCatalogError, handling both fence errors and upper mismatches gracefully
+    pub(crate) fn into_catalog_error(self) -> DurableCatalogError {
+        match self {
+            CompareAndAppendError::Fence(fence_err) => DurableCatalogError::Fence(fence_err),
+            CompareAndAppendError::UpperMismatch {
+                expected_upper,
+                actual_upper,
+            } => {
+                tracing::warn!(
+                    "Upper mismatch during catalog write - concurrent modification detected. Expected: {}, Actual: {}",
+                    expected_upper,
+                    actual_upper
+                );
+                DurableCatalogError::UpperMismatch {
+                    expected_upper,
+                    actual_upper,
+                }
             }
         }
     }
@@ -487,16 +510,18 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
             .expect("invalid usage");
 
         // There was an upper mismatch which means something else must have written to the catalog.
-        // Syncing to the current upper should result in a fence error since writing to the catalog
-        // without fencing other catalogs should be impossible. The one exception is if we are
-        // trying to fence other catalogs with this write, in which case we won't see a fence error.
+        // TODO: With concurrent environmentd instances, upper mismatches can occur without fencing
+        // Previously we would expect either this instance to be fenced or this write to be fencing,
+        // but now we allow concurrent non-fencing writes.
         if let Err(e @ UpperMismatch { .. }) = res {
             self.sync_to_current_upper().await?;
             if let Some((contains_fence, updates)) = contains_fence {
-                assert!(
-                    contains_fence,
-                    "updates were neither fenced nor fencing and encountered an upper mismatch: {updates:#?}"
-                )
+                // Log the concurrent write but don't assert/panic
+                if !contains_fence {
+                    tracing::warn!(
+                        "Upper mismatch due to concurrent catalog write without fencing: {updates:#?}"
+                    );
+                }
             }
             return Err(e.into());
         }
@@ -1764,7 +1789,7 @@ impl DurableCatalogState for PersistCatalogState {
                 Mode::Writable => catalog
                     .compare_and_append(updates, commit_ts)
                     .await
-                    .map_err(|e| e.unwrap_fence_error())?,
+                    .map_err(|e| e.into_catalog_error())?,
                 Mode::Savepoint => {
                     let updates = updates.into_iter().map(|(kind, diff)| StateUpdate {
                         kind,
@@ -2040,7 +2065,7 @@ impl UnopenedPersistCatalogState {
                 None => {
                     self.compare_and_append(updates, self.upper)
                         .await
-                        .map_err(|e| e.unwrap_fence_error())?;
+                        .map_err(|e| e.into_catalog_error())?;
                     break prev_value;
                 }
             }
@@ -2092,7 +2117,7 @@ impl UnopenedPersistCatalogState {
                 None => {
                     self.compare_and_append(retractions, self.upper)
                         .await
-                        .map_err(|e| e.unwrap_fence_error())?;
+                        .map_err(|e| e.into_catalog_error())?;
                     break;
                 }
             }

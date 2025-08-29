@@ -200,10 +200,19 @@ pub async fn preflight_0dt(
             .await
             .expect("incompatible catalog/persist version");
 
-            let (_catalog, _audit_logs) = openable_adapter_storage
+            // TODO: Consider if this intentional fencing should also be made more graceful
+            let (_catalog, _audit_logs) = match openable_adapter_storage
                 .open(boot_ts, &bootstrap_args)
                 .await
-                .unwrap_or_terminate("unexpected error while fencing out old deployment");
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to open catalog while fencing out old deployment: {e:?}"
+                    );
+                    std::process::exit(0); // This was previously unwrap_or_terminate behavior
+                }
+            };
 
             // Reboot as the leader.
             halt!("fenced out old deployment; rebooting as leader")
@@ -333,10 +342,20 @@ async fn get_next_ids(
     .await
     .expect("incompatible catalog/persist version");
 
-    let (mut catalog, _audit_logs) = openable_adapter_storage
+    // TODO: Handle concurrent catalog changes gracefully instead of terminating
+    let (mut catalog, _audit_logs) = match openable_adapter_storage
         .open_savepoint(boot_ts, &bootstrap_args)
         .await
-        .unwrap_or_terminate("can open in savepoint mode");
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to open catalog in savepoint mode due to concurrent catalog changes: {e:?}"
+            );
+            // For now, we still panic as this function needs a different return type to handle errors properly
+            panic!("can open in savepoint mode: {e:?}")
+        }
+    };
 
     let next_user_item_id = catalog
         .get_next_user_item_id()

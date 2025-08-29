@@ -81,6 +81,14 @@ pub enum DurableCatalogError {
     /// A programming error occurred during a [`mz_storage_client::controller::StorageTxn`].
     #[error(transparent)]
     Storage(StorageError<Timestamp>),
+    /// Upper mismatch occurred due to concurrent catalog writes.
+    #[error(
+        "Concurrent catalog modification detected: expected upper {expected_upper}, actual upper {actual_upper}"
+    )]
+    UpperMismatch {
+        expected_upper: mz_repr::Timestamp,
+        actual_upper: mz_repr::Timestamp,
+    },
     /// An internal programming error.
     #[error("Internal catalog error: {0}")]
     Internal(String),
