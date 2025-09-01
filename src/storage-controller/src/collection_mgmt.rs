@@ -790,7 +790,7 @@ where
                     return ControlFlow::Break("upper is the empty antichain".to_string());
                 };
 
-                tracing::info!(%self.id, ?actual_upper, expected_upper = ?self.current_upper, "upper mismatch while bumping upper, syncing to persist state");
+                tracing::debug!(%self.id, ?actual_upper, expected_upper = ?self.current_upper, "upper mismatch while bumping upper, syncing to persist state");
 
                 self.current_upper = actual_upper;
 
@@ -970,7 +970,7 @@ where
                         return ControlFlow::Break("upper is the empty antichain".to_string());
                     };
 
-                    tracing::info!(%self.id, ?actual_upper, expected_upper = ?self.current_upper, "retrying append for differential collection");
+                    tracing::debug!(%self.id, ?actual_upper, expected_upper = ?self.current_upper, "retrying append for differential collection");
 
                     // We've exhausted all of our retries, notify listeners and
                     // break out of the retry loop so we can wait for more data.
@@ -1520,65 +1520,105 @@ where
         _ => panic!("not a metrics history: {introspection_type:?}"),
     };
 
-    let upper = write_handle.fetch_recent_upper().await;
-    let Some(upper_ts) = upper.as_option() else {
-        bail!("collection is sealed");
-    };
-    let Some(as_of_ts) = upper_ts.step_back() else {
-        return Ok(()); // nothing to truncate
-    };
+    // Retry loop to handle concurrent modifications
+    const MAX_RETRIES: usize = 5;
+    let mut retry_count = 0;
 
-    let mut rows = storage_collections
-        .snapshot_cursor(id, as_of_ts)
-        .await
-        .map_err(|e| anyhow!("reading snapshot: {e:?}"))?;
+    loop {
+        let upper = write_handle.fetch_recent_upper().await;
+        let Some(upper_ts) = upper.as_option() else {
+            bail!("collection is sealed");
+        };
+        let Some(as_of_ts) = upper_ts.step_back() else {
+            return Ok(()); // nothing to truncate
+        };
 
-    let now = mz_ore::now::to_datetime(now());
-    let keep_since = now - keep_duration;
+        let mut rows = storage_collections
+            .snapshot_cursor(id, as_of_ts)
+            .await
+            .map_err(|e| anyhow!("reading snapshot: {e:?}"))?;
 
-    // It is very important that we append our retractions at the timestamp
-    // right after the timestamp at which we got our snapshot. Otherwise,
-    // it's possible for someone else to sneak in retractions or other
-    // unexpected changes.
-    let old_upper_ts = upper_ts.clone();
-    let new_upper_ts = TimestampManipulation::step_forward(&old_upper_ts);
+        let now = mz_ore::now::to_datetime(now());
+        let keep_since = now - keep_duration;
 
-    // Produce retractions by inverting diffs of rows we want to delete.
-    let mut builder = write_handle.builder(Antichain::from_elem(old_upper_ts.clone()));
-    while let Some(chunk) = rows.next().await {
-        for ((key, _v), _t, diff) in chunk {
-            let data = key.map_err(|e| anyhow!("decoding error in metrics snapshot: {e}"))?;
-            let Ok(row) = &data.0 else { continue };
-            let datums = row.unpack();
-            let occurred_at = datums[occurred_at_col].unwrap_timestamptz();
-            if *occurred_at >= keep_since {
-                continue;
+        // It is very important that we append our retractions at the timestamp
+        // right after the timestamp at which we got our snapshot. Otherwise,
+        // it's possible for someone else to sneak in retractions or other
+        // unexpected changes.
+        let old_upper_ts = upper_ts.clone();
+        let new_upper_ts = TimestampManipulation::step_forward(&old_upper_ts);
+
+        // Produce retractions by inverting diffs of rows we want to delete.
+        let mut builder = write_handle.builder(Antichain::from_elem(old_upper_ts.clone()));
+        while let Some(chunk) = rows.next().await {
+            for ((key, _v), _t, diff) in chunk {
+                let data = key.map_err(|e| anyhow!("decoding error in metrics snapshot: {e}"))?;
+                let Ok(row) = &data.0 else { continue };
+                let datums = row.unpack();
+                let occurred_at = datums[occurred_at_col].unwrap_timestamptz();
+                if *occurred_at >= keep_since {
+                    continue;
+                }
+                let diff = -diff;
+                match builder.add(&data, &(), &old_upper_ts, &diff).await? {
+                    Added::Record => {}
+                    Added::RecordAndParts => {
+                        debug!(?id, "added part to builder");
+                    }
+                }
             }
-            let diff = -diff;
-            match builder.add(&data, &(), &old_upper_ts, &diff).await? {
-                Added::Record => {}
-                Added::RecordAndParts => {
-                    debug!(?id, "added part to builder");
+        }
+
+        let mut updates = builder
+            .finish(Antichain::from_elem(new_upper_ts.clone()))
+            .await?;
+        let mut batches = vec![&mut updates];
+
+        match write_handle
+            .compare_and_append_batch(
+                batches.as_mut_slice(),
+                Antichain::from_elem(old_upper_ts),
+                Antichain::from_elem(new_upper_ts),
+                true,
+            )
+            .await
+            .expect("valid usage")
+        {
+            Ok(()) => break, // Success, exit retry loop
+            Err(e) => {
+                // Check if this is an upper mismatch error
+                if e.to_string().contains("UpperMismatch") {
+                    retry_count += 1;
+                    if retry_count >= MAX_RETRIES {
+                        // Max retries exceeded, log and return success to avoid panic
+                        tracing::warn!(
+                            "Failed to truncate metrics history after {} retries due to concurrent modifications: {:?}",
+                            MAX_RETRIES,
+                            e
+                        );
+                        return Ok(());
+                    }
+                    tracing::info!(
+                        "Upper mismatch during metrics truncation, retrying {}/{}: {e:?}",
+                        retry_count,
+                        MAX_RETRIES
+                    );
+                    // Brief delay before retry to reduce contention
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        50 * u64::try_from(retry_count).unwrap_or(1),
+                    ))
+                    .await;
+                    continue; // Retry with fresh snapshot and recomputed retractions
+                } else {
+                    // Non-upper-mismatch error, log and return success to avoid panic
+                    tracing::error!("Non-retryable error during metrics truncation: {e:?}");
+                    return Ok(());
                 }
             }
         }
     }
 
-    let mut updates = builder
-        .finish(Antichain::from_elem(new_upper_ts.clone()))
-        .await?;
-    let mut batches = vec![&mut updates];
-
-    write_handle
-        .compare_and_append_batch(
-            batches.as_mut_slice(),
-            Antichain::from_elem(old_upper_ts),
-            Antichain::from_elem(new_upper_ts),
-            true,
-        )
-        .await
-        .expect("valid usage")
-        .map_err(|e| anyhow!("appending retractions: {e:?}"))
+    Ok(())
 }
 
 /// Effectively truncates the status history shard based on its retention policy.
