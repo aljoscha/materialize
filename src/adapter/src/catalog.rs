@@ -32,7 +32,6 @@ use mz_catalog::builtin::{
     MZ_CATALOG_SERVER_CLUSTER,
 };
 use mz_catalog::config::{BuiltinItemMigrationConfig, ClusterReplicaSizeMap, Config, StateConfig};
-#[cfg(test)]
 use mz_catalog::durable::CatalogError;
 use mz_catalog::durable::{
     BootstrapArgs, DurableCatalogState, TestCatalogStateBuilder, test_bootstrap_args,
@@ -97,7 +96,6 @@ pub use crate::catalog::transact::{
 };
 use crate::command::CatalogDump;
 use crate::coord::TargetCluster;
-#[cfg(test)]
 use crate::coord::catalog_implications::parsed_state_updates::ParsedStateUpdate;
 use crate::session::{Portal, PreparedStatement, Session};
 use crate::util::ResultExt;
@@ -1508,8 +1506,7 @@ impl Catalog {
     /// Listen for and apply all unconsumed updates to the durable catalog state.
     // TODO(jkosh44) When this method is actually used outside of a test we can remove the
     // `#[cfg(test)]` annotation.
-    #[cfg(test)]
-    async fn sync_to_current_updates(
+    pub async fn sync_to_current_updates(
         &mut self,
     ) -> Result<
         (

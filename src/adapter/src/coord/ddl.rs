@@ -415,7 +415,18 @@ impl Coordinator {
         let catalog = Arc::make_mut(catalog);
         let conn = conn_id.map(|id| active_conns.get(id).expect("connection must exist"));
 
+        let mut pending_controller_updates = Vec::new();
+
         let res = loop {
+            // We don't care about builtin table updates, it's the committer's
+            // responsibility to apply them.
+            // WIP: This is a bit wasteful. Instead of always reading these away
+            // we could only try and do so on a txn failure. But ...
+            let (_new_table_updates, mut new_controller_updates) =
+                catalog.sync_to_current_updates().await?;
+
+            pending_controller_updates.append(&mut new_controller_updates);
+
             let inner_res = catalog
                 .transact(
                     Some(&mut controller.storage_collections),
@@ -435,9 +446,11 @@ impl Coordinator {
 
         let TransactionResult {
             builtin_table_updates,
-            catalog_updates,
+            mut catalog_updates,
             audit_events,
         } = res;
+
+        catalog_updates.append(&mut pending_controller_updates);
 
         for (cluster_id, replica_id) in &cluster_replicas_to_drop {
             cluster_replica_statuses.remove_cluster_replica_statuses(cluster_id, replica_id);

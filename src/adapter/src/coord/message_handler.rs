@@ -263,10 +263,9 @@ impl Coordinator {
 
         match self.catalog_transact_inner(None, ops).await {
             Ok((table_updates, catalog_updates)) => {
-                assert!(
-                    catalog_updates.is_empty(),
-                    "applying builtin table updates does not produce catalog implications"
-                );
+                self.apply_catalog_implications(None, catalog_updates)
+                    .await
+                    .expect("can apply controller commands");
 
                 let internal_cmd_tx = self.internal_cmd_tx.clone();
                 let task_span =
