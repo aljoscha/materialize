@@ -61,6 +61,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::client::{AppendOnlyUpdate, StatusUpdate, TableData};
 use crate::statistics::WebhookStatistics;
+use crate::table_worker::CloneableTableWriteWorker;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum IntrospectionType {
@@ -728,6 +729,13 @@ pub trait StorageController: Debug {
         BoxFuture<Result<Self::Timestamp, StorageError<Self::Timestamp>>>,
         StorageError<Self::Timestamp>,
     >;
+
+    /// Returns a table write worker that can be used to perform table write
+    /// operations.
+    ///
+    /// The returned worker is cheaply cloneable and can be shared across async
+    /// tasks for operations like group commit with retry logic.
+    fn persist_table_worker(&self) -> CloneableTableWriteWorker<Self::Timestamp>;
 }
 
 impl<T> DataSource<T> {

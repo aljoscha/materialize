@@ -267,6 +267,21 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> PersistTableWrite
     }
 }
 
+impl<T> mz_storage_client::table_worker::TableWriteWorker<T> for PersistTableWriteWorker<T>
+where
+    T: Timestamp + Lattice + Codec64 + TimestampManipulation,
+{
+    fn append(
+        &self,
+        write_ts: T,
+        advance_to: T,
+        updates: Vec<(mz_repr::GlobalId, Vec<mz_storage_client::client::TableData>)>,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), mz_storage_types::controller::StorageError<T>>>
+    {
+        self.append(write_ts, advance_to, updates)
+    }
+}
+
 struct TxnsTableWorker<T: Timestamp + Lattice + TotalOrder + Codec64> {
     txns: TxnsHandle<SourceData, (), T, StorageDiff, PersistEpoch, TxnsCodecRow>,
     write_handles: BTreeMap<GlobalId, ShardId>,

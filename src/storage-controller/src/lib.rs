@@ -2594,6 +2594,15 @@ where
                 })
         }))
     }
+
+    fn persist_table_worker(
+        &self,
+    ) -> mz_storage_client::table_worker::CloneableTableWriteWorker<Self::Timestamp> {
+        use std::sync::Arc;
+        mz_storage_client::table_worker::CloneableTableWriteWorker::new(Arc::new(
+            self.persist_table_worker.clone(),
+        ))
+    }
 }
 
 /// Seed [`StorageTxn`] with any state required to instantiate a
