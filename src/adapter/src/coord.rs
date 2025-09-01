@@ -4458,15 +4458,15 @@ pub fn serve(
                             audit_logs_iterator,
                         )
                         .await?;
-                    coord
-                        .controller
-                        .remove_orphaned_replicas(
-                            coord.catalog().get_next_user_replica_id().await?,
-                            coord.catalog().get_next_system_replica_id().await?,
-                        )
-                        .await
-                        .map_err(AdapterError::Orchestrator)?;
-
+                    // coord
+                    //     .controller
+                    //     .remove_orphaned_replicas(
+                    //         coord.catalog().get_next_user_replica_id().await?,
+                    //         coord.catalog().get_next_system_replica_id().await?,
+                    //     )
+                    //     .await
+                    //     .map_err(AdapterError::Orchestrator)?;
+                    //
                     if let Some(retention_period) = storage_usage_retention_period {
                         coord
                             .prune_storage_usage_events_on_startup(retention_period)
