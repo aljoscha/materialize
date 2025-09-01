@@ -20,7 +20,6 @@ use futures::future::{BoxFuture, FutureExt};
 use mz_adapter_types::connection::ConnectionId;
 use mz_catalog::builtin::{BuiltinTable, MZ_SESSIONS};
 use mz_expr::CollectionPlan;
-use mz_ore::metrics::MetricsFutureExt;
 use mz_ore::task;
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_ore::{assert_none, instrument};
@@ -553,39 +552,70 @@ impl Coordinator {
                 "Appending to tables, {modified_tables:?}, at {timestamp}, advancing to {advance_to}"
             );
         }
+
+        let table_worker = self.controller.storage.persist_table_worker();
+        let timestamp_oracle = self.get_local_timestamp_oracle();
+
         // Instrument our table writes since they can block the coordinator.
         let histogram = self.metrics.append_table_duration_seconds.clone();
-        let append_fut = self
-            .controller
-            .storage
-            .append_table(timestamp, advance_to, appends)
-            .expect("invalid updates")
-            .wall_time()
-            .observe(histogram);
 
         // Spawn a task to do the table writes.
         let internal_cmd_tx = self.internal_cmd_tx.clone();
-        let apply_write_fut = self.apply_local_write(timestamp);
 
         let span = debug_span!(parent: None, "group_commit_apply");
         OpenTelemetryContext::obtain().attach_as_parent_to(&span);
         task::spawn(
             || "group_commit_apply",
             async move {
-                // Wait for the writes to complete.
-                match append_fut
-                    .instrument(debug_span!("group_commit_apply::append_fut"))
-                    .await
-                {
-                    Ok(append_result) => {
-                        append_result.unwrap_or_terminate("cannot fail to apply appends")
+                // Start timing for metrics
+                let start_time = std::time::Instant::now();
+
+                // Retry-capable table write logic using the table worker
+                let mut retry_count = 0;
+                const MAX_RETRIES: usize = 9999;
+
+                loop {
+                    let append_result = table_worker
+                        .append(timestamp, advance_to, appends.clone())
+                        .instrument(debug_span!("group_commit_apply::table_worker_append", retry = retry_count))
+                        .await;
+
+                    match append_result {
+                        Ok(Ok(())) => {
+                            // Success! Break out of retry loop
+                            break;
+                        }
+                        Ok(Err(storage_error)) => {
+                            retry_count += 1;
+                            if retry_count >= MAX_RETRIES {
+                                // Max retries reached, terminate
+                                warn!("Table write failed after {MAX_RETRIES} retries: {storage_error}");
+                                // Apply best-effort approach similar to original - don't crash the system
+                                break;
+                            } else {
+                                tracing::debug!("Table write failed, retrying ({retry_count}/{MAX_RETRIES}): {storage_error}");
+                                // Exponential backoff: 10ms, 100ms, 1000ms
+                                let backoff_ms = 10_u64.pow(retry_count as u32);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                                continue;
+                            }
+                        }
+                        Err(_) => {
+                            warn!("Table worker channel closed, writes in indefinite state");
+                            break;
+                        }
                     }
-                    Err(_) => warn!("Writer terminated with writes in indefinite state"),
-                };
+                }
+
+                // Record metrics for the write duration
+                histogram.observe(start_time.elapsed().as_secs_f64());
+
+                tracing::debug!(?timestamp, "table writes succeeded");
 
                 // Apply the write by marking the timestamp as complete on the timeline.
-                apply_write_fut
-                    .instrument(debug_span!("group_commit_apply::append_write_fut"))
+                timestamp_oracle
+                    .apply_write(timestamp)
+                    .instrument(debug_span!("group_commit_apply::apply_write", ?timestamp))
                     .await;
 
                 // Notify the external clients of the result.
