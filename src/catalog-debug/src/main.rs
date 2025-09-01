@@ -587,6 +587,71 @@ async fn upgrade_check(
 
     let boot_ts = now().into();
     let read_only = true;
+
+    let catalog_config = StateConfig {
+        unsafe_mode: true,
+        all_features: false,
+        build_info: &BUILD_INFO,
+        deploy_generation: args.deploy_generation.unwrap_or(0),
+        environment_id: args.environment_id.clone(),
+        read_only,
+        now,
+        boot_ts,
+        skip_migrations: false,
+        cluster_replica_sizes,
+        builtin_system_cluster_config: BootstrapBuiltinClusterConfig {
+            size: builtin_clusters_replica_size.clone(),
+            replication_factor: SYSTEM_CLUSTER_DEFAULT_REPLICATION_FACTOR,
+        },
+        builtin_catalog_server_cluster_config: BootstrapBuiltinClusterConfig {
+            size: builtin_clusters_replica_size.clone(),
+            replication_factor: CATALOG_SERVER_CLUSTER_DEFAULT_REPLICATION_FACTOR,
+        },
+        builtin_probe_cluster_config: BootstrapBuiltinClusterConfig {
+            size: builtin_clusters_replica_size.clone(),
+            replication_factor: PROBE_CLUSTER_DEFAULT_REPLICATION_FACTOR,
+        },
+        builtin_support_cluster_config: BootstrapBuiltinClusterConfig {
+            size: builtin_clusters_replica_size.clone(),
+            replication_factor: SUPPORT_CLUSTER_DEFAULT_REPLICATION_FACTOR,
+        },
+        builtin_analytics_cluster_config: BootstrapBuiltinClusterConfig {
+            size: builtin_clusters_replica_size.clone(),
+            replication_factor: ANALYTICS_CLUSTER_DEFAULT_REPLICATION_FACTOR,
+        },
+        system_parameter_defaults: Default::default(),
+        remote_system_parameters: None,
+        availability_zones: vec![],
+        egress_addresses: vec![],
+        aws_principal_context: None,
+        aws_privatelink_availability_zones: None,
+        http_host_name: None,
+        connection_context: ConnectionContext::from_cli_args(
+            args.environment_id.to_string(),
+            &args.tracing.startup_log_filter,
+            args.aws_external_id_prefix,
+            args.aws_connection_role_arn,
+            secrets_reader,
+            None,
+        ),
+        builtin_item_migration_config: BuiltinItemMigrationConfig {
+            // We don't actually want to write anything down, so use an in-memory persist
+            // client.
+            persist_client: PersistClient::new_for_tests().await,
+            read_only,
+            force_migration: None,
+        },
+        persist_client: persist_client.clone(),
+        enable_expression_cache_override: None,
+        helm_chart_version: None,
+        external_login_password_mz_system: None,
+        license_key: ValidatedLicenseKey::for_tests(),
+    };
+
+    let catalog_updates: Vec<_> = storage.sync_to_current_updates().await?;
+
+    let mut catalog_txn = storage.transaction().await?;
+
     // BOXED FUTURE: As of Nov 2023 the returned Future from this function was 7.5KB. This would
     // get stored on the stack which is bad for runtime performance, and blow up our stack usage.
     // Because of that we purposefully move this Future onto the heap (i.e. Box it).
@@ -599,71 +664,10 @@ async fn upgrade_check(
         expr_cache_handle: _,
         cached_global_exprs: _,
         uncached_local_exprs: _,
-    } = Catalog::initialize_state(
-        StateConfig {
-            unsafe_mode: true,
-            all_features: false,
-            build_info: &BUILD_INFO,
-            deploy_generation: args.deploy_generation.unwrap_or(0),
-            environment_id: args.environment_id.clone(),
-            read_only,
-            now,
-            boot_ts,
-            skip_migrations: false,
-            cluster_replica_sizes,
-            builtin_system_cluster_config: BootstrapBuiltinClusterConfig {
-                size: builtin_clusters_replica_size.clone(),
-                replication_factor: SYSTEM_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-            },
-            builtin_catalog_server_cluster_config: BootstrapBuiltinClusterConfig {
-                size: builtin_clusters_replica_size.clone(),
-                replication_factor: CATALOG_SERVER_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-            },
-            builtin_probe_cluster_config: BootstrapBuiltinClusterConfig {
-                size: builtin_clusters_replica_size.clone(),
-                replication_factor: PROBE_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-            },
-            builtin_support_cluster_config: BootstrapBuiltinClusterConfig {
-                size: builtin_clusters_replica_size.clone(),
-                replication_factor: SUPPORT_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-            },
-            builtin_analytics_cluster_config: BootstrapBuiltinClusterConfig {
-                size: builtin_clusters_replica_size.clone(),
-                replication_factor: ANALYTICS_CLUSTER_DEFAULT_REPLICATION_FACTOR,
-            },
-            system_parameter_defaults: Default::default(),
-            remote_system_parameters: None,
-            availability_zones: vec![],
-            egress_addresses: vec![],
-            aws_principal_context: None,
-            aws_privatelink_availability_zones: None,
-            http_host_name: None,
-            connection_context: ConnectionContext::from_cli_args(
-                args.environment_id.to_string(),
-                &args.tracing.startup_log_filter,
-                args.aws_external_id_prefix,
-                args.aws_connection_role_arn,
-                secrets_reader,
-                None,
-            ),
-            builtin_item_migration_config: BuiltinItemMigrationConfig {
-                // We don't actually want to write anything down, so use an in-memory persist
-                // client.
-                persist_client: PersistClient::new_for_tests().await,
-                read_only,
-                force_migration: None,
-            },
-            persist_client: persist_client.clone(),
-            enable_expression_cache_override: None,
-            helm_chart_version: None,
-            external_login_password_mz_system: None,
-            license_key: ValidatedLicenseKey::for_tests(),
-        },
-        &mut storage,
-    )
-    .instrument(tracing::info_span!("catalog::initialize_state"))
-    .boxed()
-    .await?;
+    } = Catalog::initialize_state(catalog_config, &catalog_updates, &mut catalog_txn)
+        .instrument(tracing::info_span!("catalog::initialize_state"))
+        .boxed()
+        .await?;
     let dur = start.elapsed();
 
     let msg = format!(

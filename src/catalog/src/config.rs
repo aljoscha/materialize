@@ -43,7 +43,7 @@ pub struct Config<'a> {
     pub state: StateConfig,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StateConfig {
     /// Whether to enable unsafe mode.
     pub unsafe_mode: bool,
@@ -103,7 +103,7 @@ pub struct StateConfig {
     pub license_key: ValidatedLicenseKey,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BuiltinItemMigrationConfig {
     pub persist_client: PersistClient,
     pub read_only: bool,

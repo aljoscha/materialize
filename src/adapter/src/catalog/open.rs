@@ -107,7 +107,8 @@ impl Catalog {
     /// (for example: no [mz_secrets::SecretsReader]).
     pub async fn initialize_state<'a>(
         config: StateConfig,
-        storage: &'a mut Box<dyn mz_catalog::durable::DurableCatalogState>,
+        current_updates: &[StateUpdate],
+        txn: &'a mut Transaction<'_>,
     ) -> Result<InitializeStateResult, AdapterError> {
         for builtin_role in BUILTIN_ROLES {
             assert!(
@@ -182,16 +183,14 @@ impl Catalog {
             license_key: config.license_key,
         };
 
-        let deploy_generation = storage.get_deployment_generation().await?;
+        // let deploy_generation = storage.get_deployment_generation().await?;
 
-        let mut updates: Vec<_> = storage.sync_to_current_updates().await?;
-        assert!(!updates.is_empty(), "initial catalog snapshot is missing");
-        let mut txn = storage.transaction().await?;
+        let mut updates: Vec<_> = current_updates.to_vec();
 
         // Migrate/update durable data before we start loading the in-memory catalog.
         let new_builtin_collections = {
             migrate::durable_migrate(
-                &mut txn,
+                txn,
                 state.config.environment_id.organization_id(),
                 config.boot_ts,
             )?;
@@ -205,7 +204,7 @@ impl Catalog {
             }
             // Add any new builtin objects and remove old ones.
             let new_builtin_collections =
-                add_new_remove_old_builtin_items_migration(&state.config().builtins_cfg, &mut txn)?;
+                add_new_remove_old_builtin_items_migration(&state.config().builtins_cfg, txn)?;
             let builtin_bootstrap_cluster_config_map = BuiltinBootstrapClusterConfigMap {
                 system_cluster: config.builtin_system_cluster_config,
                 catalog_server_cluster: config.builtin_catalog_server_cluster_config,
@@ -214,17 +213,17 @@ impl Catalog {
                 analytics_cluster: config.builtin_analytics_cluster_config,
             };
             add_new_remove_old_builtin_clusters_migration(
-                &mut txn,
+                txn,
                 &builtin_bootstrap_cluster_config_map,
             )?;
-            add_new_remove_old_builtin_introspection_source_migration(&mut txn)?;
+            add_new_remove_old_builtin_introspection_source_migration(txn)?;
             add_new_remove_old_builtin_cluster_replicas_migration(
-                &mut txn,
+                txn,
                 &builtin_bootstrap_cluster_config_map,
             )?;
-            add_new_remove_old_builtin_roles_migration(&mut txn)?;
-            remove_invalid_config_param_role_defaults_migration(&mut txn)?;
-            remove_pending_cluster_replicas_migration(&mut txn)?;
+            add_new_remove_old_builtin_roles_migration(txn)?;
+            remove_invalid_config_param_role_defaults_migration(txn)?;
+            remove_pending_cluster_replicas_migration(txn)?;
 
             new_builtin_collections
         };
@@ -434,7 +433,7 @@ impl Catalog {
         let (builtin_table_update, _catalog_updates) = if !config.skip_migrations {
             let migrate_result = migrate::migrate(
                 &mut state,
-                &mut txn,
+                txn,
                 &mut local_expr_cache,
                 item_updates,
                 config.now,
@@ -497,8 +496,8 @@ impl Catalog {
         // Migrate builtin items.
         let schema_migration_result = builtin_schema_migration::run(
             config.build_info,
-            deploy_generation,
-            &mut txn,
+            0, // WIP!,
+            txn,
             config.builtin_item_migration_config,
         )
         .await?;
@@ -517,9 +516,7 @@ impl Catalog {
         let builtin_table_updates = state.resolve_builtin_table_updates(builtin_table_updates);
 
         // Bump the migration version immediately before committing.
-        set_migration_version(&mut txn, config.build_info.semver_version())?;
-
-        txn.commit(config.boot_ts).await?;
+        set_migration_version(txn, config.build_info.semver_version())?;
 
         // Now that the migration is durable, run any requested deferred cleanup.
         schema_migration_result.cleanup_action.await;
@@ -551,6 +548,36 @@ impl Catalog {
         async move {
             let mut storage = config.storage;
 
+            let updates: Vec<_> = storage.sync_to_current_updates().await?;
+            assert!(!updates.is_empty(), "initial catalog snapshot is missing");
+
+            let res = loop {
+                let mut txn = storage.transaction().await?;
+                let inner_res =
+                    // BOXED FUTURE: As of Nov 2023 the returned Future from this function was 7.5KB. This would
+                    // get stored on the stack which is bad for runtime performance, and blow up our stack usage.
+                    // Because of that we purposefully move this Future onto the heap (i.e. Box it).
+                    Self::initialize_state(config.state.clone(), &updates, &mut txn)
+                        .instrument(tracing::info_span!("catalog::initialize_state"))
+                        .boxed()
+                        .await;
+
+                let txn_upper = txn.upper();
+                let commit_ts = config.state.boot_ts.max(txn_upper);
+                let txn_res = txn.commit(commit_ts).await;
+
+                match txn_res {
+                    Ok(()) => break inner_res?,
+                    Err(err) => {
+                        tracing::info!(
+                            ?err,
+                            "could not commit initial catalog update, barging on..."
+                        );
+                        break inner_res?;
+                    }
+                }
+            };
+
             let InitializeStateResult {
                 state,
                 migrated_storage_collections_0dt,
@@ -560,14 +587,7 @@ impl Catalog {
                 expr_cache_handle,
                 cached_global_exprs,
                 uncached_local_exprs,
-            } =
-                // BOXED FUTURE: As of Nov 2023 the returned Future from this function was 7.5KB. This would
-                // get stored on the stack which is bad for runtime performance, and blow up our stack usage.
-                // Because of that we purposefully move this Future onto the heap (i.e. Box it).
-                Self::initialize_state(config.state, &mut storage)
-                    .instrument(tracing::info_span!("catalog::initialize_state"))
-                    .boxed()
-                    .await?;
+            } = res;
 
             let catalog = Catalog {
                 state,
