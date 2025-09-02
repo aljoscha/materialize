@@ -270,7 +270,7 @@ impl Transactor {
                     self.data_reads.insert(*data_id, (init_ts, data_read));
                     return Ok(init_ts);
                 }
-                Err(new_init_ts) => {
+                Err((new_init_ts, _handles)) => {
                     debug!(
                         "register {:.9} at {} mismatch current={}",
                         data_id, init_ts, new_init_ts

@@ -348,7 +348,7 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> TxnsTableWorker<T
 
     async fn register(
         &mut self,
-        register_ts: T,
+        mut register_ts: T,
         mut ids_handles: Vec<(GlobalId, WriteHandle<SourceData, (), T, StorageDiff>)>,
     ) {
         // As tables evolve (e.g. columns are added) we treat the older versions as
@@ -370,17 +370,59 @@ impl<T: Timestamp + Lattice + Codec64 + TimestampManipulation> TxnsTableWorker<T
 
         // Registering also advances the logical upper of all shards in the txns set.
         let new_ids = ids_handles.iter().map(|(id, _)| *id).collect_vec();
-        let handles = ids_handles.into_iter().map(|(_, handle)| handle);
-        let res = self.txns.register(register_ts.clone(), handles).await;
-        match res {
-            Ok(tidy) => {
-                self.tidy.merge(tidy);
-            }
-            Err(current) => {
-                panic!(
-                    "cannot register {:?} at {:?} because txns is at {:?}",
-                    new_ids, register_ts, current
-                );
+
+        // Retry loop for registration with advancing timestamp on conflict
+        const MAX_RETRIES: usize = 5;
+        let mut retry_count = 0;
+
+        let mut handles = ids_handles
+            .into_iter()
+            .map(|(_, handle)| handle)
+            .collect::<Vec<_>>();
+
+        loop {
+            let res = self.txns.register(register_ts.clone(), handles).await;
+
+            match res {
+                Ok(tidy) => {
+                    if retry_count > 0 {
+                        debug!(
+                            "Successfully registered {:?} at {:?} after {} retries",
+                            new_ids, register_ts, retry_count
+                        );
+                    }
+                    self.tidy.merge(tidy);
+                    break;
+                }
+                Err((current, returned_handles)) => {
+                    if retry_count >= MAX_RETRIES {
+                        // Clean up our local state since we couldn't register
+                        for id in &new_ids {
+                            self.write_handles.remove(id);
+                        }
+                        panic!(
+                            "cannot register {:?} at {:?} because txns is at {:?} (exhausted {} retries)",
+                            new_ids, register_ts, current, MAX_RETRIES
+                        );
+                    }
+
+                    debug!(
+                        "Registration failed for {:?} at {:?}, txns at {:?}. Advancing to {:?} for retry {}/{}",
+                        new_ids,
+                        register_ts,
+                        current,
+                        current,
+                        retry_count + 1,
+                        MAX_RETRIES
+                    );
+
+                    // Advance to the current timestamp for next iteration
+                    register_ts = current;
+                    retry_count += 1;
+
+                    // Use the returned handles for the next attempt
+                    handles = returned_handles;
+                }
             }
         }
     }

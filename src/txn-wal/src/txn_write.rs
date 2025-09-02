@@ -556,7 +556,7 @@ mod tests {
                             debug!("{} registered at {}", idx, register_ts);
                             break;
                         }
-                        Err(ts) => {
+                        Err((ts, _handles)) => {
                             register_ts = ts;
                             continue;
                         }

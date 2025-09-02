@@ -211,7 +211,7 @@ where
         &mut self,
         register_ts: T,
         data_writes: impl IntoIterator<Item = WriteHandle<K, V, T, D>>,
-    ) -> Result<Tidy, T> {
+    ) -> Result<Tidy, (T, Vec<WriteHandle<K, V, T, D>>)> {
         let op = &Arc::clone(&self.metrics).register;
         op.run(async {
             let mut data_writes = data_writes.into_iter().collect::<Vec<_>>();
@@ -270,7 +270,7 @@ where
                         register_ts,
                         txns_upper,
                     );
-                    return Err(txns_upper);
+                    return Err((txns_upper, data_writes));
                 }
 
                 let res = crate::small_caa(
@@ -1064,7 +1064,8 @@ mod tests {
         assert_eq!(
             txns.register(2, [writer(&client, d1).await])
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .0,
             4
         );
 
@@ -1476,7 +1477,7 @@ mod tests {
                 debug!("stress register {:.9} at {}", data_id.to_string(), w.ts);
                 Box::pin(async move {
                     let data_write = writer(&w.txns.datas.client, data_id).await;
-                    let _ = w.txns.register(w.ts, [data_write]).await?;
+                    let _ = w.txns.register(w.ts, [data_write]).await.map_err(|(ts, _handles)| ts)?;
                     Ok(())
                 })
             })
