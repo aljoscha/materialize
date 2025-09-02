@@ -11,6 +11,7 @@
 //! messages from various sources (ex: controller, clients, background tasks, etc).
 
 use std::collections::{BTreeMap, BTreeSet, btree_map};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
@@ -202,6 +203,9 @@ impl Coordinator {
             }
             Message::DeferredStatementReady => {
                 self.handle_deferred_statement().boxed_local().await;
+            }
+            Message::SyncCatalogUpdates => {
+                self.handle_sync_catalog_updates().boxed_local().await;
             }
         }
     }
@@ -811,6 +815,36 @@ impl Coordinator {
                     warn!("internal_cmd_rx dropped before we could send: {:?}", e);
                 }
             });
+        }
+    }
+
+    /// Syncs catalog updates from upstream and applies them to controllers.
+    #[mz_ore::instrument(level = "debug")]
+    pub async fn handle_sync_catalog_updates(&mut self) {
+        // Make a mutable reference to the catalog Arc
+        let catalog = Arc::make_mut(&mut self.catalog);
+
+        // Sync catalog updates, ignoring builtin table updates as those are
+        // handled elsewhere
+        let (_builtin_table_updates, controller_state_updates) =
+            match catalog.sync_to_current_updates().await {
+                Ok(updates) => updates,
+                Err(e) => {
+                    warn!("Failed to sync catalog updates: {:?}", e);
+                    return;
+                }
+            };
+
+        // Apply controller updates if there are any
+        if !controller_state_updates.is_empty() {
+            if let Err(e) = self
+                .controller_apply_catalog_updates(None, controller_state_updates)
+                .await
+            {
+                // This should not happen as controller_apply_catalog_updates
+                // is expected to always succeed
+                warn!("Failed to apply controller updates: {:?}", e);
+            }
         }
     }
 }

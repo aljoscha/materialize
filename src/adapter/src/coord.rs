@@ -339,6 +339,8 @@ pub enum Message {
     /// A cluster will be On if and only if there is at least one On decision for it.
     /// Scheduling decisions for clusters that have `SCHEDULE = MANUAL` are ignored.
     SchedulingDecisions(Vec<(&'static str, Vec<(ClusterId, SchedulingDecision)>)>),
+    /// Sync catalog updates and apply to controllers.
+    SyncCatalogUpdates,
 }
 
 impl Message {
@@ -422,6 +424,7 @@ impl Message {
             Message::CheckSchedulingPolicies => "check_scheduling_policies",
             Message::SchedulingDecisions { .. } => "scheduling_decision",
             Message::DeferredStatementReady => "deferred_statement_ready",
+            Message::SyncCatalogUpdates => "sync_catalog_updates",
         }
     }
 }
@@ -1734,6 +1737,9 @@ pub struct Coordinator {
     /// For non-realtime timelines, nothing pushes the timestamps forward, so we must do
     /// it manually.
     advance_timelines_interval: Interval,
+
+    /// Periodically sync catalog updates and apply them to controllers.
+    sync_catalog_updates_interval: Interval,
 
     /// Serialized DDL. DDL must be serialized because:
     /// - Many of them do off-thread work and need to verify the catalog is in a valid state, but
@@ -3538,6 +3544,12 @@ impl Coordinator {
                     // `tick()` on `Interval` is cancel-safe:
                     // https://docs.rs/tokio/1.19.2/tokio/time/struct.Interval.html#cancel-safety
                     // Receive a single command.
+                    _ = self.sync_catalog_updates_interval.tick() => {
+                        messages.push(Message::SyncCatalogUpdates);
+                    },
+                    // `tick()` on `Interval` is cancel-safe:
+                    // https://docs.rs/tokio/1.19.2/tokio/time/struct.Interval.html#cancel-safety
+                    // Receive a single command.
                     _ = self.check_cluster_scheduling_policies_interval.tick() => {
                         messages.push(Message::CheckSchedulingPolicies);
                     },
@@ -4291,6 +4303,8 @@ pub fn serve(
         let segment_client_clone = segment_client.clone();
         let coord_now = now.clone();
         let advance_timelines_interval = tokio::time::interval(catalog.config().timestamp_interval);
+        let mut sync_catalog_updates_interval = tokio::time::interval(Duration::from_secs(1));
+        sync_catalog_updates_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut check_scheduling_policies_interval = tokio::time::interval(
             catalog
                 .system_config()
@@ -4423,6 +4437,7 @@ pub fn serve(
                     deferred_write_ops: BTreeMap::new(),
                     pending_writes: Vec::new(),
                     advance_timelines_interval,
+                    sync_catalog_updates_interval,
                     secrets_controller,
                     caching_secrets_reader,
                     cloud_resource_controller,
