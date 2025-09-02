@@ -64,7 +64,7 @@ use mz_persist_client::PersistLocation;
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::cfg::PersistConfig;
 use mz_persist_client::rpc::{
-    MetricsSameProcessPubSubSender, PersistGrpcPubSubServer, PubSubClientConnection, PubSubSender,
+    GrpcPubSubClient, PersistGrpcPubSubServer, PersistPubSubClient, PersistPubSubClientConfig,
 };
 use mz_secrets::SecretsController;
 use mz_server_core::TlsCliArgs;
@@ -950,7 +950,6 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
     persist_config.disable_compaction();
 
     let persist_pubsub_server = PersistGrpcPubSubServer::new(&persist_config, &metrics_registry);
-    let persist_pubsub_client = persist_pubsub_server.new_same_process_connection();
 
     match args.persist_isolated_runtime_threads {
         // Use the default.
@@ -982,16 +981,29 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
         .instrument(tracing::info_span!("persist::rpc::server")),
     );
 
+    // let persist_clients = {
+    //     // PersistClientCache may spawn tasks, so run within a tokio runtime context
+    //     let _tokio_guard = runtime.enter();
+    //     PersistClientCache::new(persist_config, &metrics_registry, |cfg, metrics| {
+    //         let sender: Arc<dyn PubSubSender> = Arc::new(MetricsSameProcessPubSubSender::new(
+    //             cfg,
+    //             persist_pubsub_client.sender,
+    //             metrics,
+    //         ));
+    //         PubSubClientConnection::new(sender, persist_pubsub_client.receiver)
+    //     })
+    // };
+
     let persist_clients = {
         // PersistClientCache may spawn tasks, so run within a tokio runtime context
         let _tokio_guard = runtime.enter();
-        PersistClientCache::new(persist_config, &metrics_registry, |cfg, metrics| {
-            let sender: Arc<dyn PubSubSender> = Arc::new(MetricsSameProcessPubSubSender::new(
-                cfg,
-                persist_pubsub_client.sender,
-                metrics,
-            ));
-            PubSubClientConnection::new(sender, persist_pubsub_client.receiver)
+        PersistClientCache::new(persist_config, &metrics_registry, |persist_cfg, metrics| {
+            let cfg = PersistPubSubClientConfig {
+                url: args.persist_pubsub_url.clone(),
+                caller_id: "envd".to_string(),
+                persist_cfg: persist_cfg.clone(),
+            };
+            GrpcPubSubClient::connect(cfg, metrics)
         })
     };
 
