@@ -838,10 +838,10 @@ impl Coordinator {
         // Apply controller updates if there are any
         if !controller_state_updates.is_empty() {
             if let Err(e) = self
-                .controller_apply_catalog_updates(None, controller_state_updates)
+                .apply_catalog_implications(None, controller_state_updates)
                 .await
             {
-                // This should not happen as controller_apply_catalog_updates
+                // This should not happen as apply_catalog_implications
                 // is expected to always succeed
                 warn!("Failed to apply controller updates: {:?}", e);
             }

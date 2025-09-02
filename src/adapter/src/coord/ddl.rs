@@ -26,12 +26,11 @@ use mz_cluster_client::ReplicaId;
 use mz_controller::clusters::ReplicaLocation;
 use mz_controller_types::ClusterId;
 use mz_ore::instrument;
-use mz_ore::now::to_datetime;
 use mz_ore::retry::Retry;
 use mz_ore::task;
 use mz_repr::adt::numeric::Numeric;
 use mz_repr::{CatalogItemId, GlobalId, Timestamp};
-use mz_sql::catalog::{CatalogClusterReplica, CatalogSchema};
+use mz_sql::catalog::CatalogSchema;
 use mz_sql::names::ResolvedDatabaseSpecifier;
 use mz_sql::plan::ConnectionDetails;
 use mz_sql::session::metadata::SessionMetadata;
@@ -263,10 +262,6 @@ impl Coordinator {
         event!(Level::TRACE, ops = format!("{:?}", ops));
 
         let mut webhook_sources_to_restart = BTreeSet::new();
-        let mut clusters_to_drop = vec![];
-        let mut cluster_replicas_to_drop = vec![];
-        let mut clusters_to_create = vec![];
-        let mut cluster_replicas_to_create = vec![];
         let mut update_metrics_config = false;
         let mut update_tracing_config = false;
         let mut update_controller_config = false;
@@ -286,17 +281,6 @@ impl Coordinator {
                             catalog::DropObjectInfo::Item(_) => {
                                 // Nothing to do, these will be handled by
                                 // applying the side effects that we return.
-                            }
-                            catalog::DropObjectInfo::Cluster(id) => {
-                                clusters_to_drop.push(*id);
-                            }
-                            catalog::DropObjectInfo::ClusterReplica((
-                                cluster_id,
-                                replica_id,
-                                _reason,
-                            )) => {
-                                // Drop the cluster replica itself.
-                                cluster_replicas_to_drop.push((*cluster_id, *replica_id));
                             }
                             _ => (),
                         }
@@ -374,21 +358,6 @@ impl Coordinator {
                     });
                     webhook_sources_to_restart.extend(webhook_sources);
                 }
-                catalog::Op::CreateCluster { id, .. } => {
-                    clusters_to_create.push(*id);
-                }
-                catalog::Op::CreateClusterReplica {
-                    cluster_id,
-                    name,
-                    config,
-                    ..
-                } => {
-                    cluster_replicas_to_create.push((
-                        *cluster_id,
-                        name.clone(),
-                        config.location.num_processes(),
-                    ));
-                }
                 _ => (),
             }
         }
@@ -409,7 +378,6 @@ impl Coordinator {
             catalog,
             active_conns,
             controller,
-            cluster_replica_statuses,
             ..
         } = self;
         let catalog = Arc::make_mut(catalog);
@@ -451,29 +419,6 @@ impl Coordinator {
         } = res;
 
         catalog_updates.append(&mut pending_controller_updates);
-
-        for (cluster_id, replica_id) in &cluster_replicas_to_drop {
-            cluster_replica_statuses.remove_cluster_replica_statuses(cluster_id, replica_id);
-        }
-        for cluster_id in &clusters_to_drop {
-            cluster_replica_statuses.remove_cluster_statuses(cluster_id);
-        }
-        for cluster_id in clusters_to_create {
-            cluster_replica_statuses.initialize_cluster_statuses(cluster_id);
-        }
-        let now = to_datetime((catalog.config().now)());
-        for (cluster_id, replica_name, num_processes) in cluster_replicas_to_create {
-            let replica_id = catalog
-                .resolve_replica_in_cluster(&cluster_id, &replica_name)
-                .expect("just created")
-                .replica_id();
-            cluster_replica_statuses.initialize_cluster_replica_statuses(
-                cluster_id,
-                replica_id,
-                num_processes,
-                now,
-            );
-        }
 
         // Append our builtin table updates, then return the notify so we can run other tasks in
         // parallel.

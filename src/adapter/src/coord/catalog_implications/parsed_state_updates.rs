@@ -56,6 +56,9 @@ pub enum ParsedStateUpdateKind {
         durable_cluster_replica: durable::objects::ClusterReplica,
         parsed_cluster_replica: memory::objects::ClusterReplica,
     },
+    IntrospectionSourceIndex {
+        introspection_source_index: durable::objects::IntrospectionSourceIndex,
+    },
 }
 
 /// Potentially generate a [ParsedStateUpdate] that corresponds to the given
@@ -87,6 +90,9 @@ pub fn parse_state_update(
         StateUpdateKind::ClusterReplica(replica) => {
             Some(parse_cluster_replica_update(catalog, replica))
         }
+        StateUpdateKind::IntrospectionSourceIndex(introspection_source_index) => Some(
+            parse_introspection_source_index_update(introspection_source_index),
+        ),
         _ => {
             // The controllers are currently not interested in other kinds of
             // changes to the catalog.
@@ -183,5 +189,13 @@ fn parse_cluster_replica_update(
     ParsedStateUpdateKind::ClusterReplica {
         durable_cluster_replica,
         parsed_cluster_replica: parsed_cluster_replica.clone(),
+    }
+}
+
+fn parse_introspection_source_index_update(
+    introspection_source_index: durable::objects::IntrospectionSourceIndex,
+) -> ParsedStateUpdateKind {
+    ParsedStateUpdateKind::IntrospectionSourceIndex {
+        introspection_source_index,
     }
 }

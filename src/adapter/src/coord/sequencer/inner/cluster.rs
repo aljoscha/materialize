@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use itertools::Itertools;
 use maplit::btreeset;
-use mz_adapter_types::compaction::CompactionWindow;
 use mz_catalog::builtin::BUILTINS;
 use mz_catalog::memory::objects::{
     ClusterConfig, ClusterReplica, ClusterVariant, ClusterVariantManaged,
@@ -714,8 +713,6 @@ impl Coordinator {
 
         self.catalog_transact(Some(session), ops).await?;
 
-        self.create_cluster(cluster_id).await;
-
         Ok(ExecuteResponse::CreatedCluster)
     }
 
@@ -895,54 +892,7 @@ impl Coordinator {
 
         self.catalog_transact(Some(session), ops).await?;
 
-        self.create_cluster(id).await;
-
         Ok(ExecuteResponse::CreatedCluster)
-    }
-
-    async fn create_cluster(&mut self, cluster_id: ClusterId) {
-        if !self.controller.is_responsible_for_cluster(&cluster_id) {
-            tracing::info!("not responsible for cluster {cluster_id}, this is where I cut");
-            return;
-        }
-
-        let Coordinator {
-            catalog,
-            controller,
-            ..
-        } = self;
-        let cluster = catalog.get_cluster(cluster_id);
-        let cluster_id = cluster.id;
-        let introspection_source_ids: Vec<_> =
-            cluster.log_indexes.iter().map(|(_, id)| *id).collect();
-
-        controller
-            .create_cluster(
-                cluster_id,
-                mz_controller::clusters::ClusterConfig {
-                    arranged_logs: cluster.log_indexes.clone(),
-                    workload_class: cluster.config.workload_class.clone(),
-                },
-            )
-            .expect("creating cluster must not fail");
-
-        let replica_ids: Vec<_> = cluster
-            .replicas()
-            .map(|r| (r.replica_id, format!("{}.{}", cluster.name(), &r.name)))
-            .collect();
-        for (replica_id, replica_name) in replica_ids {
-            self.create_cluster_replica(cluster_id, replica_id, replica_name)
-                .await;
-        }
-
-        if !introspection_source_ids.is_empty() {
-            self.initialize_compute_read_policies(
-                introspection_source_ids,
-                cluster_id,
-                CompactionWindow::Default,
-            )
-            .await;
-        }
     }
 
     #[mz_ore::instrument(level = "debug")]
@@ -1050,18 +1000,10 @@ impl Coordinator {
 
         self.catalog_transact(Some(session), vec![op]).await?;
 
-        let id = self
-            .catalog()
-            .resolve_replica_in_cluster(&cluster_id, &name)
-            .expect("just created")
-            .replica_id();
-
-        self.create_cluster_replica(cluster_id, id, name).await;
-
         Ok(ExecuteResponse::CreatedClusterReplica)
     }
 
-    async fn create_cluster_replica(
+    pub(crate) async fn create_cluster_replica(
         &mut self,
         cluster_id: ClusterId,
         replica_id: ReplicaId,

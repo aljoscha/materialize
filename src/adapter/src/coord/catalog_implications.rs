@@ -34,6 +34,7 @@ use fail::fail_point;
 use itertools::Itertools;
 use mz_adapter_types::compaction::CompactionWindow;
 use mz_catalog::builtin;
+use mz_catalog::durable::IntrospectionSourceIndex;
 use mz_catalog::memory::objects::{
     CatalogItem, Cluster, ClusterReplica, Connection, ContinualTask, DataSourceDesc, Index,
     MaterializedView, Secret, Sink, Source, StateDiff, Table, TableDataSource, View,
@@ -44,6 +45,7 @@ use mz_ore::collections::CollectionExt;
 use mz_ore::error::ErrorExt;
 use mz_ore::future::InTask;
 use mz_ore::instrument;
+use mz_ore::now::to_datetime;
 use mz_ore::retry::Retry;
 use mz_ore::str::StrExt;
 use mz_ore::task;
@@ -86,6 +88,10 @@ impl Coordinator {
         let mut cluster_commands: BTreeMap<ClusterId, CatalogImplication> = BTreeMap::new();
         let mut cluster_replica_commands: BTreeMap<(ClusterId, ReplicaId), CatalogImplication> =
             BTreeMap::new();
+        let mut introspection_source_index_commands: BTreeMap<
+            (ClusterId, CatalogItemId),
+            CatalogImplication,
+        > = BTreeMap::new();
 
         for update in catalog_updates {
             tracing::trace!(?update, "got parsed state update");
@@ -133,6 +139,17 @@ impl Coordinator {
                         .or_insert_with(|| CatalogImplication::None);
                     entry.absorb(update.clone());
                 }
+                ParsedStateUpdateKind::IntrospectionSourceIndex {
+                    introspection_source_index,
+                } => {
+                    let entry = introspection_source_index_commands
+                        .entry((
+                            introspection_source_index.cluster_id,
+                            introspection_source_index.item_id,
+                        ))
+                        .or_insert_with(|| CatalogImplication::None);
+                    entry.absorb(update.clone());
+                }
             }
         }
 
@@ -141,6 +158,9 @@ impl Coordinator {
             catalog_implications.into_iter().collect_vec(),
             cluster_commands.into_iter().collect_vec(),
             cluster_replica_commands.into_iter().collect_vec(),
+            introspection_source_index_commands
+                .into_iter()
+                .collect_vec(),
         )
         .await?;
 
@@ -154,6 +174,7 @@ impl Coordinator {
         implications: Vec<(CatalogItemId, CatalogImplication)>,
         cluster_commands: Vec<(ClusterId, CatalogImplication)>,
         cluster_replica_commands: Vec<((ClusterId, ReplicaId), CatalogImplication)>,
+        introspection_source_index_commands: Vec<((ClusterId, CatalogItemId), CatalogImplication)>,
     ) -> Result<(), AdapterError> {
         let mut tables_to_drop = BTreeSet::new();
         let mut sources_to_drop = vec![];
@@ -412,6 +433,10 @@ impl Coordinator {
                 CatalogImplication::None => {
                     // Nothing to do for None commands
                 }
+                CatalogImplication::IntrospectionSourceIndex(_) => {
+                    // These are handled below, they are incorporated into
+                    // cluster commands before applying them to the controller.
+                }
                 CatalogImplication::Cluster(_) | CatalogImplication::ClusterReplica(_) => {
                     unreachable!("clusters and cluster replicas are handled below")
                 }
@@ -429,12 +454,55 @@ impl Coordinator {
             }
         }
 
+        // Collect introspection source indexes for each cluster that's being created.
+        // We need to apply these BEFORE creating the clusters.
+        let mut cluster_introspection_indexes: BTreeMap<ClusterId, Vec<IntrospectionSourceIndex>> =
+            BTreeMap::new();
+
+        for ((cluster_id, _item_id), command) in introspection_source_index_commands {
+            tracing::trace!(
+                ?command,
+                "have introspection source index command to apply!"
+            );
+            match command {
+                CatalogImplication::IntrospectionSourceIndex(CatalogImplicationKind::Added(index)) => {
+                    cluster_introspection_indexes
+                        .entry(cluster_id)
+                        .or_default()
+                        .push(index);
+                }
+                CatalogImplication::IntrospectionSourceIndex(CatalogImplicationKind::Dropped(
+                    _index,
+                    _full_name,
+                )) => {
+                    // Drops are handled with the cluster drops
+                }
+                command => {
+                    unreachable!(
+                        "we only handle introspection source updates in this bag of updates, got: {:?}",
+                        command
+                    );
+                }
+            }
+        }
+
         for (cluster_id, command) in cluster_commands {
             tracing::trace!(?command, "have cluster command to apply!");
 
             match command {
-                CatalogImplication::Cluster(CatalogImplicationKind::Added(cluster)) => {
-                    tracing::debug!(?cluster, "not handling AddCluster in here yet");
+                CatalogImplication::Cluster(CatalogImplicationKind::Added(mut cluster)) => {
+                    // Apply the introspection source indexes to the cluster before creating it
+                    if let Some(indexes) = cluster_introspection_indexes.get(&cluster_id) {
+                        for index in indexes {
+                            // The index.name field contains the log name (e.g., "mz_active_peeks")
+                            if let Some(log) =
+                                mz_catalog::builtin::BUILTIN_LOG_LOOKUP.get(index.name.as_str())
+                            {
+                                cluster.log_indexes.insert(log.variant, index.index_id);
+                            }
+                        }
+                    }
+                    self.handle_create_cluster(cluster_id, cluster).await;
                 }
                 CatalogImplication::Cluster(CatalogImplicationKind::Altered {
                     prev: prev_cluster,
@@ -470,7 +538,8 @@ impl Coordinator {
 
             match command {
                 CatalogImplication::ClusterReplica(CatalogImplicationKind::Added(replica)) => {
-                    tracing::debug!(?replica, "not handling AddClusterReplica in here yet");
+                    self.handle_create_cluster_replica(cluster_id, replica_id, replica)
+                        .await;
                 }
                 CatalogImplication::ClusterReplica(CatalogImplicationKind::Altered {
                     prev: prev_replica,
@@ -732,11 +801,21 @@ impl Coordinator {
             if !cluster_replicas_to_drop.is_empty() {
                 fail::fail_point!("after_catalog_drop_replica");
 
+                for (cluster_id, replica_id) in &cluster_replicas_to_drop {
+                    self.cluster_replica_statuses
+                        .remove_cluster_replica_statuses(cluster_id, replica_id);
+                }
+
                 for (cluster_id, replica_id) in cluster_replicas_to_drop {
                     self.drop_replica(cluster_id, replica_id);
                 }
             }
             if !clusters_to_drop.is_empty() {
+                for cluster_id in &clusters_to_drop {
+                    self.cluster_replica_statuses
+                        .remove_cluster_statuses(cluster_id);
+                }
+
                 for cluster_id in clusters_to_drop {
                     self.controller.drop_cluster(cluster_id);
                 }
@@ -1251,6 +1330,70 @@ impl Coordinator {
 
         Ok(())
     }
+
+    #[instrument(level = "debug")]
+    async fn handle_create_cluster(&mut self, cluster_id: ClusterId, cluster: Cluster) {
+        if !self.controller.is_responsible_for_cluster(&cluster_id) {
+            tracing::info!("not responsible for cluster {cluster_id}");
+            return;
+        }
+
+        let introspection_source_ids: Vec<_> =
+            cluster.log_indexes.iter().map(|(_, id)| *id).collect();
+
+        // Initialize cluster statuses
+        self.cluster_replica_statuses
+            .initialize_cluster_statuses(cluster_id);
+
+        self.controller
+            .create_cluster(
+                cluster_id,
+                mz_controller::clusters::ClusterConfig {
+                    arranged_logs: cluster.log_indexes.clone(),
+                    workload_class: cluster.config.workload_class.clone(),
+                },
+            )
+            .expect("creating cluster must not fail");
+
+        // Create all replicas that already exist for this cluster
+        let replica_ids: Vec<_> = cluster
+            .replicas()
+            .map(|r| (r.replica_id, format!("{}.{}", cluster.name, &r.name)))
+            .collect();
+        for (replica_id, replica_name) in replica_ids {
+            self.create_cluster_replica(cluster_id, replica_id, replica_name)
+                .await;
+        }
+
+        if !introspection_source_ids.is_empty() {
+            self.initialize_compute_read_policies(
+                introspection_source_ids,
+                cluster_id,
+                CompactionWindow::Default,
+            )
+            .await;
+        }
+    }
+
+    #[instrument(level = "debug")]
+    async fn handle_create_cluster_replica(
+        &mut self,
+        cluster_id: ClusterId,
+        replica_id: ReplicaId,
+        replica: ClusterReplica,
+    ) {
+        let cluster = self.catalog().get_cluster(cluster_id);
+        let replica_name = format!("{}.{}", cluster.name, &replica.name);
+
+        // Initialize cluster replica statuses
+        let num_processes = replica.config.location.num_processes();
+        let now = to_datetime((self.catalog.config().now)());
+        self.cluster_replica_statuses
+            .initialize_cluster_replica_statuses(cluster_id, replica_id, num_processes, now);
+
+        self.create_cluster_replica(cluster_id, replica_id, replica_name)
+            .await;
+    }
 }
 
 /// A state machine for building catalog implications from catalog updates.
@@ -1272,6 +1415,7 @@ enum CatalogImplication {
     Connection(CatalogImplicationKind<Connection>),
     Cluster(CatalogImplicationKind<Cluster>),
     ClusterReplica(CatalogImplicationKind<ClusterReplica>),
+    IntrospectionSourceIndex(CatalogImplicationKind<IntrospectionSourceIndex>),
 }
 
 #[derive(Debug, Clone)]
@@ -1478,6 +1622,15 @@ impl CatalogImplication {
             } => {
                 self.absorb_cluster_replica(parsed_cluster_replica, catalog_update.diff);
             }
+            ParsedStateUpdateKind::IntrospectionSourceIndex {
+                introspection_source_index,
+            } => {
+                self.absorb_introspection_source_index(
+                    introspection_source_index,
+                    None,
+                    catalog_update.diff,
+                );
+            }
         }
     }
 
@@ -1495,6 +1648,11 @@ impl CatalogImplication {
     impl_absorb_method!(absorb_continual_task, ContinualTask, ContinualTask);
     impl_absorb_method!(absorb_secret, Secret, Secret);
     impl_absorb_method!(absorb_connection, Connection, Connection);
+    impl_absorb_method!(
+        absorb_introspection_source_index,
+        IntrospectionSourceIndex,
+        IntrospectionSourceIndex
+    );
 
     // Special case for cluster which uses the cluster's name field.
     fn absorb_cluster(&mut self, cluster: Cluster, diff: StateDiff) {
