@@ -40,6 +40,8 @@ use mz_catalog::memory::objects::{
     MaterializedView, Secret, Sink, Source, StateDiff, Table, TableDataSource, View,
 };
 use mz_compute_client::protocol::response::PeekResponse;
+use mz_compute_types::ComputeInstanceId;
+use mz_compute_types::dataflows::DataflowDescription;
 use mz_controller_types::{ClusterId, ReplicaId};
 use mz_ore::collections::CollectionExt;
 use mz_ore::error::ErrorExt;
@@ -49,7 +51,8 @@ use mz_ore::now::to_datetime;
 use mz_ore::retry::Retry;
 use mz_ore::str::StrExt;
 use mz_ore::task;
-use mz_repr::{CatalogItemId, GlobalId, RelationVersion, RelationVersionSelector, Timestamp};
+use mz_repr::optimize::OverrideFrom;
+use mz_repr::{CatalogItemId, Diff, GlobalId, RelationVersion, RelationVersionSelector, Timestamp};
 use mz_sql::plan::ConnectionDetails;
 use mz_storage_client::controller::{CollectionDescription, DataSource};
 use mz_storage_types::connections::PostgresConnection;
@@ -64,6 +67,8 @@ use crate::coord::catalog_implications::parsed_state_updates::{
 };
 use crate::coord::statement_logging::StatementLoggingId;
 use crate::coord::timeline::TimelineState;
+use crate::optimize::dataflows::dataflow_import_id_bundle;
+use crate::optimize::{self, Optimize};
 use crate::statement_logging::StatementEndedExecutionReason;
 use crate::{AdapterError, CollectionIdBundle, ExecuteContext, ResultExt};
 
@@ -203,6 +208,16 @@ impl Coordinator {
         let mut storage_policies_to_initialize = BTreeMap::new();
         let mut execution_timestamps_to_set = BTreeSet::new();
 
+        // Compute dataflows to ship and policies to initialize
+        let mut compute_dataflows_to_ship: BTreeMap<
+            ComputeInstanceId,
+            DataflowDescription<mz_compute_types::plan::Plan>,
+        > = BTreeMap::new();
+        let mut compute_policies_to_initialize: BTreeMap<
+            CompactionWindow,
+            BTreeMap<ComputeInstanceId, BTreeSet<GlobalId>>,
+        > = BTreeMap::new();
+
         // We're incrementally migrating the code that manipulates the
         // controller from closures in the sequencer. For some types of catalog
         // changes we haven't done this migration yet, so there you will see
@@ -313,7 +328,13 @@ impl Coordinator {
                     dropped_item_names.insert(sink.global_id(), full_name);
                 }
                 CatalogImplication::Index(CatalogImplicationKind::Added(index)) => {
-                    tracing::debug!(?index, "not handling AddIndex in here yet");
+                    self.handle_create_index(
+                        catalog_id,
+                        index,
+                        &mut compute_dataflows_to_ship,
+                        &mut compute_policies_to_initialize,
+                    )
+                    .await?
                 }
                 CatalogImplication::Index(CatalogImplicationKind::Altered {
                     prev: prev_index,
@@ -587,6 +608,29 @@ impl Coordinator {
         // policy that might make the since advance.
         self.initialize_storage_collections(storage_policies_to_initialize)
             .await?;
+
+        // Ship compute dataflows and initialize compute read policies
+        if !compute_dataflows_to_ship.is_empty() {
+            for (instance_id, dataflow) in compute_dataflows_to_ship {
+                self.controller
+                    .compute
+                    .create_dataflow(instance_id, dataflow, None)
+                    .unwrap_or_terminate("dataflow creation cannot fail");
+            }
+        }
+
+        if !compute_policies_to_initialize.is_empty() {
+            for (compaction_window, compute_policies) in compute_policies_to_initialize {
+                for (instance_id, export_ids) in compute_policies {
+                    self.initialize_compute_read_policies(
+                        export_ids.into_iter().collect(),
+                        instance_id,
+                        compaction_window,
+                    )
+                    .await;
+                }
+            }
+        }
 
         let collections_to_drop: BTreeSet<_> = sources_to_drop
             .iter()
@@ -1393,6 +1437,149 @@ impl Coordinator {
 
         self.create_cluster_replica(cluster_id, replica_id, replica_name)
             .await;
+    }
+
+    #[instrument(level = "debug")]
+    async fn handle_create_index(
+        &mut self,
+        item_id: CatalogItemId,
+        index: Index,
+        compute_dataflows_to_ship: &mut BTreeMap<
+            ComputeInstanceId,
+            DataflowDescription<mz_compute_types::plan::Plan>,
+        >,
+        compute_policies_to_initialize: &mut BTreeMap<
+            CompactionWindow,
+            BTreeMap<ComputeInstanceId, BTreeSet<GlobalId>>,
+        >,
+    ) -> Result<(), AdapterError> {
+        let cluster_id = index.cluster_id;
+        let global_id = index.global_id();
+
+        // Skip indexes for clusters that are not managed by this controller
+        if !self.controller.is_responsible_for_cluster(&cluster_id) {
+            tracing::info!(
+                "Skipping index {:?} on filtered cluster {}",
+                global_id,
+                cluster_id
+            );
+            return Ok(());
+        }
+
+        // Get the catalog entry to get the name
+        let entry = self.catalog().get_entry(&item_id);
+        let name = entry.name().clone();
+
+        // NOTE: We need to re-optimize the index here even though it was
+        // already optimized in create_index_optimize. This is because the
+        // optimized plans cannot be passed through the catalog transaction
+        // boundary. This is inefficient but necessary for the clean separation
+        // between catalog operations and controller operations.
+        //
+        // This mirrors what happens during bootstrap where indexes are
+        // optimized when we need to install them on compute instances.
+
+        // Collect optimizer parameters
+        let compute_instance = self
+            .instance_snapshot(cluster_id)
+            .expect("compute instance does not exist");
+
+        let optimizer_config = optimize::OptimizerConfig::from(self.catalog().system_config())
+            .override_from(&self.catalog.get_cluster(cluster_id).config.features());
+
+        // Build an optimizer for this INDEX
+        let mut optimizer = optimize::index::Optimizer::new(
+            self.owned_catalog(),
+            compute_instance,
+            global_id,
+            optimizer_config,
+            self.optimizer_metrics(),
+        );
+
+        // Run the optimization pipeline
+        let index_plan = optimize::index::Index::new(name, index.on, index.keys.to_vec());
+
+        // MIR ⇒ MIR optimization (global)
+        let global_mir_plan = optimizer.optimize(index_plan)?;
+
+        // MIR ⇒ LIR lowering and LIR ⇒ LIR optimization (global)
+        let global_lir_plan = optimizer.optimize(global_mir_plan.clone())?;
+
+        // Store the optimized plans in the catalog for future use
+        self.catalog_mut()
+            .set_optimized_plan(global_id, global_mir_plan.df_desc().clone());
+        self.catalog_mut()
+            .set_physical_plan(global_id, global_lir_plan.df_desc().clone());
+
+        // Extract dataflow description and metadata
+        let (df_desc, df_meta) = global_lir_plan.unapply();
+
+        // Allocate notice IDs for optimizer notices
+        let notice_ids = std::iter::repeat_with(|| self.allocate_transient_id())
+            .map(|(_item_id, global_id)| global_id)
+            .take(df_meta.optimizer_notices.len())
+            .collect::<Vec<_>>();
+
+        // Convert the metainfo to use Arc<OptimizerNotice> and store it in the catalog
+        let df_meta = self
+            .catalog()
+            .render_notices(df_meta, notice_ids, Some(global_id));
+
+        // Process optimizer notices and update builtin tables if necessary
+        if self.catalog().state().system_config().enable_mz_notices()
+            && !df_meta.optimizer_notices.is_empty()
+        {
+            let mut builtin_table_updates = Vec::with_capacity(df_meta.optimizer_notices.len());
+            self.catalog().state().pack_optimizer_notices(
+                &mut builtin_table_updates,
+                df_meta.optimizer_notices.iter(),
+                Diff::ONE,
+            );
+
+            // Apply the builtin table updates
+            let (fut, _) = self.builtin_table_update().execute(builtin_table_updates).await;
+            fut.await;
+        }
+
+        self.catalog_mut().set_dataflow_metainfo(global_id, df_meta);
+
+        // Acquire read holds
+        let id_bundle = dataflow_import_id_bundle(&df_desc, cluster_id);
+        let read_holds = self.acquire_read_holds(&id_bundle);
+        let since = read_holds.least_valid_read();
+
+        // Update the dataflow description with the correct as_of
+        let mut df_desc = df_desc;
+        df_desc.set_as_of(since);
+
+        // Add to the dataflows to ship or update existing entry
+        compute_dataflows_to_ship
+            .entry(cluster_id)
+            .and_modify(|existing| {
+                // Merge the new dataflow into the existing one
+                existing
+                    .objects_to_build
+                    .extend(df_desc.objects_to_build.clone());
+                existing.index_exports.extend(df_desc.index_exports.clone());
+                existing.sink_exports.extend(df_desc.sink_exports.clone());
+            })
+            .or_insert(df_desc);
+
+        // Initialize read policy
+        let compaction_window = index
+            .custom_logical_compaction_window
+            .unwrap_or(CompactionWindow::Default);
+        compute_policies_to_initialize
+            .entry(compaction_window)
+            .or_default()
+            .entry(cluster_id)
+            .or_default()
+            .insert(global_id);
+
+        // Drop read holds after preparing the dataflow
+        drop(read_holds);
+
+        Ok(())
     }
 }
 

@@ -639,7 +639,6 @@ pub struct CreateIndexFinish {
     global_id: GlobalId,
     plan: plan::CreateIndexPlan,
     resolved_ids: ResolvedIds,
-    global_mir_plan: optimize::index::GlobalMirPlan,
     global_lir_plan: optimize::index::GlobalLirPlan,
 }
 
