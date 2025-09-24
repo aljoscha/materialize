@@ -57,7 +57,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub(crate) fn register_into(registry: &MetricsRegistry) -> Self {
+    pub fn register_into(registry: &MetricsRegistry) -> Self {
         Self {
             query_total: registry.register(metric!(
                 name: "mz_query_total",

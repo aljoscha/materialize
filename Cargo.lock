@@ -7309,6 +7309,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mz-pgwire-server"
+version = "0.0.0"
+dependencies = [
+ "mz-adapter",
+ "mz-authenticator",
+ "mz-build-info",
+ "mz-ore",
+ "mz-pgwire",
+ "mz-pgwire-common",
+ "mz-repr",
+ "mz-server-core",
+ "mz-sql",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mz-postgres-client"
 version = "0.0.0"
 dependencies = [
