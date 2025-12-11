@@ -204,13 +204,16 @@ impl Coordinator {
                 self.handle_deferred_statement().boxed_local().await;
             }
             Message::Widget(widget_msg) => {
-                self.handle_widget_message(widget_msg);
+                self.handle_widget_message(widget_msg).boxed_local().await;
+            }
+            Message::WidgetDataRequest(request) => {
+                self.handle_widget_data_request(request).await;
             }
         }
     }
 
     /// Handle a message from a widget.
-    fn handle_widget_message(&self, msg: crate::widget::WidgetMessage) {
+    async fn handle_widget_message(&mut self, msg: crate::widget::WidgetMessage) {
         use crate::widget::WidgetMessage;
         match msg {
             WidgetMessage::Actions {
@@ -223,7 +226,7 @@ impl Coordinator {
                     "coordinator received widget actions"
                 );
                 for (i, action) in actions.into_iter().enumerate() {
-                    self.execute_widget_action(widget_name, i, action);
+                    self.execute_widget_action(widget_name, i, action).await;
                 }
             }
             WidgetMessage::Error { widget_name, error } => {
@@ -233,49 +236,551 @@ impl Coordinator {
     }
 
     /// Execute a single widget action.
-    fn execute_widget_action(
-        &self,
+    async fn execute_widget_action(
+        &mut self,
         widget_name: &'static str,
         action_index: usize,
         action: crate::widget::WidgetAction,
     ) {
         use crate::widget::WidgetAction;
         match action {
-            WidgetAction::ExecuteDdl { sql, reason } => {
+            WidgetAction::ExecuteDdl {
+                cluster_id,
+                strategy_id,
+                action_type,
+                sql,
+                reason,
+            } => {
                 tracing::info!(
                     widget = widget_name,
                     action_index = action_index,
                     reason = %reason,
                     sql = %sql,
-                    "widget DDL action received (not yet implemented)"
+                    "executing widget DDL action"
                 );
-                // TODO(Phase 2): Implement DDL execution for widgets.
-                // This requires parsing the SQL, planning it, and executing it
-                // with system privileges. For now, we just log the action.
+
+                let action_id = Self::next_scaling_action_id((self.catalog().config().now)());
+                let cluster_id_str = cluster_id.to_string();
+                let strategy_id = strategy_id.unwrap_or_else(|| "<unknown>".to_string());
+                let action_type = action_type.unwrap_or_else(|| "unknown".to_string());
+
+                let insert_sql = format!(
+                    "INSERT INTO mz_internal.mz_scaling_actions \
+                     (action_id, strategy_id, cluster_id, action_type, action_sql, reason, executed, error_message, created_at) \
+                     VALUES ({}, '{}', '{}', '{}', '{}', '{}', false, NULL, now())",
+                    action_id,
+                    Self::escape_single_quotes(&strategy_id),
+                    Self::escape_single_quotes(&cluster_id_str),
+                    Self::escape_single_quotes(&action_type),
+                    Self::escape_single_quotes(&sql),
+                    Self::escape_single_quotes(&reason),
+                );
+
+                if let Err(e) = self
+                    .execute_widget_dml(&insert_sql, "log scaling action")
+                    .await
+                {
+                    tracing::warn!(
+                        widget = widget_name,
+                        action_id,
+                        error = %e,
+                        "failed to insert mz_scaling_actions row"
+                    );
+                }
+
+                // Global kill switch: still log actions, but don't execute them.
+                if !self.catalog().system_config().auto_scaling_enabled() {
+                    tracing::info!(
+                        widget = widget_name,
+                        action_id,
+                        sql = %sql,
+                        "auto_scaling_enabled is off; skipping widget DDL execution"
+                    );
+                    return;
+                }
+
+                // Execute the DDL using the internal SQL execution path.
+                let ddl_result = self.execute_widget_ddl(&sql, &reason).await;
+
+                let update_sql = match &ddl_result {
+                    Ok(()) => format!(
+                        "UPDATE mz_internal.mz_scaling_actions \
+                         SET executed = true, error_message = NULL \
+                         WHERE action_id = {}",
+                        action_id
+                    ),
+                    Err(e) => format!(
+                        "UPDATE mz_internal.mz_scaling_actions \
+                         SET executed = false, error_message = '{}' \
+                         WHERE action_id = {}",
+                        Self::escape_single_quotes(&e.to_string()),
+                        action_id
+                    ),
+                };
+
+                if let Err(e) = self
+                    .execute_widget_dml(&update_sql, "update scaling action result")
+                    .await
+                {
+                    tracing::warn!(
+                        widget = widget_name,
+                        action_id,
+                        error = %e,
+                        "failed to update mz_scaling_actions row"
+                    );
+                }
+
+                match ddl_result {
+                    Ok(()) => tracing::info!(
+                        widget = widget_name,
+                        action_id,
+                        sql = %sql,
+                        "widget DDL action executed successfully"
+                    ),
+                    Err(e) => tracing::warn!(
+                        widget = widget_name,
+                        action_id,
+                        sql = %sql,
+                        error = %e,
+                        "widget DDL action failed"
+                    ),
+                }
             }
-            WidgetAction::WriteToBuiltinTable { table_id, rows } => {
+            WidgetAction::ExecuteDml { sql, reason } => {
                 tracing::info!(
                     widget = widget_name,
                     action_index = action_index,
-                    table_id = %table_id,
-                    num_rows = rows.len(),
-                    "widget table write action received (not yet implemented)"
+                    reason = %reason,
+                    sql = %sql,
+                    "executing widget DML action"
                 );
-                // TODO(Phase 2): Implement builtin table writes for widgets.
-                // This will use the same code path as statement logging.
+
+                // Execute the DML using the internal SQL execution path
+                match self.execute_widget_dml(&sql, &reason).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            widget = widget_name,
+                            sql = %sql,
+                            "widget DML action executed successfully"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            widget = widget_name,
+                            sql = %sql,
+                            error = %e,
+                            "widget DML action failed"
+                        );
+                    }
+                }
             }
-            WidgetAction::DeleteFromBuiltinTable {
+        }
+    }
+    fn escape_single_quotes(s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
+    fn next_scaling_action_id(now_millis: u64) -> i64 {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        static LAST: AtomicI64 = AtomicI64::new(0);
+        let now = i64::try_from(now_millis).unwrap_or(i64::MAX);
+
+        let mut last = LAST.load(Ordering::Relaxed);
+        loop {
+            let next = std::cmp::max(last.saturating_add(1), now);
+            match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return next,
+                Err(observed) => last = observed,
+            }
+        }
+    }
+
+    /// Execute a DDL action on behalf of a widget.
+    ///
+    /// This parses and executes DDL statements (CREATE/DROP CLUSTER REPLICA)
+    /// using the same code paths as user DDL, but with system privileges.
+    async fn execute_widget_ddl(
+        &mut self,
+        sql: &str,
+        reason: &str,
+    ) -> Result<(), crate::AdapterError> {
+        use crate::catalog::ReplicaCreateDropReason;
+        use mz_ore::collections::CollectionExt;
+        use mz_sql::names::ObjectId;
+        use mz_sql::plan::{Params, Plan};
+
+        // Step 1: Parse the SQL
+        let stmts = mz_sql_parser::parser::parse_statements(sql)
+            .map_err(crate::AdapterError::ParseError)?;
+
+        if stmts.len() != 1 {
+            return Err(crate::AdapterError::Internal(format!(
+                "widget DDL must be exactly one statement, got {}",
+                stmts.len()
+            )));
+        }
+
+        let stmt_raw = stmts.into_element().ast;
+
+        // Step 2: Resolve names using the system session catalog
+        let catalog = self.catalog().for_system_session();
+        let (stmt, resolved_ids) =
+            mz_sql::names::resolve(&catalog, stmt_raw).map_err(crate::AdapterError::PlanError)?;
+
+        // Step 3: Plan the statement
+        let params = Params::empty();
+        let plan = mz_sql::plan::plan(None, &catalog, stmt, &params, &resolved_ids)
+            .map_err(crate::AdapterError::PlanError)?;
+
+        // Step 4: Execute based on plan type, using the inner methods that accept a reason
+        let auto_scaling_reason = ReplicaCreateDropReason::AutoScaling(reason.to_string());
+
+        match plan {
+            Plan::CreateClusterReplica(plan) => {
+                self.sequence_create_cluster_replica_inner(None, plan, auto_scaling_reason)
+                    .await?;
+                Ok(())
+            }
+            Plan::DropObjects(plan) => {
+                // Extract cluster replica drops from the plan
+                let replicas: Vec<_> = plan
+                    .drop_ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        if let ObjectId::ClusterReplica((cluster_id, replica_id)) = id {
+                            Some((cluster_id, replica_id))
+                        } else {
+                            tracing::warn!(
+                                ?id,
+                                "widget attempted to drop non-replica object, ignoring"
+                            );
+                            None
+                        }
+                    })
+                    .collect();
+
+                if replicas.is_empty() {
+                    return Ok(());
+                }
+
+                self.sequence_drop_cluster_replicas(replicas, auto_scaling_reason)
+                    .await
+            }
+            _ => Err(crate::AdapterError::Internal(
+                "widget DDL only supports CREATE/DROP CLUSTER REPLICA, got unsupported plan type"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Execute a DML action on behalf of a widget.
+    ///
+    /// This parses and executes DML statements (INSERT/UPDATE/DELETE) on writable
+    /// builtin tables using the same code paths as user DML, ensuring proper
+    /// transactional consistency.
+    ///
+    /// IMPORTANT: Widgets should use this method for all table modifications rather
+    /// than directly manipulating `BuiltinTableUpdate`, as direct manipulation can
+    /// lead to inconsistent table state.
+    async fn execute_widget_dml(
+        &mut self,
+        sql: &str,
+        reason: &str,
+    ) -> Result<(), crate::AdapterError> {
+        use std::sync::Arc;
+
+        use mz_adapter_types::connection::ConnectionId;
+        use mz_ore::collections::CollectionExt;
+        use mz_sql::plan::Params;
+        use mz_sql::session::user::MZ_SYSTEM_ROLE_ID;
+        use mz_sql_parser::ast::Raw;
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+
+        use crate::coord::ExecuteContextExtra;
+        use crate::session::{Session, SessionConfig};
+        use crate::util::ClientTransmitter;
+
+        // Step 1: Parse the SQL into exactly one statement.
+        let stmts = mz_sql_parser::parser::parse_statements(sql)
+            .map_err(crate::AdapterError::ParseError)?;
+        if stmts.len() != 1 {
+            return Err(crate::AdapterError::Internal(format!(
+                "widget DML must be exactly one statement, got {}",
+                stmts.len()
+            )));
+        }
+        let stmt: Arc<mz_sql::ast::Statement<Raw>> = Arc::new(stmts.into_element().ast);
+
+        // Step 2: Execute the statement through the normal single-statement
+        // execution path (ReadThenWrite) using a system session.
+        //
+        // This ensures proper transactional semantics for writable builtin tables.
+        let (sub_tx, sub_rx) = oneshot::channel();
+        let sub_ct = ClientTransmitter::new(sub_tx, self.internal_cmd_tx.clone());
+
+        // Pick a stable-ish static connection id for internal widget execution.
+        // Keep it below 2^31 so it remains i32-compatible for any pgwire logging.
+        const WIDGET_INTERNAL_CONN_ID: ConnectionId = ConnectionId::Static(2_000_000_000);
+
+        let mut session = Session::new(
+            self.catalog().config().build_info,
+            SessionConfig {
+                conn_id: WIDGET_INTERNAL_CONN_ID,
+                uuid: Uuid::new_v4(),
+                user: mz_sql::session::user::SYSTEM_USER.name.clone(),
+                client_ip: None,
+                external_metadata_rx: None,
+                internal_user_metadata: None,
+                helm_chart_version: self.catalog().config().helm_chart_version.clone(),
+            },
+            self.metrics.session_metrics(),
+        );
+        session.initialize_role_metadata(MZ_SYSTEM_ROLE_ID);
+
+        tracing::debug!(reason = reason, %sql, "widget executing DML");
+        let ctx = crate::coord::ExecuteContext::from_parts(
+            sub_ct,
+            self.internal_cmd_tx.clone(),
+            session,
+            ExecuteContextExtra::default(),
+        );
+
+        self.sequence_execute_single_statement_transaction(ctx, stmt, Params::empty())
+            .await;
+
+        let resp = sub_rx.await.map_err(|_| {
+            crate::AdapterError::Internal(
+                "widget DML execution response channel dropped".to_string(),
+            )
+        })?;
+
+        match resp.result {
+            Ok(_ok) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Handle a data request from a widget.
+    ///
+    /// This reads data from builtin tables and returns it to the widget.
+    /// The widget specifies which table to read by its CatalogItemId.
+    async fn handle_widget_data_request(&mut self, request: crate::widget::WidgetDataRequest) {
+        use crate::widget::WidgetDataRequest;
+        match request {
+            WidgetDataRequest::ReadBuiltinTable {
                 table_id,
-                filter: _,
+                response_tx,
             } => {
-                tracing::info!(
-                    widget = widget_name,
-                    action_index = action_index,
-                    table_id = %table_id,
-                    "widget table delete action received (not yet implemented)"
-                );
-                // TODO(Phase 2): Implement builtin table deletes for widgets.
+                tracing::debug!(?table_id, "handling widget builtin table read request");
+
+                let result = self.read_builtin_table_for_widget(table_id).await;
+
+                if response_tx.send(result).is_err() {
+                    tracing::debug!("widget dropped before receiving table read response");
+                }
             }
+            WidgetDataRequest::ExecuteSql { sql, response_tx } => {
+                tracing::debug!(%sql, "handling widget SQL execution request");
+
+                let result = self.execute_sql_for_widget(&sql).await;
+
+                if response_tx.send(result).is_err() {
+                    tracing::debug!("widget dropped before receiving SQL execution response");
+                }
+            }
+        }
+    }
+
+    /// Execute a SQL query for a widget.
+    ///
+    /// This executes read-only SQL queries (SELECT statements) against system tables.
+    /// Currently, this only supports simple single-table reads. For complex queries
+    /// with joins/aggregations, use `read_builtin_table` to read raw data and
+    /// process it in Rust.
+    ///
+    /// The query is executed with system privileges.
+    async fn execute_sql_for_widget(&mut self, sql: &str) -> Result<Vec<Row>, String> {
+        use mz_adapter_types::connection::ConnectionId;
+        use mz_ore::collections::CollectionExt;
+        use mz_sql::plan::Params;
+        use mz_sql_parser::ast::Raw;
+        use std::sync::Arc;
+        use tokio::sync::oneshot;
+        use uuid::Uuid;
+
+        // Step 1: Parse the SQL
+        let stmts = mz_sql_parser::parser::parse_statements(sql)
+            .map_err(|e| format!("SQL parse error: {}", e))?;
+
+        if stmts.len() != 1 {
+            return Err(format!(
+                "widget SQL must be exactly one statement, got {}",
+                stmts.len()
+            ));
+        }
+
+        let stmt: Arc<mz_sql::ast::Statement<Raw>> = Arc::new(stmts.into_element().ast);
+
+        // Execute through the normal single-statement execution path using a
+        // system session, then collect the produced rows.
+        let (sub_tx, sub_rx) = oneshot::channel();
+        let sub_ct = crate::util::ClientTransmitter::new(sub_tx, self.internal_cmd_tx.clone());
+
+        // Allocate a unique-ish connection id for widget SQL execution.
+        //
+        // Keep it below 2^31 so it remains i32-compatible for any pgwire logging.
+        static NEXT_WIDGET_CONN_ID: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(2_000_000_000);
+        let conn_id = ConnectionId::Static(
+            NEXT_WIDGET_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+
+        let mut session = crate::session::Session::new(
+            self.catalog().config().build_info,
+            crate::session::SessionConfig {
+                conn_id: conn_id.clone(),
+                uuid: Uuid::new_v4(),
+                user: mz_sql::session::user::SYSTEM_USER.name.clone(),
+                client_ip: None,
+                external_metadata_rx: None,
+                internal_user_metadata: None,
+                helm_chart_version: self.catalog().config().helm_chart_version.clone(),
+            },
+            self.metrics.session_metrics(),
+        );
+        session.initialize_role_metadata(mz_sql::session::user::MZ_SYSTEM_ROLE_ID);
+        session.start_transaction_single_stmt(self.now_datetime());
+
+        let ctx = crate::coord::ExecuteContext::from_parts(
+            sub_ct,
+            self.internal_cmd_tx.clone(),
+            session,
+            crate::coord::ExecuteContextExtra::default(),
+        );
+
+        self.handle_execute_inner(stmt, Params::empty(), ctx).await;
+
+        let resp = sub_rx
+            .await
+            .map_err(|_| "widget SQL execution response channel dropped".to_string())?;
+
+        let crate::command::Response {
+            result,
+            session,
+            otel_ctx: _,
+        } = resp;
+
+        let execute_response = result.map_err(|e| e.to_string())?;
+
+        let mut rows_out: Vec<Row> = Vec::new();
+        let mut response = execute_response;
+        loop {
+            match response {
+                crate::ExecuteResponse::CopyTo { resp, .. } => {
+                    response = *resp;
+                }
+                crate::ExecuteResponse::SendingRowsImmediate { mut rows } => {
+                    while let Some(row_ref) = rows.next() {
+                        rows_out.push(row_ref.to_owned());
+                    }
+                    break;
+                }
+                crate::ExecuteResponse::SendingRowsStreaming { mut rows, .. } => {
+                    use crate::coord::peek::PeekResponseUnary;
+                    use futures::StreamExt;
+
+                    while let Some(unary) = rows.next().await {
+                        match unary {
+                            PeekResponseUnary::Rows(mut iter) => {
+                                while let Some(row_ref) = iter.next() {
+                                    rows_out.push(row_ref.to_owned());
+                                }
+                            }
+                            PeekResponseUnary::Error(e) => return Err(e),
+                            PeekResponseUnary::Canceled => {
+                                return Err("widget SQL execution canceled".to_string());
+                            }
+                        }
+                    }
+                    break;
+                }
+                other => {
+                    return Err(format!(
+                        "widget SQL must be a single SELECT-like statement that returns rows, got {}",
+                        other.tag().unwrap_or_else(|| format!("{:?}", other))
+                    ));
+                }
+            }
+        }
+
+        // Always clear per-connection coordinator state for this ephemeral session.
+        self.clear_connection(&conn_id).await;
+        // Clear session-side transaction state.
+        let mut session = session;
+        let _ = session.clear_transaction();
+
+        Ok(rows_out)
+    }
+
+    /// Read all rows from a builtin table for a widget.
+    ///
+    /// This looks up the table by CatalogItemId, resolves it to a GlobalId,
+    /// and reads the latest snapshot from storage.
+    async fn read_builtin_table_for_widget(
+        &self,
+        table_id: mz_repr::CatalogItemId,
+    ) -> Result<Vec<Row>, String> {
+        // Get the catalog entry for this item
+        let entry = self.catalog().try_get_entry(&table_id);
+        let entry = match entry {
+            Some(entry) => entry,
+            None => {
+                return Err(format!(
+                    "builtin table not found in catalog: {:?}",
+                    table_id
+                ));
+            }
+        };
+
+        // Ensure it's a table
+        let table = match entry.table() {
+            Some(table) => table,
+            None => {
+                return Err(format!("catalog item {:?} is not a table", table_id));
+            }
+        };
+
+        // Get the GlobalId for reading (the latest version)
+        let global_id = table.global_id_writes();
+
+        tracing::debug!(
+            ?table_id,
+            ?global_id,
+            table_name = %entry.name().item,
+            "reading builtin table for widget"
+        );
+
+        // Read the latest snapshot from storage
+        match self
+            .controller
+            .storage_collections
+            .snapshot_latest(global_id)
+            .await
+        {
+            Ok(rows) => {
+                tracing::debug!(
+                    ?table_id,
+                    num_rows = rows.len(),
+                    "read builtin table for widget"
+                );
+                Ok(rows)
+            }
+            Err(e) => Err(format!(
+                "failed to read builtin table {:?}: {}",
+                table_id, e
+            )),
         }
     }
 

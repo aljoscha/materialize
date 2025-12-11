@@ -2079,6 +2079,10 @@ impl SystemVars {
         *self.expect_value(&cluster_scheduling::CLUSTER_SOFTEN_AZ_AFFINITY_WEIGHT)
     }
 
+    pub fn auto_scaling_enabled(&self) -> bool {
+        *self.expect_value(&auto_scaling::AUTO_SCALING_ENABLED)
+    }
+
     pub fn cluster_alter_check_ready_interval(&self) -> Duration {
         *self.expect_value(&cluster_scheduling::CLUSTER_ALTER_CHECK_READY_INTERVAL)
     }

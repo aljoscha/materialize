@@ -230,17 +230,14 @@ impl Coordinator {
             drop(txn_reads);
         }
 
-        if let Some(_guard) = self
-            .active_conns
-            .get_mut(conn_id)
-            .expect("must exist for active session")
-            .deferred_lock
-            .take()
+        // Some internal execution paths (e.g., background/widget SQL) construct
+        // ephemeral sessions that are not present in `active_conns`. Only attempt
+        // to release deferred statement locks when the connection is tracked.
+        if let Some(conn_meta) = self.active_conns.get_mut(conn_id)
+            && conn_meta.deferred_lock.take().is_some()
+            && !self.serialized_ddl.is_empty()
         {
-            // If there are waiting deferred statements, process one.
-            if !self.serialized_ddl.is_empty() {
-                let _ = self.internal_cmd_tx.send(Message::DeferredStatementReady);
-            }
+            let _ = self.internal_cmd_tx.send(Message::DeferredStatementReady);
         }
     }
 

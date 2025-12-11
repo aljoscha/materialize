@@ -25,6 +25,7 @@ use mz_build_info::DUMMY_BUILD_INFO;
 use mz_catalog::SYSTEM_CONN_ID;
 use mz_catalog::builtin::{
     BUILTINS, Builtin, BuiltinCluster, BuiltinLog, BuiltinSource, BuiltinTable, BuiltinType,
+    BuiltinView,
 };
 use mz_catalog::config::{AwsPrincipalContext, ClusterReplicaSizeMap};
 use mz_catalog::expr_cache::LocalExpressions;
@@ -1777,6 +1778,13 @@ impl CatalogState {
     /// Panics if the builtin storage collection doesn't exist in the catalog.
     pub fn resolve_builtin_source(&self, builtin: &'static BuiltinSource) -> CatalogItemId {
         self.resolve_builtin_object(&Builtin::<IdReference>::Source(builtin))
+    }
+
+    /// Optimized lookup for a builtin view.
+    ///
+    /// Panics if the builtin view doesn't exist in the catalog.
+    pub fn resolve_builtin_view(&self, builtin: &'static BuiltinView) -> CatalogItemId {
+        self.resolve_builtin_object(&Builtin::<IdReference>::View(builtin))
     }
 
     /// Optimized lookup for a builtin object.

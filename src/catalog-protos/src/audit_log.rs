@@ -583,6 +583,9 @@ impl RustType<crate::objects::audit_log_event_v1::CreateOrDropClusterReplicaReas
             CreateOrDropClusterReplicaReasonV1::System => crate::objects::audit_log_event_v1::CreateOrDropClusterReplicaReasonV1 {
                 reason: Some(crate::objects::audit_log_event_v1::create_or_drop_cluster_replica_reason_v1::Reason::System(Empty {}))
             },
+            CreateOrDropClusterReplicaReasonV1::AutoScaling => crate::objects::audit_log_event_v1::CreateOrDropClusterReplicaReasonV1 {
+                reason: Some(crate::objects::audit_log_event_v1::create_or_drop_cluster_replica_reason_v1::Reason::AutoScaling(Empty {}))
+            },
         }
     }
 
@@ -594,6 +597,7 @@ impl RustType<crate::objects::audit_log_event_v1::CreateOrDropClusterReplicaReas
             Some(crate::objects::audit_log_event_v1::create_or_drop_cluster_replica_reason_v1::Reason::Manual(Empty {})) => Ok(CreateOrDropClusterReplicaReasonV1::Manual),
             Some(crate::objects::audit_log_event_v1::create_or_drop_cluster_replica_reason_v1::Reason::Schedule(Empty {})) => Ok(CreateOrDropClusterReplicaReasonV1::Schedule),
             Some(crate::objects::audit_log_event_v1::create_or_drop_cluster_replica_reason_v1::Reason::System(Empty {})) => Ok(CreateOrDropClusterReplicaReasonV1::System),
+            Some(crate::objects::audit_log_event_v1::create_or_drop_cluster_replica_reason_v1::Reason::AutoScaling(Empty {})) => Ok(CreateOrDropClusterReplicaReasonV1::AutoScaling),
         }
     }
 }

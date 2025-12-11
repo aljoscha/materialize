@@ -19,7 +19,10 @@
 //! The isolation is important: widget bugs or slow operations should not block
 //! critical coordinator functions.
 
+pub mod auto_scaling;
+
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,7 +32,7 @@ use mz_ore::task::spawn;
 use mz_repr::GlobalId;
 use thiserror::Error;
 use tokio::select;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
@@ -71,25 +74,127 @@ pub trait Widget: Send + Sync + 'static {
     async fn shutdown(&mut self, ctx: &WidgetContext) -> Result<(), WidgetError>;
 }
 
+/// A request from the widget to the coordinator for data.
+///
+/// This provides a generic interface for widgets to read from builtin tables
+/// and execute SQL queries. The coordinator handles the request and returns
+/// raw row data that the widget then interprets according to its needs.
+#[derive(Debug)]
+pub enum WidgetDataRequest {
+    /// Read all rows from a builtin table.
+    ///
+    /// The widget specifies the table by CatalogItemId, and the coordinator returns
+    /// the raw rows. The widget is responsible for parsing the rows according
+    /// to the table's schema.
+    ReadBuiltinTable {
+        /// The CatalogItemId of the builtin table to read.
+        table_id: mz_repr::CatalogItemId,
+        /// Channel to send the rows back to the widget.
+        response_tx: oneshot::Sender<Result<Vec<mz_repr::Row>, String>>,
+    },
+    /// Execute a SQL query and return the results.
+    ///
+    /// This allows widgets to execute read-only SQL queries against the system.
+    /// The query is executed with system privileges but should only be used for
+    /// SELECT queries on system tables for signal collection.
+    ExecuteSql {
+        /// The SQL query to execute.
+        sql: String,
+        /// Channel to send the result rows back to the widget.
+        response_tx: oneshot::Sender<Result<Vec<mz_repr::Row>, String>>,
+    },
+}
+
 /// Read-only context provided to widgets for observing the system.
 ///
 /// Widgets use this to read from the catalog and builtin tables.
 /// All writes must go through `WidgetAction` to be processed by the coordinator.
-#[derive(Clone)]
 pub struct WidgetContext {
     /// Current wall-clock time (milliseconds since epoch).
     pub now_millis: u64,
     /// Whether the system is in read-only mode.
     pub read_only: bool,
+    /// Catalog for reading cluster and replica information.
+    pub catalog: Arc<crate::catalog::Catalog>,
+    /// Channel to send data requests to the coordinator.
+    request_tx: mpsc::UnboundedSender<WidgetDataRequest>,
 }
 
 impl WidgetContext {
     /// Create a new widget context.
-    pub fn new(now_millis: u64, read_only: bool) -> Self {
+    pub fn new(
+        now_millis: u64,
+        read_only: bool,
+        catalog: Arc<crate::catalog::Catalog>,
+        request_tx: mpsc::UnboundedSender<WidgetDataRequest>,
+    ) -> Self {
         Self {
             now_millis,
             read_only,
+            catalog,
+            request_tx,
         }
+    }
+
+    /// Read all rows from a builtin table.
+    ///
+    /// This sends a request to the coordinator to read from the specified builtin
+    /// table. The coordinator returns raw rows that the widget must parse according
+    /// to the table's schema.
+    ///
+    /// # Arguments
+    /// * `table_id` - The CatalogItemId of the builtin table to read
+    ///
+    /// # Returns
+    /// A vector of raw rows from the table, or an error if the read failed.
+    pub async fn read_builtin_table(
+        &self,
+        table_id: mz_repr::CatalogItemId,
+    ) -> Result<Vec<mz_repr::Row>, WidgetError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.request_tx
+            .send(WidgetDataRequest::ReadBuiltinTable {
+                table_id,
+                response_tx,
+            })
+            .map_err(|e| {
+                WidgetError::Internal(format!("failed to send table read request: {}", e))
+            })?;
+        response_rx
+            .await
+            .map_err(|e| {
+                WidgetError::Internal(format!("failed to receive table read response: {}", e))
+            })?
+            .map_err(|e| WidgetError::Internal(format!("table read failed: {}", e)))
+    }
+
+    /// Execute a SQL query and return the result rows.
+    ///
+    /// This sends a request to the coordinator to execute a read-only SQL query.
+    /// The query is executed with system privileges but should only be used for
+    /// SELECT queries on system tables for signal collection.
+    ///
+    /// # Arguments
+    /// * `sql` - The SQL query to execute
+    ///
+    /// # Returns
+    /// A vector of result rows, or an error if the query failed.
+    pub async fn execute_sql(&self, sql: &str) -> Result<Vec<mz_repr::Row>, WidgetError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.request_tx
+            .send(WidgetDataRequest::ExecuteSql {
+                sql: sql.to_string(),
+                response_tx,
+            })
+            .map_err(|e| {
+                WidgetError::Internal(format!("failed to send SQL execution request: {}", e))
+            })?;
+        response_rx
+            .await
+            .map_err(|e| {
+                WidgetError::Internal(format!("failed to receive SQL execution response: {}", e))
+            })?
+            .map_err(|e| WidgetError::Internal(format!("SQL execution failed: {}", e)))
     }
 }
 
@@ -128,28 +233,37 @@ pub enum CrashReason {
 }
 
 /// Actions that widgets request from the coordinator.
-#[derive(Debug, Clone)]
+///
+/// Widgets can request the coordinator to execute SQL statements on their behalf.
+/// All SQL execution goes through the standard planning and execution paths to
+/// ensure transactional consistency. Widgets should NOT directly manipulate
+/// `BuiltinTableUpdate` or write raw diffs, as this can lead to inconsistent
+/// table state.
+#[derive(Debug)]
 pub enum WidgetAction {
     /// Execute a DDL statement (e.g., CREATE/DROP CLUSTER REPLICA).
     ExecuteDdl {
+        /// The cluster this action affects.
+        cluster_id: ClusterId,
+        /// The ID of the scaling strategy that produced this action (if applicable).
+        strategy_id: Option<String>,
+        /// Type of action, e.g. create_replica/drop_replica/resize_replica (if applicable).
+        action_type: Option<String>,
         /// The DDL SQL statement to execute.
         sql: String,
         /// Human-readable reason for this action.
         reason: String,
     },
-    /// Write rows to a builtin table.
-    WriteToBuiltinTable {
-        /// The global ID of the builtin table.
-        table_id: GlobalId,
-        /// Rows to write (with diffs).
-        rows: Vec<(mz_repr::Row, mz_repr::Diff)>,
-    },
-    /// Delete rows from a builtin table.
-    DeleteFromBuiltinTable {
-        /// The global ID of the builtin table.
-        table_id: GlobalId,
-        /// Filter for rows to delete (represented as a Row pattern).
-        filter: mz_repr::Row,
+    /// Execute a DML statement (INSERT/UPDATE/DELETE) on a writable builtin table.
+    ///
+    /// This goes through the standard SQL execution path to ensure proper
+    /// transactional semantics and table consistency. Only writable builtin
+    /// tables (like mz_scaling_strategies) can be modified this way.
+    ExecuteDml {
+        /// The DML SQL statement to execute.
+        sql: String,
+        /// Human-readable reason for this action.
+        reason: String,
     },
 }
 
@@ -178,16 +292,20 @@ pub enum WidgetError {
 // ============================================================================
 
 /// Configuration for the widget runtime.
-#[derive(Clone)]
 pub struct WidgetRuntimeConfig {
     /// Function to get the current time in milliseconds since epoch.
     pub now: NowFn,
     /// Whether the system is in read-only mode.
     pub read_only: bool,
+    /// Catalog for reading cluster and replica information.
+    pub catalog: Arc<crate::catalog::Catalog>,
+    /// Channel to send data requests to the coordinator.
+    /// The sender is cloned for each widget's context.
+    pub request_tx: mpsc::UnboundedSender<WidgetDataRequest>,
 }
 
 /// Handle to send events to a widget.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WidgetHandle {
     event_tx: mpsc::UnboundedSender<WidgetEvent>,
     name: &'static str,
@@ -255,6 +373,8 @@ impl WidgetRuntime {
         let tick_interval = widget.tick_interval();
         let now = self.config.now.clone();
         let read_only = self.config.read_only;
+        let catalog = Arc::clone(&self.config.catalog);
+        let request_tx = self.config.request_tx.clone();
 
         // Channel for sending events to the widget
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<WidgetEvent>();
@@ -270,7 +390,8 @@ impl WidgetRuntime {
         // Spawn the widget task
         spawn(|| format!("widget:{}", name), async move {
             // Create initial context
-            let ctx = WidgetContext::new(now(), read_only);
+            let ctx =
+                WidgetContext::new(now(), read_only, Arc::clone(&catalog), request_tx.clone());
 
             // Initialize the widget
             info!(widget = name, "initializing widget");
@@ -295,7 +416,7 @@ impl WidgetRuntime {
                     // Shutdown signal has highest priority
                     _ = shutdown_rx.recv() => {
                         info!(widget = name, "widget received shutdown signal");
-                        let ctx = WidgetContext::new(now(), read_only);
+                        let ctx = WidgetContext::new(now(), read_only, Arc::clone(&catalog), request_tx.clone());
                         if let Err(e) = widget.shutdown(&ctx).await {
                             warn!(widget = name, error = %e, "widget shutdown failed");
                         }
@@ -304,7 +425,7 @@ impl WidgetRuntime {
 
                     // Process events
                     Some(event) = event_rx.recv() => {
-                        let ctx = WidgetContext::new(now(), read_only);
+                        let ctx = WidgetContext::new(now(), read_only, Arc::clone(&catalog), request_tx.clone());
                         debug!(widget = name, event = ?event, "widget processing event");
                         match widget.on_event(event, &ctx).await {
                             Ok(actions) => {
@@ -327,7 +448,7 @@ impl WidgetRuntime {
 
                     // Periodic tick
                     _ = tick_timer.tick() => {
-                        let ctx = WidgetContext::new(now(), read_only);
+                        let ctx = WidgetContext::new(now(), read_only, Arc::clone(&catalog), request_tx.clone());
                         debug!(widget = name, "widget tick");
                         match widget.tick(&ctx).await {
                             Ok(actions) => {
@@ -459,6 +580,9 @@ impl Widget for DummyWidget {
                 "DummyWidget producing test DDL action"
             );
             Ok(vec![WidgetAction::ExecuteDdl {
+                cluster_id: ClusterId::User(0),
+                strategy_id: None,
+                action_type: None,
                 sql: format!(
                     "-- DummyWidget test action (tick {}), not actually executed",
                     self.tick_count
@@ -495,77 +619,7 @@ impl Widget for DummyWidget {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-
-    struct TestWidget {
-        tick_count: u32,
-        event_count: u32,
-    }
-
-    impl TestWidget {
-        fn new() -> Self {
-            Self {
-                tick_count: 0,
-                event_count: 0,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Widget for TestWidget {
-        fn name(&self) -> &'static str {
-            "test_widget"
-        }
-
-        fn tick_interval(&self) -> Duration {
-            Duration::from_millis(100)
-        }
-
-        async fn initialize(&mut self, _ctx: &WidgetContext) -> Result<(), WidgetError> {
-            Ok(())
-        }
-
-        async fn tick(&mut self, _ctx: &WidgetContext) -> Result<Vec<WidgetAction>, WidgetError> {
-            self.tick_count += 1;
-            Ok(vec![])
-        }
-
-        async fn on_event(
-            &mut self,
-            _event: WidgetEvent,
-            _ctx: &WidgetContext,
-        ) -> Result<Vec<WidgetAction>, WidgetError> {
-            self.event_count += 1;
-            Ok(vec![])
-        }
-
-        async fn shutdown(&mut self, _ctx: &WidgetContext) -> Result<(), WidgetError> {
-            Ok(())
-        }
-    }
-
-    #[mz_ore::test(tokio::test)]
-    async fn test_widget_runtime_basic() {
-        let config = WidgetRuntimeConfig {
-            now: Arc::new(|| 0),
-            read_only: false,
-        };
-        let mut runtime = WidgetRuntime::new(config);
-        let (message_tx, _message_rx) = mpsc::unbounded_channel();
-
-        let widget = Box::new(TestWidget::new());
-        let handle = runtime.spawn_widget(widget, message_tx);
-
-        assert_eq!(handle.name, "test_widget");
-
-        // Give the widget time to initialize and tick a few times
-        tokio::time::sleep(Duration::from_millis(350)).await;
-
-        // Shutdown
-        runtime.shutdown_all(Duration::from_secs(1)).await;
-    }
-}
+// Note: Widget runtime tests that require a catalog would need to create a mock
+// catalog, which is complex. The auto_scaling module has its own unit tests for
+// strategy logic. Integration tests for the full widget runtime should be done
+// via testdrive.

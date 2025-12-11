@@ -944,11 +944,35 @@ impl Coordinator {
     pub(crate) async fn sequence_create_cluster_replica(
         &mut self,
         session: &Session,
+        plan: CreateClusterReplicaPlan,
+    ) -> Result<ExecuteResponse, AdapterError> {
+        self.sequence_create_cluster_replica_inner(
+            Some(session),
+            plan,
+            ReplicaCreateDropReason::Manual,
+        )
+        .await
+    }
+
+    /// Create a cluster replica, optionally with a session context.
+    ///
+    /// When `session` is `None`, the operation runs with system privileges:
+    /// - No restrictions on INTERNAL or BILLED AS
+    /// - No user permission checks
+    /// - Uses the cluster owner for allowed sizes
+    ///
+    /// This is used by the auto-scaling widget to create replicas without
+    /// requiring a user session.
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn sequence_create_cluster_replica_inner(
+        &mut self,
+        session: Option<&Session>,
         CreateClusterReplicaPlan {
             name,
             cluster_id,
             config,
         }: CreateClusterReplicaPlan,
+        reason: ReplicaCreateDropReason,
     ) -> Result<ExecuteResponse, AdapterError> {
         // Choose default AZ if necessary
         let (compute, location) = match config {
@@ -997,7 +1021,12 @@ impl Coordinator {
             ReplicaLogging::default()
         };
 
-        let role_id = session.role_metadata().current_role;
+        // For allowed cluster sizes, use the session's role if available,
+        // otherwise use the cluster owner's role.
+        let cluster = self.catalog().get_cluster(cluster_id);
+        let role_id = session
+            .map(|s| s.role_metadata().current_role)
+            .unwrap_or_else(|| cluster.owner_id());
         let config = ReplicaConfig {
             location: self.catalog().concretize_replica_location(
                 location,
@@ -1011,25 +1040,29 @@ impl Coordinator {
             compute: ComputeReplicaConfig { logging },
         };
 
-        let cluster = self.catalog().get_cluster(cluster_id);
-
-        if let ReplicaLocation::Managed(ManagedReplicaLocation {
-            internal,
-            billed_as,
-            ..
-        }) = &config.location
-        {
-            // Only internal users have access to INTERNAL and BILLED AS
-            if !session.user().is_internal() && (*internal || billed_as.is_some()) {
-                coord_bail!("cannot specify INTERNAL or BILLED AS as non-internal user")
-            }
-            // Managed clusters require the INTERNAL flag.
-            if cluster.is_managed() && !*internal {
-                coord_bail!("must specify INTERNAL when creating a replica in a managed cluster");
-            }
-            // BILLED AS implies the INTERNAL flag.
-            if billed_as.is_some() && !*internal {
-                coord_bail!("must specify INTERNAL when specifying BILLED AS");
+        // Permission checks only apply when there's a user session.
+        // System operations (like auto-scaling) bypass these checks.
+        if let Some(session) = session {
+            if let ReplicaLocation::Managed(ManagedReplicaLocation {
+                internal,
+                billed_as,
+                ..
+            }) = &config.location
+            {
+                // Only internal users have access to INTERNAL and BILLED AS
+                if !session.user().is_internal() && (*internal || billed_as.is_some()) {
+                    coord_bail!("cannot specify INTERNAL or BILLED AS as non-internal user")
+                }
+                // Managed clusters require the INTERNAL flag.
+                if cluster.is_managed() && !*internal {
+                    coord_bail!(
+                        "must specify INTERNAL when creating a replica in a managed cluster"
+                    );
+                }
+                // BILLED AS implies the INTERNAL flag.
+                if billed_as.is_some() && !*internal {
+                    coord_bail!("must specify INTERNAL when specifying BILLED AS");
+                }
             }
         }
 
@@ -1040,10 +1073,10 @@ impl Coordinator {
             name: name.clone(),
             config,
             owner_id,
-            reason: ReplicaCreateDropReason::Manual,
+            reason,
         };
 
-        self.catalog_transact(Some(session), vec![op]).await?;
+        self.catalog_transact(session, vec![op]).await?;
 
         let id = self
             .catalog()
@@ -1054,6 +1087,33 @@ impl Coordinator {
         self.create_cluster_replica(cluster_id, id, name).await;
 
         Ok(ExecuteResponse::CreatedClusterReplica)
+    }
+
+    /// Drop cluster replicas on behalf of a system operation (like auto-scaling).
+    ///
+    /// This bypasses the normal session-based drop flow and directly constructs
+    /// the catalog operations with the specified reason.
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn sequence_drop_cluster_replicas(
+        &mut self,
+        replicas: Vec<(ClusterId, ReplicaId)>,
+        reason: ReplicaCreateDropReason,
+    ) -> Result<(), AdapterError> {
+        if replicas.is_empty() {
+            return Ok(());
+        }
+
+        let drop_infos: Vec<_> = replicas
+            .into_iter()
+            .map(|(cluster_id, replica_id)| {
+                catalog::DropObjectInfo::ClusterReplica((cluster_id, replica_id, reason.clone()))
+            })
+            .collect();
+
+        let op = catalog::Op::DropObjects(drop_infos);
+        self.catalog_transact(None::<&Session>, vec![op]).await?;
+
+        Ok(())
     }
 
     async fn create_cluster_replica(

@@ -1589,6 +1589,7 @@ mod tests {
             resolved_ids: ResolvedIds::empty(),
             custom_logical_compaction_window: None,
             is_retained_metrics_object: false,
+            is_writable_builtin: false,
             data_source: TableDataSource::TableWrites { defaults: vec![] },
         }
     }

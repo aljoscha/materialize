@@ -231,7 +231,7 @@ mod message_handler;
 mod privatelink_status;
 mod sql;
 mod validity;
-mod widgets;
+pub(crate) mod widgets;
 
 #[derive(Debug)]
 pub enum Message {
@@ -342,6 +342,8 @@ pub enum Message {
     SchedulingDecisions(Vec<(&'static str, Vec<(ClusterId, SchedulingDecision)>)>),
     /// Message from a widget.
     Widget(crate::widget::WidgetMessage),
+    /// Data request from a widget (to read from a builtin table).
+    WidgetDataRequest(crate::widget::WidgetDataRequest),
 }
 
 impl Message {
@@ -426,6 +428,7 @@ impl Message {
             Message::SchedulingDecisions { .. } => "scheduling_decision",
             Message::DeferredStatementReady => "deferred_statement_ready",
             Message::Widget(_) => "widget",
+            Message::WidgetDataRequest(_) => "widget_data_request",
         }
     }
 }

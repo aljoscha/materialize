@@ -305,6 +305,9 @@ pub enum ReplicaCreateDropReason {
     /// The automated cluster scheduling initiated the replica create or drop, e.g., a
     /// materialized view is needing a refresh on a SCHEDULE ON REFRESH cluster.
     ClusterScheduling(Vec<SchedulingDecision>),
+    /// The auto-scaling widget initiated the replica create or drop.
+    /// The string contains the reason from the scaling strategy.
+    AutoScaling(String),
 }
 
 impl ReplicaCreateDropReason {
@@ -320,6 +323,11 @@ impl ReplicaCreateDropReason {
                 CreateOrDropClusterReplicaReasonV1::Schedule,
                 Some(scheduling_decisions),
             ),
+            ReplicaCreateDropReason::AutoScaling(_reason) => {
+                // For now, auto-scaling reasons are not captured in detail in the audit log.
+                // The scheduling_policies field is for cluster scheduling, not auto-scaling.
+                (CreateOrDropClusterReplicaReasonV1::AutoScaling, None)
+            }
         };
         (
             reason,

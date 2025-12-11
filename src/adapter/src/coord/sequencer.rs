@@ -704,10 +704,7 @@ impl Coordinator {
                 }
                 // Scaling strategy plans
                 Plan::CreateScalingStrategy(plan) => {
-                    let result = self
-                        .sequence_create_scaling_strategy(ctx.session(), plan)
-                        .await;
-                    ctx.retire(result);
+                    self.sequence_create_scaling_strategy(ctx, plan).await;
                 }
                 Plan::AlterScalingStrategy(plan) => {
                     self.sequence_alter_scaling_strategy(ctx, plan).await;

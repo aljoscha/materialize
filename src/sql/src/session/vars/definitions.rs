@@ -1653,6 +1653,18 @@ pub mod cluster_scheduling {
     );
 }
 
+pub mod auto_scaling {
+    use super::*;
+
+    pub static AUTO_SCALING_ENABLED: VarDefinition = VarDefinition::new(
+        "auto_scaling_enabled",
+        value!(bool; true),
+        "Whether the auto-scaling widget is allowed to execute actions (Materialize).",
+        false,
+    )
+    .with_feature_flag(&ENABLE_AUTO_SCALING);
+}
+
 /// Macro to simplify creating feature flags, i.e. boolean flags that we use to toggle the
 /// availability of features.
 ///
@@ -1772,6 +1784,12 @@ feature_flags!(
         enable_for_item_parsing: true,
     },
     // Actual feature flags
+    {
+        name: enable_auto_scaling,
+        desc: "auto-scaling strategies for clusters",
+        default: false,
+        enable_for_item_parsing: true,
+    },
     {
         name: enable_guard_subquery_tablefunc,
         desc: "Whether HIR -> MIR lowering should use a new tablefunc to guard subquery sizes",

@@ -106,6 +106,7 @@ async fn datadriven() {
                                             data_source: TableDataSource::TableWrites {
                                                 defaults: vec![],
                                             },
+                                            is_writable_builtin: false,
                                         }),
                                         owner_id: MZ_SYSTEM_ROLE_ID,
                                     }],

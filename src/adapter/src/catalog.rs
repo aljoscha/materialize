@@ -28,7 +28,7 @@ use mz_adapter_types::connection::ConnectionId;
 use mz_audit_log::{EventType, FullNameV1, ObjectType, VersionedStorageUsage};
 use mz_build_info::{BuildInfo, DUMMY_BUILD_INFO};
 use mz_catalog::builtin::{
-    BUILTIN_PREFIXES, BuiltinCluster, BuiltinLog, BuiltinSource, BuiltinTable,
+    BUILTIN_PREFIXES, BuiltinCluster, BuiltinLog, BuiltinSource, BuiltinTable, BuiltinView,
     MZ_CATALOG_SERVER_CLUSTER,
 };
 use mz_catalog::config::{BuiltinItemMigrationConfig, ClusterReplicaSizeMap, Config, StateConfig};
@@ -930,6 +930,11 @@ impl Catalog {
         builtin: &'static BuiltinSource,
     ) -> CatalogItemId {
         self.state.resolve_builtin_source(builtin)
+    }
+
+    /// Resolves a `BuiltinView`.
+    pub fn resolve_builtin_view(&self, builtin: &'static BuiltinView) -> CatalogItemId {
+        self.state.resolve_builtin_view(builtin)
     }
 
     /// Resolves `name` to a function [`CatalogEntry`].

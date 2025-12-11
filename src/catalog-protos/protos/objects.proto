@@ -719,6 +719,7 @@ message AuditLogEventV1 {
       Empty Manual = 1;
       Empty Schedule = 2;
       Empty System = 3;
+      Empty AutoScaling = 4;
     }
   }
 

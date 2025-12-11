@@ -345,6 +345,7 @@ pub enum CreateOrDropClusterReplicaReasonV1 {
     Manual,
     Schedule,
     System,
+    AutoScaling,
 }
 
 /// The reason for the automated cluster scheduling to turn a cluster On or Off. Each existing

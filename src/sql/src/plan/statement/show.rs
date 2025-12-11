@@ -957,6 +957,8 @@ pub fn show_scaling_strategies<'a>(
     scx: &'a StatementContext<'a>,
     cluster: Option<ResolvedClusterName>,
 ) -> Result<ShowSelect<'a>, PlanError> {
+    scx.require_feature_flag(&crate::session::vars::ENABLE_AUTO_SCALING)?;
+
     let mut query = "SELECT
         s.id,
         COALESCE(c.name, s.cluster_pattern, 'ALL CLUSTERS') AS target,
@@ -985,6 +987,8 @@ pub fn show_scaling_actions<'a>(
     cluster: Option<ResolvedClusterName>,
     limit: Option<u64>,
 ) -> Result<ShowSelect<'a>, PlanError> {
+    scx.require_feature_flag(&crate::session::vars::ENABLE_AUTO_SCALING)?;
+
     let mut query = "SELECT
         a.action_id,
         c.name AS cluster,

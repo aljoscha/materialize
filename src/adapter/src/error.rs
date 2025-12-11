@@ -180,7 +180,15 @@ pub enum AdapterError {
         replica_name: String,
     },
     /// The specified scaling strategy does not exist.
-    UnknownScalingStrategy { details: String },
+    UnknownScalingStrategy {
+        details: String,
+    },
+    DuplicateScalingStrategy {
+        details: String,
+    },
+    AmbiguousScalingStrategyPattern {
+        details: String,
+    },
     /// The named setting does not exist.
     UnrecognizedConfigurationParam(String),
     /// A generic error occurred.
@@ -578,6 +586,8 @@ impl AdapterError {
             AdapterError::UnknownLoginRole(_) => SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
             AdapterError::UnknownClusterReplica { .. } => SqlState::UNDEFINED_OBJECT,
             AdapterError::UnknownScalingStrategy { .. } => SqlState::UNDEFINED_OBJECT,
+            AdapterError::DuplicateScalingStrategy { .. } => SqlState::DUPLICATE_OBJECT,
+            AdapterError::AmbiguousScalingStrategyPattern { .. } => SqlState::AMBIGUOUS_PARAMETER,
             AdapterError::UnrecognizedConfigurationParam(_) => SqlState::UNDEFINED_OBJECT,
             AdapterError::Unsupported(..) => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::UnavailableFeature { .. } => SqlState::FEATURE_NOT_SUPPORTED,
@@ -871,6 +881,12 @@ impl fmt::Display for AdapterError {
             ),
             AdapterError::UnknownScalingStrategy { details } => {
                 write!(f, "scaling strategy does not exist: {details}")
+            }
+            AdapterError::DuplicateScalingStrategy { details } => {
+                write!(f, "scaling strategy already exists: {details}")
+            }
+            AdapterError::AmbiguousScalingStrategyPattern { details } => {
+                write!(f, "ambiguous scaling strategy pattern: {details}")
             }
             AdapterError::UnrecognizedConfigurationParam(setting_name) => write!(
                 f,

@@ -7705,7 +7705,10 @@ pub fn plan_create_scaling_strategy(
         with_options,
     }: CreateScalingStrategyStatement<Aug>,
 ) -> Result<Plan, PlanError> {
+    use crate::session::vars;
     use mz_sql_parser::ast::ScalingStrategyType as AstStrategyType;
+
+    scx.require_feature_flag(&vars::ENABLE_AUTO_SCALING)?;
 
     // Resolve the target
     let plan_target = resolve_scaling_strategy_target(scx, &target)?;
@@ -7747,8 +7750,11 @@ pub fn plan_alter_scaling_strategy(
         action,
     }: AlterScalingStrategyStatement<Aug>,
 ) -> Result<Plan, PlanError> {
+    use crate::session::vars;
     use mz_sql_parser::ast::AlterScalingStrategyAction;
     use mz_sql_parser::ast::ScalingStrategyType as AstStrategyType;
+
+    scx.require_feature_flag(&vars::ENABLE_AUTO_SCALING)?;
 
     // Resolve the target
     let plan_target = resolve_scaling_strategy_target(scx, &target)?;
@@ -7790,7 +7796,10 @@ pub fn plan_drop_scaling_strategy(
         strategy_type,
     }: DropScalingStrategyStatement<Aug>,
 ) -> Result<Plan, PlanError> {
+    use crate::session::vars;
     use mz_sql_parser::ast::ScalingStrategyType as AstStrategyType;
+
+    scx.require_feature_flag(&vars::ENABLE_AUTO_SCALING)?;
 
     // Resolve the target
     let plan_target = resolve_scaling_strategy_target(scx, &target)?;

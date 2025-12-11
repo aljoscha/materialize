@@ -4789,23 +4789,26 @@ impl Coordinator {
     #[instrument]
     pub(super) async fn sequence_create_scaling_strategy(
         &mut self,
-        _session: &Session,
+        ctx: ExecuteContext,
         plan: plan::CreateScalingStrategyPlan,
-    ) -> Result<ExecuteResponse, AdapterError> {
+    ) {
         use mz_catalog::builtin::MZ_SCALING_STRATEGIES;
-        use mz_sql::plan::{ScalingStrategyTarget, ScalingStrategyType};
+        use mz_controller_types::ClusterId;
+        use mz_ore::collections::CollectionExt;
+        use mz_sql::plan::{Params, ScalingStrategyTarget, ScalingStrategyType};
+        use mz_sql_parser::ast::Raw;
+        use std::str::FromStr;
+        use tokio::sync::oneshot;
 
-        // Generate a unique ID for the strategy
+        // Generate a unique ID for the strategy row.
         let strategy_id = uuid::Uuid::new_v4().to_string();
 
-        // Convert target to cluster_id string and pattern
         let (cluster_id_str, cluster_pattern) = match &plan.target {
             ScalingStrategyTarget::Cluster(id) => (Some(id.to_string()), None),
             ScalingStrategyTarget::AllClusters => (None, None),
             ScalingStrategyTarget::AllClustersLike(pattern) => (None, Some(pattern.clone())),
         };
 
-        // Convert strategy type to string
         let strategy_type_str = match plan.strategy_type {
             ScalingStrategyType::TargetSize => "target_size",
             ScalingStrategyType::ShrinkToFit => "shrink_to_fit",
@@ -4813,46 +4816,238 @@ impl Coordinator {
             ScalingStrategyType::IdleSuspend => "idle_suspend",
         };
 
-        let now = self.now();
-        let now_ts = mz_ore::now::to_datetime(now);
+        // Read existing configs to enforce (target, type) uniqueness and detect ambiguous pattern overlaps.
+        let existing_rows = match self
+            .controller
+            .storage_collections
+            .snapshot_latest(
+                self.catalog()
+                    .get_entry(&self.catalog().resolve_builtin_table(&MZ_SCALING_STRATEGIES))
+                    .table()
+                    .expect("mz_scaling_strategies must be a table")
+                    .global_id_writes(),
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                ctx.retire(Err(AdapterError::Internal(format!(
+                    "failed to read mz_scaling_strategies: {}",
+                    e
+                ))));
+                return;
+            }
+        };
 
-        // Build the row for mz_scaling_strategies
-        let mut row = Row::default();
-        let mut packer = row.packer();
-        packer.push(Datum::String(&strategy_id));
-        packer.push(match &cluster_id_str {
-            Some(id) => Datum::String(id),
-            None => Datum::Null,
+        #[derive(Debug)]
+        struct ExistingStrategy {
+            cluster_id: Option<ClusterId>,
+            cluster_pattern: Option<String>,
+            strategy_type: String,
+        }
+
+        fn row_to_existing(row: &Row) -> Option<ExistingStrategy> {
+            let mut datums = row.iter();
+            let _id = datums.next()?;
+            let cluster_id = match datums.next()? {
+                Datum::String(s) => ClusterId::from_str(s).ok(),
+                Datum::Null => None,
+                _ => return None,
+            };
+            let cluster_pattern = match datums.next()? {
+                Datum::String(s) => Some(s.to_string()),
+                Datum::Null => None,
+                _ => return None,
+            };
+            let strategy_type = match datums.next()? {
+                Datum::String(s) => s.to_string(),
+                _ => return None,
+            };
+            Some(ExistingStrategy {
+                cluster_id,
+                cluster_pattern,
+                strategy_type,
+            })
+        }
+
+        fn is_system_cluster(name: &str) -> bool {
+            name == "system" || name.starts_with("mz_")
+        }
+
+        fn matches_like_pattern(name: &str, pattern: &str) -> bool {
+            let parts: Vec<&str> = pattern.split('%').collect();
+            if parts.is_empty() {
+                return name.is_empty();
+            }
+            let mut pos = 0usize;
+            for (i, part) in parts.iter().enumerate() {
+                if part.is_empty() {
+                    continue;
+                }
+                match name[pos..].find(part) {
+                    Some(found) => {
+                        if i == 0 && !pattern.starts_with('%') && found != 0 {
+                            return false;
+                        }
+                        pos += found + part.len();
+                    }
+                    None => return false,
+                }
+            }
+            if !pattern.ends_with('%') {
+                if let Some(last) = parts.last() {
+                    if !last.is_empty() {
+                        return name.ends_with(last);
+                    }
+                }
+            }
+            true
+        }
+
+        let existing: Vec<ExistingStrategy> =
+            existing_rows.iter().filter_map(row_to_existing).collect();
+
+        let duplicates = existing.iter().any(|e| {
+            if e.strategy_type != strategy_type_str {
+                return false;
+            }
+            match &plan.target {
+                ScalingStrategyTarget::Cluster(id) => {
+                    e.cluster_id == Some(*id) && e.cluster_pattern.is_none()
+                }
+                ScalingStrategyTarget::AllClusters => {
+                    e.cluster_id.is_none() && e.cluster_pattern.is_none()
+                }
+                ScalingStrategyTarget::AllClustersLike(pattern) => {
+                    e.cluster_id.is_none() && e.cluster_pattern.as_deref() == Some(pattern)
+                }
+            }
         });
-        packer.push(match &cluster_pattern {
-            Some(p) => Datum::String(p),
-            None => Datum::Null,
+
+        if duplicates {
+            if plan.if_not_exists {
+                ctx.retire(Ok(ExecuteResponse::CreatedScalingStrategy));
+                return;
+            }
+            ctx.retire(Err(AdapterError::DuplicateScalingStrategy {
+                details: format!("{} for {:?}", strategy_type_str, plan.target),
+            }));
+            return;
+        }
+
+        if let ScalingStrategyTarget::AllClustersLike(pattern) = &plan.target {
+            let cluster_names: Vec<String> = self
+                .catalog()
+                .clusters()
+                .filter(|c| !is_system_cluster(&c.name))
+                .map(|c| c.name.clone())
+                .collect();
+
+            let new_matches: Vec<_> = cluster_names
+                .iter()
+                .filter(|name| matches_like_pattern(name, pattern))
+                .collect();
+
+            for e in existing
+                .iter()
+                .filter(|e| e.strategy_type == strategy_type_str)
+            {
+                let Some(existing_pattern) = e.cluster_pattern.as_deref() else {
+                    continue;
+                };
+                let existing_matches: Vec<_> = cluster_names
+                    .iter()
+                    .filter(|name| matches_like_pattern(name, existing_pattern))
+                    .collect();
+
+                let overlaps = new_matches
+                    .iter()
+                    .any(|name| matches_like_pattern(name, existing_pattern));
+                if overlaps && new_matches.len() == existing_matches.len() {
+                    ctx.retire(Err(AdapterError::AmbiguousScalingStrategyPattern {
+                        details: format!(
+                            "pattern '{}' overlaps ambiguously with existing pattern '{}'",
+                            pattern, existing_pattern
+                        ),
+                    }));
+                    return;
+                }
+            }
+        }
+
+        let config_json = plan.config.config.to_string().replace('\'', "''");
+        let enabled = if plan.config.enabled { "true" } else { "false" };
+
+        let insert_sql = format!(
+            "INSERT INTO mz_internal.mz_scaling_strategies \
+             (id, cluster_id, cluster_pattern, strategy_type, config, enabled, created_at, updated_at) \
+             VALUES ('{}', {}, {}, '{}', '{}'::jsonb, {}, now(), now())",
+            strategy_id,
+            match &cluster_id_str {
+                Some(id) => format!("'{}'", id.replace('\'', "''")),
+                None => "NULL".to_string(),
+            },
+            match &cluster_pattern {
+                Some(p) => format!("'{}'", p.replace('\'', "''")),
+                None => "NULL".to_string(),
+            },
+            strategy_type_str,
+            config_json,
+            enabled,
+        );
+
+        let stmts = match mz_sql_parser::parser::parse_statements(&insert_sql) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                ctx.retire(Err(AdapterError::ParseError(e)));
+                return;
+            }
+        };
+        if stmts.len() != 1 {
+            ctx.retire(Err(AdapterError::Internal(format!(
+                "expected 1 statement, got {}",
+                stmts.len()
+            ))));
+            return;
+        }
+        let stmt: Arc<Statement<Raw>> = Arc::new(stmts.into_element().ast);
+
+        let (sub_tx, sub_rx) = oneshot::channel();
+        let sub_ct = ClientTransmitter::new(sub_tx, self.internal_cmd_tx.clone());
+        let (tx, internal_cmd_tx, session, extra) = ctx.into_parts();
+        let sub_ctx = ExecuteContext::from_parts(sub_ct, internal_cmd_tx.clone(), session, extra);
+
+        self.handle_execute_inner(stmt, Params::empty(), sub_ctx)
+            .await;
+
+        task::spawn(|| "sequence_create_scaling_strategy", async move {
+            match sub_rx.await {
+                Ok(Response {
+                    result,
+                    session,
+                    otel_ctx,
+                }) => {
+                    otel_ctx.attach_as_parent();
+                    let mapped = match result {
+                        Ok(ExecuteResponse::Inserted(1)) => {
+                            Ok(ExecuteResponse::CreatedScalingStrategy)
+                        }
+                        Ok(ExecuteResponse::Inserted(_)) => Err(AdapterError::Internal(
+                            "unexpected INSERT result for CREATE SCALING STRATEGY".to_string(),
+                        )),
+                        Ok(other) => Err(AdapterError::Internal(format!(
+                            "unexpected response from INSERT in CREATE SCALING STRATEGY: {:?}",
+                            other
+                        ))),
+                        Err(e) => Err(e),
+                    };
+                    tx.send(mapped, session);
+                }
+                Err(_) => {
+                    tracing::warn!("coordinator went away during CREATE SCALING STRATEGY");
+                }
+            }
         });
-        packer.push(Datum::String(strategy_type_str));
-        // Config as JSONB
-        let config_json = plan.config.config.clone();
-        let jsonb = Jsonb::from_serde_json(config_json)
-            .map_err(|e| AdapterError::Internal(format!("invalid JSON config: {}", e)))?;
-        packer.push(jsonb.as_ref().into_datum());
-        packer.push(Datum::from(plan.config.enabled));
-        packer.push(Datum::TimestampTz(now_ts.try_into().map_err(|_| {
-            AdapterError::Internal("invalid timestamp".to_string())
-        })?));
-        packer.push(Datum::TimestampTz(now_ts.try_into().map_err(|_| {
-            AdapterError::Internal("invalid timestamp".to_string())
-        })?));
-
-        // Get the builtin table ID
-        let table_id = self.catalog().resolve_builtin_table(&MZ_SCALING_STRATEGIES);
-
-        // Create the update
-        let update = crate::catalog::BuiltinTableUpdate::row(table_id, row, Diff::ONE);
-
-        // Execute the update and wait for completion
-        let (notify, _) = self.builtin_table_update().execute(vec![update]).await;
-        notify.await;
-
-        Ok(ExecuteResponse::CreatedScalingStrategy)
     }
 
     /// Alter scaling strategy by executing an UPDATE statement internally.
@@ -4956,12 +5151,7 @@ impl Coordinator {
 
         // Create sub-context for the UPDATE execution
         // Pass the original extra so it gets properly retired
-        let sub_ctx = ExecuteContext::from_parts(
-            sub_ct,
-            internal_cmd_tx.clone(),
-            session,
-            extra,
-        );
+        let sub_ctx = ExecuteContext::from_parts(sub_ct, internal_cmd_tx.clone(), session, extra);
 
         // Execute the UPDATE statement through the normal SQL path
         self.handle_execute_inner(stmt, Params::empty(), sub_ctx)
@@ -5104,12 +5294,7 @@ impl Coordinator {
 
         // Create sub-context for the DELETE execution
         // Pass the original extra so it gets properly retired
-        let sub_ctx = ExecuteContext::from_parts(
-            sub_ct,
-            internal_cmd_tx.clone(),
-            session,
-            extra,
-        );
+        let sub_ctx = ExecuteContext::from_parts(sub_ct, internal_cmd_tx.clone(), session, extra);
 
         // Execute the DELETE statement through the normal SQL path
         self.handle_execute_inner(stmt, Params::empty(), sub_ctx)
@@ -5117,6 +5302,7 @@ impl Coordinator {
 
         // Handle the response in a spawned task to not block the coordinator
         let if_exists = plan.if_exists;
+
         task::spawn(|| "sequence_drop_scaling_strategy", async move {
             match sub_rx.await {
                 Ok(Response {

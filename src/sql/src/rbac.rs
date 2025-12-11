@@ -1548,12 +1548,89 @@ fn generate_rbac_requirements(
         })
         | Plan::Execute(plan::ExecutePlan { name: _, params: _ })
         | Plan::Deallocate(plan::DeallocatePlan { name: _ })
-        | Plan::Raise(plan::RaisePlan { severity: _ })
-        // Scaling strategy plans - permissions are handled via cluster USAGE
-        | Plan::CreateScalingStrategy(_)
-        | Plan::AlterScalingStrategy(_)
-        | Plan::DropScalingStrategy(_) => Default::default(),
+        | Plan::Raise(plan::RaisePlan { severity: _ }) => Default::default(),
+        Plan::CreateScalingStrategy(plan::CreateScalingStrategyPlan {
+            target,
+            strategy_type: _,
+            config: _,
+            if_not_exists: _,
+        })
+        | Plan::AlterScalingStrategy(plan::AlterScalingStrategyPlan {
+            target,
+            strategy_type: _,
+            config_updates: _,
+        })
+        | Plan::DropScalingStrategy(plan::DropScalingStrategyPlan {
+            target,
+            strategy_type: _,
+            if_exists: _,
+        }) => {
+            let cluster_ids: Vec<_> = match target {
+                plan::ScalingStrategyTarget::Cluster(cluster_id) => vec![*cluster_id],
+                plan::ScalingStrategyTarget::AllClusters => catalog
+                    .get_clusters()
+                    .into_iter()
+                    .filter(|c| !is_system_cluster(c.name()))
+                    .map(|c| c.id())
+                    .collect(),
+                plan::ScalingStrategyTarget::AllClustersLike(pattern) => catalog
+                    .get_clusters()
+                    .into_iter()
+                    .filter(|c| !is_system_cluster(c.name()))
+                    .filter(|c| matches_like_pattern(c.name(), pattern))
+                    .map(|c| c.id())
+                    .collect(),
+            };
+
+            let privileges = cluster_ids
+                .into_iter()
+                .map(|id| (SystemObjectId::Object(id.into()), AclMode::USAGE, role_id))
+                .collect();
+
+            RbacRequirements {
+                privileges,
+                ..Default::default()
+            }
+        }
     }
+}
+
+fn is_system_cluster(name: &str) -> bool {
+    name == "system" || name.starts_with("mz_")
+}
+
+// A minimal LIKE implementation that supports % wildcards.
+fn matches_like_pattern(name: &str, pattern: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('%').collect();
+    if parts.is_empty() {
+        return name.is_empty();
+    }
+
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        match name[pos..].find(part) {
+            Some(found) => {
+                if i == 0 && !pattern.starts_with('%') && found != 0 {
+                    return false;
+                }
+                pos += found + part.len();
+            }
+            None => return false,
+        }
+    }
+
+    if !pattern.ends_with('%') {
+        if let Some(last) = parts.last() {
+            if !last.is_empty() {
+                return name.ends_with(last);
+            }
+        }
+    }
+
+    true
 }
 
 /// Reports whether any role has ownership over an object.
