@@ -231,6 +231,7 @@ mod message_handler;
 mod privatelink_status;
 mod sql;
 mod validity;
+mod widgets;
 
 #[derive(Debug)]
 pub enum Message {
@@ -339,6 +340,8 @@ pub enum Message {
     /// A cluster will be On if and only if there is at least one On decision for it.
     /// Scheduling decisions for clusters that have `SCHEDULE = MANUAL` are ignored.
     SchedulingDecisions(Vec<(&'static str, Vec<(ClusterId, SchedulingDecision)>)>),
+    /// Message from a widget.
+    Widget(crate::widget::WidgetMessage),
 }
 
 impl Message {
@@ -422,6 +425,7 @@ impl Message {
             Message::CheckSchedulingPolicies => "check_scheduling_policies",
             Message::SchedulingDecisions { .. } => "scheduling_decision",
             Message::DeferredStatementReady => "deferred_statement_ready",
+            Message::Widget(_) => "widget",
         }
     }
 }
@@ -3374,6 +3378,7 @@ impl Coordinator {
             self.schedule_storage_usage_collection().await;
             self.spawn_privatelink_vpc_endpoints_watch_task();
             self.spawn_statement_logging_task();
+            self.spawn_widget_runtime();
             flags::tracing_config(self.catalog.system_config()).apply(&self.tracing_handle);
 
             // Report if the handling of a single message takes longer than this threshold.

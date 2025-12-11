@@ -203,6 +203,79 @@ impl Coordinator {
             Message::DeferredStatementReady => {
                 self.handle_deferred_statement().boxed_local().await;
             }
+            Message::Widget(widget_msg) => {
+                self.handle_widget_message(widget_msg);
+            }
+        }
+    }
+
+    /// Handle a message from a widget.
+    fn handle_widget_message(&self, msg: crate::widget::WidgetMessage) {
+        use crate::widget::WidgetMessage;
+        match msg {
+            WidgetMessage::Actions {
+                widget_name,
+                actions,
+            } => {
+                tracing::info!(
+                    widget = widget_name,
+                    num_actions = actions.len(),
+                    "coordinator received widget actions"
+                );
+                for (i, action) in actions.into_iter().enumerate() {
+                    self.execute_widget_action(widget_name, i, action);
+                }
+            }
+            WidgetMessage::Error { widget_name, error } => {
+                tracing::warn!(widget = widget_name, error = %error, "widget reported error");
+            }
+        }
+    }
+
+    /// Execute a single widget action.
+    fn execute_widget_action(
+        &self,
+        widget_name: &'static str,
+        action_index: usize,
+        action: crate::widget::WidgetAction,
+    ) {
+        use crate::widget::WidgetAction;
+        match action {
+            WidgetAction::ExecuteDdl { sql, reason } => {
+                tracing::info!(
+                    widget = widget_name,
+                    action_index = action_index,
+                    reason = %reason,
+                    sql = %sql,
+                    "widget DDL action received (not yet implemented)"
+                );
+                // TODO(Phase 2): Implement DDL execution for widgets.
+                // This requires parsing the SQL, planning it, and executing it
+                // with system privileges. For now, we just log the action.
+            }
+            WidgetAction::WriteToBuiltinTable { table_id, rows } => {
+                tracing::info!(
+                    widget = widget_name,
+                    action_index = action_index,
+                    table_id = %table_id,
+                    num_rows = rows.len(),
+                    "widget table write action received (not yet implemented)"
+                );
+                // TODO(Phase 2): Implement builtin table writes for widgets.
+                // This will use the same code path as statement logging.
+            }
+            WidgetAction::DeleteFromBuiltinTable {
+                table_id,
+                filter: _,
+            } => {
+                tracing::info!(
+                    widget = widget_name,
+                    action_index = action_index,
+                    table_id = %table_id,
+                    "widget table delete action received (not yet implemented)"
+                );
+                // TODO(Phase 2): Implement builtin table deletes for widgets.
+            }
         }
     }
 
