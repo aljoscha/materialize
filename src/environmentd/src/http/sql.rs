@@ -1476,6 +1476,9 @@ async fn execute_stmt<S: ResultSender>(
         | ExecuteResponse::CreatedContinualTask { .. }
         | ExecuteResponse::CreatedType
         | ExecuteResponse::CreatedNetworkPolicy
+        | ExecuteResponse::CreatedScalingStrategy
+        | ExecuteResponse::AlteredScalingStrategy
+        | ExecuteResponse::DroppedScalingStrategy
         | ExecuteResponse::Comment
         | ExecuteResponse::Deleted(_)
         | ExecuteResponse::DiscardedTemp

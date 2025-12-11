@@ -441,6 +441,12 @@ pub enum ExecuteResponse {
     CreatedType,
     /// The requested network policy was created.
     CreatedNetworkPolicy,
+    /// The requested scaling strategy was created.
+    CreatedScalingStrategy,
+    /// The requested scaling strategy was altered.
+    AlteredScalingStrategy,
+    /// The requested scaling strategy was dropped.
+    DroppedScalingStrategy,
     /// The requested prepared statement was removed.
     Deallocate { all: bool },
     /// The requested cursor was declared.
@@ -607,6 +613,15 @@ impl TryInto<ExecuteResponse> for ExecuteResponseKind {
                 Ok(ExecuteResponse::CreatedMaterializedView)
             }
             ExecuteResponseKind::CreatedNetworkPolicy => Ok(ExecuteResponse::CreatedNetworkPolicy),
+            ExecuteResponseKind::CreatedScalingStrategy => {
+                Ok(ExecuteResponse::CreatedScalingStrategy)
+            }
+            ExecuteResponseKind::AlteredScalingStrategy => {
+                Ok(ExecuteResponse::AlteredScalingStrategy)
+            }
+            ExecuteResponseKind::DroppedScalingStrategy => {
+                Ok(ExecuteResponse::DroppedScalingStrategy)
+            }
             ExecuteResponseKind::CreatedContinualTask => Ok(ExecuteResponse::CreatedContinualTask),
             ExecuteResponseKind::CreatedType => Ok(ExecuteResponse::CreatedType),
             ExecuteResponseKind::Deallocate => Err(()),
@@ -672,6 +687,9 @@ impl ExecuteResponse {
             CreatedContinualTask { .. } => Some("CREATE CONTINUAL TASK".into()),
             CreatedType => Some("CREATE TYPE".into()),
             CreatedNetworkPolicy => Some("CREATE NETWORKPOLICY".into()),
+            CreatedScalingStrategy => Some("CREATE SCALING STRATEGY".into()),
+            AlteredScalingStrategy => Some("ALTER SCALING STRATEGY".into()),
+            DroppedScalingStrategy => Some("DROP SCALING STRATEGY".into()),
             Deallocate { all } => Some(format!("DEALLOCATE{}", if *all { " ALL" } else { "" })),
             DeclaredCursor => Some("DECLARE CURSOR".into()),
             Deleted(n) => Some(format!("DELETE {}", n)),
@@ -765,6 +783,9 @@ impl ExecuteResponse {
             CreateType => &[CreatedType],
             PlanKind::Deallocate => &[ExecuteResponseKind::Deallocate],
             CreateNetworkPolicy => &[CreatedNetworkPolicy],
+            CreateScalingStrategy => &[CreatedScalingStrategy],
+            AlterScalingStrategy => &[AlteredScalingStrategy],
+            DropScalingStrategy => &[DroppedScalingStrategy],
             Declare => &[DeclaredCursor],
             DiscardTemp => &[DiscardedTemp],
             DiscardAll => &[DiscardedAll],

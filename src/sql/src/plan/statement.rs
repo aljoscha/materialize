@@ -257,6 +257,19 @@ pub fn describe(
             scl::describe_inspect_shard(&scx, stmt)?
         }
         Statement::ValidateConnection(stmt) => validate::describe_validate_connection(&scx, stmt)?,
+
+        // Scaling strategy statements
+        Statement::CreateScalingStrategy(stmt) => {
+            ddl::describe_create_scaling_strategy(&scx, stmt)?
+        }
+        Statement::AlterScalingStrategy(stmt) => ddl::describe_alter_scaling_strategy(&scx, stmt)?,
+        Statement::DropScalingStrategy(stmt) => ddl::describe_drop_scaling_strategy(&scx, stmt)?,
+        Statement::Show(ShowStatement::ShowScalingStrategies(stmt)) => {
+            show::show_scaling_strategies(&scx, stmt.cluster)?.describe()?
+        }
+        Statement::Show(ShowStatement::ShowScalingActions(stmt)) => {
+            show::show_scaling_actions(&scx, stmt.cluster, stmt.limit)?.describe()?
+        }
     };
 
     let desc = desc.with_params(scx.finalize_param_types()?);
@@ -444,6 +457,17 @@ pub fn plan(
         Statement::Raise(stmt) => raise::plan_raise(scx, stmt),
         Statement::Show(ShowStatement::InspectShard(stmt)) => scl::plan_inspect_shard(scx, stmt),
         Statement::ValidateConnection(stmt) => validate::plan_validate_connection(scx, stmt),
+
+        // Scaling strategy statements
+        Statement::CreateScalingStrategy(stmt) => ddl::plan_create_scaling_strategy(scx, stmt),
+        Statement::AlterScalingStrategy(stmt) => ddl::plan_alter_scaling_strategy(scx, stmt),
+        Statement::DropScalingStrategy(stmt) => ddl::plan_drop_scaling_strategy(scx, stmt),
+        Statement::Show(ShowStatement::ShowScalingStrategies(stmt)) => {
+            show::show_scaling_strategies(scx, stmt.cluster)?.plan()
+        }
+        Statement::Show(ShowStatement::ShowScalingActions(stmt)) => {
+            show::show_scaling_actions(scx, stmt.cluster, stmt.limit)?.plan()
+        }
     };
 
     if let Ok(plan) = &plan {
@@ -1150,6 +1174,13 @@ impl<T: mz_sql_parser::ast::AstInfo> From<&Statement<T>> for StatementClassifica
             Statement::Raise(_) => Other,
             Statement::Show(ShowStatement::InspectShard(_)) => Other,
             Statement::ValidateConnection(_) => Other,
+
+            // Scaling strategy statements (classify as DDL since they modify configuration)
+            Statement::CreateScalingStrategy(_) => DDL,
+            Statement::AlterScalingStrategy(_) => DDL,
+            Statement::DropScalingStrategy(_) => DDL,
+            Statement::Show(ShowStatement::ShowScalingStrategies(_)) => Show,
+            Statement::Show(ShowStatement::ShowScalingActions(_)) => Show,
         }
     }
 }

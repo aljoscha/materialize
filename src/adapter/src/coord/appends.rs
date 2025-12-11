@@ -152,6 +152,7 @@ pub(crate) enum PendingWriteTxn {
 }
 
 impl PendingWriteTxn {
+    /// Returns true if this is an internal operation that should bypass the `now()` wait.
     fn is_internal_system(&self) -> bool {
         match self {
             PendingWriteTxn::System {
@@ -1021,7 +1022,10 @@ pub(crate) fn waiting_on_startup_appends(
         | Plan::AlterDefaultPrivileges(_)
         | Plan::ReassignOwned(_)
         | Plan::ValidateConnection(_)
-        | Plan::SideEffectingFunc(_) => BTreeSet::default(),
+        | Plan::SideEffectingFunc(_)
+        | Plan::CreateScalingStrategy(_)
+        | Plan::AlterScalingStrategy(_)
+        | Plan::DropScalingStrategy(_) => BTreeSet::default(),
     };
     let depends_on_required_id = REQUIRED_BUILTIN_TABLES
         .iter()

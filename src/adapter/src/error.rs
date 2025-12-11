@@ -179,6 +179,8 @@ pub enum AdapterError {
         cluster_name: String,
         replica_name: String,
     },
+    /// The specified scaling strategy does not exist.
+    UnknownScalingStrategy { details: String },
     /// The named setting does not exist.
     UnrecognizedConfigurationParam(String),
     /// A generic error occurred.
@@ -575,6 +577,7 @@ impl AdapterError {
             AdapterError::UnknownPreparedStatement(_) => SqlState::UNDEFINED_PSTATEMENT,
             AdapterError::UnknownLoginRole(_) => SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
             AdapterError::UnknownClusterReplica { .. } => SqlState::UNDEFINED_OBJECT,
+            AdapterError::UnknownScalingStrategy { .. } => SqlState::UNDEFINED_OBJECT,
             AdapterError::UnrecognizedConfigurationParam(_) => SqlState::UNDEFINED_OBJECT,
             AdapterError::Unsupported(..) => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::UnavailableFeature { .. } => SqlState::FEATURE_NOT_SUPPORTED,
@@ -866,6 +869,9 @@ impl fmt::Display for AdapterError {
                 f,
                 "cluster replica '{cluster_name}.{replica_name}' does not exist"
             ),
+            AdapterError::UnknownScalingStrategy { details } => {
+                write!(f, "scaling strategy does not exist: {details}")
+            }
             AdapterError::UnrecognizedConfigurationParam(setting_name) => write!(
                 f,
                 "unrecognized configuration parameter {}",

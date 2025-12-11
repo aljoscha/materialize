@@ -953,6 +953,67 @@ fn show_continual_tasks<'a>(
     )
 }
 
+pub fn show_scaling_strategies<'a>(
+    scx: &'a StatementContext<'a>,
+    cluster: Option<ResolvedClusterName>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let mut query = "SELECT
+        s.id,
+        COALESCE(c.name, s.cluster_pattern, 'ALL CLUSTERS') AS target,
+        s.strategy_type,
+        s.config,
+        s.enabled,
+        s.created_at,
+        s.updated_at
+    FROM mz_internal.mz_scaling_strategies s
+    LEFT JOIN mz_catalog.mz_clusters c ON s.cluster_id = c.id"
+        .to_string();
+
+    if let Some(cluster) = cluster {
+        write!(query, " WHERE s.cluster_id = '{}'", cluster.id)
+            .expect("write on string cannot fail");
+    }
+
+    query.push_str(" ORDER BY s.created_at DESC");
+
+    // Use new_from_bare_query since we have a complete query with ORDER BY
+    ShowSelect::new_from_bare_query(scx, query).map(|(show_select, _)| show_select)
+}
+
+pub fn show_scaling_actions<'a>(
+    scx: &'a StatementContext<'a>,
+    cluster: Option<ResolvedClusterName>,
+    limit: Option<u64>,
+) -> Result<ShowSelect<'a>, PlanError> {
+    let mut query = "SELECT
+        a.action_id,
+        c.name AS cluster,
+        a.strategy_id,
+        a.action_type,
+        a.action_sql,
+        a.reason,
+        a.executed,
+        a.error_message,
+        a.created_at
+    FROM mz_internal.mz_scaling_actions a
+    LEFT JOIN mz_catalog.mz_clusters c ON a.cluster_id = c.id"
+        .to_string();
+
+    if let Some(cluster) = cluster {
+        write!(query, " WHERE a.cluster_id = '{}'", cluster.id)
+            .expect("write on string cannot fail");
+    }
+
+    query.push_str(" ORDER BY a.created_at DESC");
+
+    if let Some(limit) = limit {
+        write!(query, " LIMIT {}", limit).expect("write on string cannot fail");
+    }
+
+    // Use new_from_bare_query since we have a complete query with ORDER BY and LIMIT
+    ShowSelect::new_from_bare_query(scx, query).map(|(show_select, _)| show_select)
+}
+
 /// An intermediate result when planning a `SHOW` query.
 ///
 /// Can be interrogated for its columns, or converted into a proper [`Plan`].

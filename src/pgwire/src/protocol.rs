@@ -2104,6 +2104,9 @@ where
             | ExecuteResponse::CreatedView { .. }
             | ExecuteResponse::CreatedViews { .. }
             | ExecuteResponse::CreatedNetworkPolicy
+            | ExecuteResponse::CreatedScalingStrategy
+            | ExecuteResponse::AlteredScalingStrategy
+            | ExecuteResponse::DroppedScalingStrategy
             | ExecuteResponse::Comment
             | ExecuteResponse::Deallocate { .. }
             | ExecuteResponse::Deleted(..)

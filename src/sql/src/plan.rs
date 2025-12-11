@@ -212,6 +212,10 @@ pub enum Plan {
     SideEffectingFunc(SideEffectingFunc),
     ValidateConnection(ValidateConnectionPlan),
     AlterRetainHistory(AlterRetainHistoryPlan),
+    // Scaling strategy plans
+    CreateScalingStrategy(CreateScalingStrategyPlan),
+    AlterScalingStrategy(AlterScalingStrategyPlan),
+    DropScalingStrategy(DropScalingStrategyPlan),
 }
 
 impl Plan {
@@ -327,6 +331,10 @@ impl Plan {
             StatementKind::Update => &[PlanKind::ReadThenWrite],
             StatementKind::ValidateConnection => &[PlanKind::ValidateConnection],
             StatementKind::AlterRetainHistory => &[PlanKind::AlterRetainHistory],
+            // Scaling strategy statements
+            StatementKind::CreateScalingStrategy => &[PlanKind::CreateScalingStrategy],
+            StatementKind::AlterScalingStrategy => &[PlanKind::AlterScalingStrategy],
+            StatementKind::DropScalingStrategy => &[PlanKind::DropScalingStrategy],
         }
     }
 
@@ -474,6 +482,9 @@ impl Plan {
             Plan::SideEffectingFunc(_) => "side effecting func",
             Plan::ValidateConnection(_) => "validate connection",
             Plan::AlterRetainHistory(_) => "alter retain history",
+            Plan::CreateScalingStrategy(_) => "create scaling strategy",
+            Plan::AlterScalingStrategy(_) => "alter scaling strategy",
+            Plan::DropScalingStrategy(_) => "drop scaling strategy",
         }
     }
 
@@ -1186,6 +1197,85 @@ pub struct AlterRetainHistoryPlan {
     pub value: Option<Value>,
     pub window: CompactionWindow,
     pub object_type: ObjectType,
+}
+
+// ============================================================================
+// Scaling Strategy Plans
+// ============================================================================
+
+/// Target for scaling strategy operations.
+#[derive(Debug, Clone)]
+pub enum ScalingStrategyTarget {
+    /// A specific cluster.
+    Cluster(ClusterId),
+    /// All clusters.
+    AllClusters,
+    /// All clusters matching a pattern.
+    AllClustersLike(String),
+}
+
+/// The type of scaling strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalingStrategyType {
+    TargetSize,
+    ShrinkToFit,
+    Burst,
+    IdleSuspend,
+}
+
+impl std::fmt::Display for ScalingStrategyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScalingStrategyType::TargetSize => write!(f, "target_size"),
+            ScalingStrategyType::ShrinkToFit => write!(f, "shrink_to_fit"),
+            ScalingStrategyType::Burst => write!(f, "burst"),
+            ScalingStrategyType::IdleSuspend => write!(f, "idle_suspend"),
+        }
+    }
+}
+
+/// Configuration for a scaling strategy, stored as JSON.
+#[derive(Debug, Clone)]
+pub struct ScalingStrategyConfig {
+    /// The JSON config for the strategy.
+    pub config: serde_json::Value,
+    /// Whether the strategy is enabled.
+    pub enabled: bool,
+}
+
+/// Plan for `CREATE SCALING STRATEGY`.
+#[derive(Debug)]
+pub struct CreateScalingStrategyPlan {
+    /// The target (cluster or all clusters).
+    pub target: ScalingStrategyTarget,
+    /// The type of strategy.
+    pub strategy_type: ScalingStrategyType,
+    /// The configuration for the strategy.
+    pub config: ScalingStrategyConfig,
+    /// If true, don't error if a strategy already exists.
+    pub if_not_exists: bool,
+}
+
+/// Plan for `ALTER SCALING STRATEGY`.
+#[derive(Debug)]
+pub struct AlterScalingStrategyPlan {
+    /// The target (cluster or all clusters).
+    pub target: ScalingStrategyTarget,
+    /// The type of strategy to alter.
+    pub strategy_type: ScalingStrategyType,
+    /// Options to update (merged with existing config).
+    pub config_updates: serde_json::Value,
+}
+
+/// Plan for `DROP SCALING STRATEGY`.
+#[derive(Debug)]
+pub struct DropScalingStrategyPlan {
+    /// The target (cluster or all clusters).
+    pub target: ScalingStrategyTarget,
+    /// The type of strategy to drop. If None, drop all strategies for the target.
+    pub strategy_type: Option<ScalingStrategyType>,
+    /// If true, don't error if the strategy doesn't exist.
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone)]

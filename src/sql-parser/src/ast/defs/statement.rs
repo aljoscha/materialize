@@ -115,6 +115,9 @@ pub enum Statement<T: AstInfo> {
     ReassignOwned(ReassignOwnedStatement<T>),
     ValidateConnection(ValidateConnectionStatement<T>),
     Comment(CommentStatement<T>),
+    CreateScalingStrategy(CreateScalingStrategyStatement<T>),
+    AlterScalingStrategy(AlterScalingStrategyStatement<T>),
+    DropScalingStrategy(DropScalingStrategyStatement<T>),
 }
 
 impl<T: AstInfo> AstDisplay for Statement<T> {
@@ -194,6 +197,9 @@ impl<T: AstInfo> AstDisplay for Statement<T> {
             Statement::ReassignOwned(stmt) => f.write_node(stmt),
             Statement::ValidateConnection(stmt) => f.write_node(stmt),
             Statement::Comment(stmt) => f.write_node(stmt),
+            Statement::CreateScalingStrategy(stmt) => f.write_node(stmt),
+            Statement::AlterScalingStrategy(stmt) => f.write_node(stmt),
+            Statement::DropScalingStrategy(stmt) => f.write_node(stmt),
         }
     }
 }
@@ -278,6 +284,9 @@ pub fn statement_kind_label_value(kind: StatementKind) -> &'static str {
         StatementKind::ReassignOwned => "reassign_owned",
         StatementKind::ValidateConnection => "validate_connection",
         StatementKind::Comment => "comment",
+        StatementKind::CreateScalingStrategy => "create_scaling_strategy",
+        StatementKind::AlterScalingStrategy => "alter_scaling_strategy",
+        StatementKind::DropScalingStrategy => "drop_scaling_strategy",
     }
 }
 
@@ -5178,6 +5187,8 @@ pub enum ShowStatement<T: AstInfo> {
     ShowCreateType(ShowCreateTypeStatement<T>),
     ShowVariable(ShowVariableStatement),
     InspectShard(InspectShardStatement),
+    ShowScalingStrategies(ShowScalingStrategiesStatement<T>),
+    ShowScalingActions(ShowScalingActionsStatement<T>),
 }
 
 impl<T: AstInfo> AstDisplay for ShowStatement<T> {
@@ -5196,6 +5207,8 @@ impl<T: AstInfo> AstDisplay for ShowStatement<T> {
             ShowStatement::ShowCreateType(stmt) => f.write_node(stmt),
             ShowStatement::ShowVariable(stmt) => f.write_node(stmt),
             ShowStatement::InspectShard(stmt) => f.write_node(stmt),
+            ShowStatement::ShowScalingStrategies(stmt) => f.write_node(stmt),
+            ShowStatement::ShowScalingActions(stmt) => f.write_node(stmt),
         }
     }
 }
@@ -5718,6 +5731,261 @@ impl<T: AstInfo> AstDisplay for CommentObjectType<T> {
 }
 
 impl_display_t!(CommentObjectType);
+
+// ============================================================================
+// Scaling Strategy Statements
+// ============================================================================
+
+/// Target for scaling strategy commands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ScalingStrategyTarget<T: AstInfo> {
+    /// A specific cluster.
+    Cluster(T::ClusterName),
+    /// All clusters.
+    AllClusters,
+    /// All clusters matching a pattern.
+    AllClustersLike(String),
+}
+
+impl<T: AstInfo> AstDisplay for ScalingStrategyTarget<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            ScalingStrategyTarget::Cluster(name) => {
+                f.write_str("CLUSTER ");
+                f.write_node(name);
+            }
+            ScalingStrategyTarget::AllClusters => {
+                f.write_str("ALL CLUSTERS");
+            }
+            ScalingStrategyTarget::AllClustersLike(pattern) => {
+                f.write_str("ALL CLUSTERS LIKE ");
+                f.write_node(&display::escape_single_quote_string(pattern));
+            }
+        }
+    }
+}
+impl_display_t!(ScalingStrategyTarget);
+
+/// Scaling strategy types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalingStrategyType {
+    TargetSize,
+    ShrinkToFit,
+    Burst,
+    IdleSuspend,
+}
+
+impl AstDisplay for ScalingStrategyType {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            ScalingStrategyType::TargetSize => f.write_str("TARGET_SIZE"),
+            ScalingStrategyType::ShrinkToFit => f.write_str("SHRINK_TO_FIT"),
+            ScalingStrategyType::Burst => f.write_str("BURST"),
+            ScalingStrategyType::IdleSuspend => f.write_str("IDLE_SUSPEND"),
+        }
+    }
+}
+impl_display!(ScalingStrategyType);
+
+/// Option names for scaling strategies.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ScalingStrategyOptionName {
+    // Common options
+    Cooldown,
+    Enabled,
+    ReplicaScope,
+    // Target Size options
+    Size,
+    ReplicaName,
+    // Burst options
+    BurstSize,
+    // Idle Suspend options
+    IdleAfter,
+    // Shrink to Fit options
+    MaxSize,
+    MinOomCount,
+    MinCrashCount,
+    CrashWindow,
+}
+
+impl WithOptionName for ScalingStrategyOptionName {
+    fn redact_value(&self) -> bool {
+        // None of these options contain sensitive data
+        false
+    }
+}
+
+impl AstDisplay for ScalingStrategyOptionName {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            ScalingStrategyOptionName::Cooldown => f.write_str("COOLDOWN"),
+            ScalingStrategyOptionName::Enabled => f.write_str("ENABLED"),
+            ScalingStrategyOptionName::ReplicaScope => f.write_str("REPLICA SCOPE"),
+            ScalingStrategyOptionName::Size => f.write_str("SIZE"),
+            ScalingStrategyOptionName::ReplicaName => f.write_str("REPLICA NAME"),
+            ScalingStrategyOptionName::BurstSize => f.write_str("BURST SIZE"),
+            ScalingStrategyOptionName::IdleAfter => f.write_str("IDLE AFTER"),
+            ScalingStrategyOptionName::MaxSize => f.write_str("MAX SIZE"),
+            ScalingStrategyOptionName::MinOomCount => f.write_str("MIN OOM COUNT"),
+            ScalingStrategyOptionName::MinCrashCount => f.write_str("MIN CRASH COUNT"),
+            ScalingStrategyOptionName::CrashWindow => f.write_str("CRASH WINDOW"),
+        }
+    }
+}
+
+/// An option for a scaling strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScalingStrategyOption<T: AstInfo> {
+    pub name: ScalingStrategyOptionName,
+    pub value: Option<WithOptionValue<T>>,
+}
+
+impl_display_for_with_option!(ScalingStrategyOption);
+
+/// `CREATE SCALING STRATEGY` statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateScalingStrategyStatement<T: AstInfo> {
+    pub if_not_exists: bool,
+    pub target: ScalingStrategyTarget<T>,
+    pub strategy_type: ScalingStrategyType,
+    pub with_options: Vec<ScalingStrategyOption<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for CreateScalingStrategyStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("CREATE SCALING STRATEGY ");
+        if self.if_not_exists {
+            f.write_str("IF NOT EXISTS ");
+        }
+        f.write_str("FOR ");
+        f.write_node(&self.target);
+        f.write_str(" TYPE ");
+        f.write_node(&self.strategy_type);
+        if !self.with_options.is_empty() {
+            f.write_str(" WITH (");
+            f.write_node(&display::comma_separated(&self.with_options));
+            f.write_str(")");
+        }
+    }
+}
+impl_display_t!(CreateScalingStrategyStatement);
+
+/// Action for `ALTER SCALING STRATEGY`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AlterScalingStrategyAction<T: AstInfo> {
+    /// `UPDATE (option = value, ...)` - partial update, merges with existing config.
+    UpdateOptions(Vec<ScalingStrategyOption<T>>),
+}
+
+impl<T: AstInfo> AstDisplay for AlterScalingStrategyAction<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        match self {
+            AlterScalingStrategyAction::UpdateOptions(options) => {
+                f.write_str("UPDATE (");
+                f.write_node(&display::comma_separated(options));
+                f.write_str(")");
+            }
+        }
+    }
+}
+impl_display_t!(AlterScalingStrategyAction);
+
+/// `ALTER SCALING STRATEGY` statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AlterScalingStrategyStatement<T: AstInfo> {
+    pub target: ScalingStrategyTarget<T>,
+    pub strategy_type: ScalingStrategyType,
+    pub action: AlterScalingStrategyAction<T>,
+}
+
+impl<T: AstInfo> AstDisplay for AlterScalingStrategyStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("ALTER SCALING STRATEGY FOR ");
+        f.write_node(&self.target);
+        f.write_str(" TYPE ");
+        f.write_node(&self.strategy_type);
+        f.write_str(" ");
+        f.write_node(&self.action);
+    }
+}
+impl_display_t!(AlterScalingStrategyStatement);
+
+/// `DROP SCALING STRATEGY` statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DropScalingStrategyStatement<T: AstInfo> {
+    pub if_exists: bool,
+    pub target: ScalingStrategyTarget<T>,
+    /// If None, drop all strategies for the target.
+    pub strategy_type: Option<ScalingStrategyType>,
+}
+
+impl<T: AstInfo> AstDisplay for DropScalingStrategyStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("DROP ");
+        if self.strategy_type.is_none() {
+            f.write_str("ALL ");
+        }
+        f.write_str("SCALING STRATEG");
+        if self.strategy_type.is_none() {
+            f.write_str("IES");
+        } else {
+            f.write_str("Y");
+        }
+        f.write_str(" ");
+        if self.if_exists {
+            f.write_str("IF EXISTS ");
+        }
+        f.write_str("FOR ");
+        f.write_node(&self.target);
+        if let Some(strategy_type) = &self.strategy_type {
+            f.write_str(" TYPE ");
+            f.write_node(strategy_type);
+        }
+    }
+}
+impl_display_t!(DropScalingStrategyStatement);
+
+/// `SHOW SCALING STRATEGIES` statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShowScalingStrategiesStatement<T: AstInfo> {
+    /// If Some, show strategies only for this cluster.
+    pub cluster: Option<T::ClusterName>,
+}
+
+impl<T: AstInfo> AstDisplay for ShowScalingStrategiesStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("SHOW SCALING STRATEGIES");
+        if let Some(cluster) = &self.cluster {
+            f.write_str(" FOR CLUSTER ");
+            f.write_node(cluster);
+        }
+    }
+}
+impl_display_t!(ShowScalingStrategiesStatement);
+
+/// `SHOW SCALING ACTIONS` statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShowScalingActionsStatement<T: AstInfo> {
+    /// If Some, show actions only for this cluster.
+    pub cluster: Option<T::ClusterName>,
+    /// Optional limit on number of actions to show.
+    pub limit: Option<u64>,
+}
+
+impl<T: AstInfo> AstDisplay for ShowScalingActionsStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        f.write_str("SHOW SCALING ACTIONS");
+        if let Some(cluster) = &self.cluster {
+            f.write_str(" FOR CLUSTER ");
+            f.write_node(cluster);
+        }
+        if let Some(limit) = self.limit {
+            f.write_str(" LIMIT ");
+            f.write_str(&limit.to_string());
+        }
+    }
+}
+impl_display_t!(ShowScalingActionsStatement);
 
 // Include the `AstDisplay` implementations for simple options derived by the
 // crate's build.rs script.

@@ -1285,6 +1285,13 @@ fn generate_rbac_requirements(
             kind,
             returning,
         }) => {
+            // Writable builtin tables (like mz_scaling_strategies) don't require
+            // explicit privileges - they're managed through dedicated SQL commands
+            // that perform their own authorization checks.
+            if catalog.get_item(id).is_writable_builtin_table() {
+                return RbacRequirements::default();
+            }
+
             let acl_mode = match kind {
                 MutationKind::Insert => AclMode::INSERT,
                 MutationKind::Update => AclMode::UPDATE,
@@ -1541,7 +1548,11 @@ fn generate_rbac_requirements(
         })
         | Plan::Execute(plan::ExecutePlan { name: _, params: _ })
         | Plan::Deallocate(plan::DeallocatePlan { name: _ })
-        | Plan::Raise(plan::RaisePlan { severity: _ }) => Default::default(),
+        | Plan::Raise(plan::RaisePlan { severity: _ })
+        // Scaling strategy plans - permissions are handled via cluster USAGE
+        | Plan::CreateScalingStrategy(_)
+        | Plan::AlterScalingStrategy(_)
+        | Plan::DropScalingStrategy(_) => Default::default(),
     }
 }
 

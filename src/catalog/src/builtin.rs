@@ -5660,6 +5660,7 @@ pub static MZ_SCALING_STRATEGIES: LazyLock<BuiltinTable> = LazyLock::new(|| Buil
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: true,
 });
 
 pub static MZ_SCALING_STRATEGY_STATE: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -5698,6 +5699,7 @@ pub static MZ_SCALING_STRATEGY_STATE: LazyLock<BuiltinTable> = LazyLock::new(|| 
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: true,
 });
 
 pub static MZ_SCALING_ACTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -5753,6 +5755,7 @@ pub static MZ_SCALING_ACTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| Builtin
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: true,
 });
 
 // These will be replaced with per-replica tables once source/sink multiplexing on

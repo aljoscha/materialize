@@ -47,19 +47,20 @@ use mz_sql_parser::ast::{
     AlterConnectionOptionName, AlterConnectionStatement, AlterIndexAction, AlterIndexStatement,
     AlterMaterializedViewApplyReplacementStatement, AlterNetworkPolicyStatement,
     AlterObjectRenameStatement, AlterObjectSwapStatement, AlterRetainHistoryStatement,
-    AlterRoleOption, AlterRoleStatement, AlterSecretStatement, AlterSetClusterStatement,
-    AlterSinkAction, AlterSinkStatement, AlterSourceAction, AlterSourceAddSubsourceOption,
-    AlterSourceAddSubsourceOptionName, AlterSourceStatement, AlterSystemResetAllStatement,
-    AlterSystemResetStatement, AlterSystemSetStatement, AlterTableAddColumnStatement, AvroSchema,
-    AvroSchemaOption, AvroSchemaOptionName, ClusterAlterOption, ClusterAlterOptionName,
-    ClusterAlterOptionValue, ClusterAlterUntilReadyOption, ClusterAlterUntilReadyOptionName,
-    ClusterFeature, ClusterFeatureName, ClusterOption, ClusterOptionName,
-    ClusterScheduleOptionValue, ColumnDef, ColumnOption, CommentObjectType, CommentStatement,
-    ConnectionOption, ConnectionOptionName, ContinualTaskOption, ContinualTaskOptionName,
-    CreateClusterReplicaStatement, CreateClusterStatement, CreateConnectionOption,
-    CreateConnectionOptionName, CreateConnectionStatement, CreateConnectionType,
-    CreateContinualTaskStatement, CreateDatabaseStatement, CreateIndexStatement,
-    CreateMaterializedViewStatement, CreateNetworkPolicyStatement, CreateRoleStatement,
+    AlterRoleOption, AlterRoleStatement, AlterScalingStrategyStatement, AlterSecretStatement,
+    AlterSetClusterStatement, AlterSinkAction, AlterSinkStatement, AlterSourceAction,
+    AlterSourceAddSubsourceOption, AlterSourceAddSubsourceOptionName, AlterSourceStatement,
+    AlterSystemResetAllStatement, AlterSystemResetStatement, AlterSystemSetStatement,
+    AlterTableAddColumnStatement, AvroSchema, AvroSchemaOption, AvroSchemaOptionName,
+    ClusterAlterOption, ClusterAlterOptionName, ClusterAlterOptionValue,
+    ClusterAlterUntilReadyOption, ClusterAlterUntilReadyOptionName, ClusterFeature,
+    ClusterFeatureName, ClusterOption, ClusterOptionName, ClusterScheduleOptionValue, ColumnDef,
+    ColumnOption, CommentObjectType, CommentStatement, ConnectionOption, ConnectionOptionName,
+    ContinualTaskOption, ContinualTaskOptionName, CreateClusterReplicaStatement,
+    CreateClusterStatement, CreateConnectionOption, CreateConnectionOptionName,
+    CreateConnectionStatement, CreateConnectionType, CreateContinualTaskStatement,
+    CreateDatabaseStatement, CreateIndexStatement, CreateMaterializedViewStatement,
+    CreateNetworkPolicyStatement, CreateRoleStatement, CreateScalingStrategyStatement,
     CreateSchemaStatement, CreateSecretStatement, CreateSinkConnection, CreateSinkOption,
     CreateSinkOptionName, CreateSinkStatement, CreateSourceConnection, CreateSourceOption,
     CreateSourceOptionName, CreateSourceStatement, CreateSubsourceOption,
@@ -68,19 +69,20 @@ use mz_sql_parser::ast::{
     CreateTypeMapOption, CreateTypeMapOptionName, CreateTypeStatement, CreateViewStatement,
     CreateWebhookSourceStatement, CsrConfigOption, CsrConfigOptionName, CsrConnection,
     CsrConnectionAvro, CsrConnectionProtobuf, CsrSeedProtobuf, CsvColumns, DeferredItemName,
-    DocOnIdentifier, DocOnSchema, DropObjectsStatement, DropOwnedStatement, Expr, Format,
-    FormatSpecifier, IcebergSinkConfigOption, Ident, IfExistsBehavior, IndexOption,
-    IndexOptionName, KafkaSinkConfigOption, KeyConstraint, LoadGeneratorOption,
-    LoadGeneratorOptionName, MaterializedViewOption, MaterializedViewOptionName, MySqlConfigOption,
-    MySqlConfigOptionName, NetworkPolicyOption, NetworkPolicyOptionName,
-    NetworkPolicyRuleDefinition, NetworkPolicyRuleOption, NetworkPolicyRuleOptionName,
-    PgConfigOption, PgConfigOptionName, ProtobufSchema, QualifiedReplica, RefreshAtOptionValue,
-    RefreshEveryOptionValue, RefreshOptionValue, ReplicaDefinition, ReplicaOption,
-    ReplicaOptionName, RoleAttribute, SetRoleVar, SourceErrorPolicy, SourceIncludeMetadata,
-    SqlServerConfigOption, SqlServerConfigOptionName, Statement, TableConstraint,
-    TableFromSourceColumns, TableFromSourceOption, TableFromSourceOptionName, TableOption,
-    TableOptionName, UnresolvedDatabaseName, UnresolvedItemName, UnresolvedObjectName,
-    UnresolvedSchemaName, Value, ViewDefinition, WithOptionValue,
+    DocOnIdentifier, DocOnSchema, DropObjectsStatement, DropOwnedStatement,
+    DropScalingStrategyStatement, Expr, Format, FormatSpecifier, IcebergSinkConfigOption, Ident,
+    IfExistsBehavior, IndexOption, IndexOptionName, KafkaSinkConfigOption, KeyConstraint,
+    LoadGeneratorOption, LoadGeneratorOptionName, MaterializedViewOption,
+    MaterializedViewOptionName, MySqlConfigOption, MySqlConfigOptionName, NetworkPolicyOption,
+    NetworkPolicyOptionName, NetworkPolicyRuleDefinition, NetworkPolicyRuleOption,
+    NetworkPolicyRuleOptionName, PgConfigOption, PgConfigOptionName, ProtobufSchema,
+    QualifiedReplica, RefreshAtOptionValue, RefreshEveryOptionValue, RefreshOptionValue,
+    ReplicaDefinition, ReplicaOption, ReplicaOptionName, RoleAttribute, ScalingStrategyOption,
+    SetRoleVar, SourceErrorPolicy, SourceIncludeMetadata, SqlServerConfigOption,
+    SqlServerConfigOptionName, Statement, TableConstraint, TableFromSourceColumns,
+    TableFromSourceOption, TableFromSourceOptionName, TableOption, TableOptionName,
+    UnresolvedDatabaseName, UnresolvedItemName, UnresolvedObjectName, UnresolvedSchemaName, Value,
+    ViewDefinition, WithOptionValue,
 };
 use mz_sql_parser::ident;
 use mz_sql_parser::parser::StatementParseResult;
@@ -149,20 +151,21 @@ use crate::plan::{
     AlterClusterPlan, AlterClusterPlanStrategy, AlterClusterRenamePlan,
     AlterClusterReplicaRenamePlan, AlterClusterSwapPlan, AlterConnectionPlan, AlterItemRenamePlan,
     AlterMaterializedViewApplyReplacementPlan, AlterNetworkPolicyPlan, AlterNoopPlan,
-    AlterOptionParameter, AlterRetainHistoryPlan, AlterRolePlan, AlterSchemaRenamePlan,
-    AlterSchemaSwapPlan, AlterSecretPlan, AlterSetClusterPlan, AlterSinkPlan,
-    AlterSystemResetAllPlan, AlterSystemResetPlan, AlterSystemSetPlan, AlterTablePlan,
-    ClusterSchedule, CommentPlan, ComputeReplicaConfig, ComputeReplicaIntrospectionConfig,
-    ConnectionDetails, CreateClusterManagedPlan, CreateClusterPlan, CreateClusterReplicaPlan,
-    CreateClusterUnmanagedPlan, CreateClusterVariant, CreateConnectionPlan,
-    CreateContinualTaskPlan, CreateDatabasePlan, CreateIndexPlan, CreateMaterializedViewPlan,
-    CreateNetworkPolicyPlan, CreateRolePlan, CreateSchemaPlan, CreateSecretPlan, CreateSinkPlan,
-    CreateSourcePlan, CreateTablePlan, CreateTypePlan, CreateViewPlan, DataSourceDesc,
-    DropObjectsPlan, DropOwnedPlan, HirRelationExpr, Index, MaterializedView, NetworkPolicyRule,
+    AlterOptionParameter, AlterRetainHistoryPlan, AlterRolePlan, AlterScalingStrategyPlan,
+    AlterSchemaRenamePlan, AlterSchemaSwapPlan, AlterSecretPlan, AlterSetClusterPlan,
+    AlterSinkPlan, AlterSystemResetAllPlan, AlterSystemResetPlan, AlterSystemSetPlan,
+    AlterTablePlan, ClusterSchedule, CommentPlan, ComputeReplicaConfig,
+    ComputeReplicaIntrospectionConfig, ConnectionDetails, CreateClusterManagedPlan,
+    CreateClusterPlan, CreateClusterReplicaPlan, CreateClusterUnmanagedPlan, CreateClusterVariant,
+    CreateConnectionPlan, CreateContinualTaskPlan, CreateDatabasePlan, CreateIndexPlan,
+    CreateMaterializedViewPlan, CreateNetworkPolicyPlan, CreateRolePlan, CreateScalingStrategyPlan,
+    CreateSchemaPlan, CreateSecretPlan, CreateSinkPlan, CreateSourcePlan, CreateTablePlan,
+    CreateTypePlan, CreateViewPlan, DataSourceDesc, DropObjectsPlan, DropOwnedPlan,
+    DropScalingStrategyPlan, HirRelationExpr, Index, MaterializedView, NetworkPolicyRule,
     NetworkPolicyRuleAction, NetworkPolicyRuleDirection, Plan, PlanClusterOption, PlanNotice,
-    PolicyAddress, QueryContext, ReplicaConfig, Secret, Sink, Source, Table, TableDataSource, Type,
-    VariableValue, View, WebhookBodyFormat, WebhookHeaderFilters, WebhookHeaders,
-    WebhookValidation, literal, plan_utils, query, transform_ast,
+    PolicyAddress, QueryContext, ReplicaConfig, ScalingStrategyConfig, Secret, Sink, Source, Table,
+    TableDataSource, Type, VariableValue, View, WebhookBodyFormat, WebhookHeaderFilters,
+    WebhookHeaders, WebhookValidation, literal, plan_utils, query, transform_ast,
 };
 use crate::session::vars::{
     self, ENABLE_CLUSTER_SCHEDULE_REFRESH, ENABLE_COLLECTION_PARTITION_BY,
@@ -7679,5 +7682,436 @@ fn ensure_cluster_is_not_managed(
         })
     } else {
         Ok(())
+    }
+}
+
+// ============================================================================
+// Scaling Strategy Planning
+// ============================================================================
+
+pub fn describe_create_scaling_strategy(
+    _: &StatementContext,
+    _: CreateScalingStrategyStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
+    Ok(StatementDesc::new(None))
+}
+
+pub fn plan_create_scaling_strategy(
+    scx: &StatementContext,
+    CreateScalingStrategyStatement {
+        if_not_exists,
+        target,
+        strategy_type,
+        with_options,
+    }: CreateScalingStrategyStatement<Aug>,
+) -> Result<Plan, PlanError> {
+    use mz_sql_parser::ast::ScalingStrategyType as AstStrategyType;
+
+    // Resolve the target
+    let plan_target = resolve_scaling_strategy_target(scx, &target)?;
+
+    // Convert AST strategy type to plan strategy type
+    let plan_strategy_type = match strategy_type {
+        AstStrategyType::TargetSize => crate::plan::ScalingStrategyType::TargetSize,
+        AstStrategyType::ShrinkToFit => crate::plan::ScalingStrategyType::ShrinkToFit,
+        AstStrategyType::Burst => crate::plan::ScalingStrategyType::Burst,
+        AstStrategyType::IdleSuspend => crate::plan::ScalingStrategyType::IdleSuspend,
+    };
+
+    // Build the configuration from options
+    let (config_json, enabled) = build_scaling_strategy_config(plan_strategy_type, &with_options)?;
+
+    Ok(Plan::CreateScalingStrategy(CreateScalingStrategyPlan {
+        target: plan_target,
+        strategy_type: plan_strategy_type,
+        config: ScalingStrategyConfig {
+            config: config_json,
+            enabled,
+        },
+        if_not_exists,
+    }))
+}
+
+pub fn describe_alter_scaling_strategy(
+    _: &StatementContext,
+    _: AlterScalingStrategyStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
+    Ok(StatementDesc::new(None))
+}
+
+pub fn plan_alter_scaling_strategy(
+    scx: &StatementContext,
+    AlterScalingStrategyStatement {
+        target,
+        strategy_type,
+        action,
+    }: AlterScalingStrategyStatement<Aug>,
+) -> Result<Plan, PlanError> {
+    use mz_sql_parser::ast::AlterScalingStrategyAction;
+    use mz_sql_parser::ast::ScalingStrategyType as AstStrategyType;
+
+    // Resolve the target
+    let plan_target = resolve_scaling_strategy_target(scx, &target)?;
+
+    // Convert AST strategy type to plan strategy type
+    let plan_strategy_type = match strategy_type {
+        AstStrategyType::TargetSize => crate::plan::ScalingStrategyType::TargetSize,
+        AstStrategyType::ShrinkToFit => crate::plan::ScalingStrategyType::ShrinkToFit,
+        AstStrategyType::Burst => crate::plan::ScalingStrategyType::Burst,
+        AstStrategyType::IdleSuspend => crate::plan::ScalingStrategyType::IdleSuspend,
+    };
+
+    // Process the action
+    let config_updates = match action {
+        AlterScalingStrategyAction::UpdateOptions(options) => {
+            build_scaling_strategy_config_updates(&options)?
+        }
+    };
+
+    Ok(Plan::AlterScalingStrategy(AlterScalingStrategyPlan {
+        target: plan_target,
+        strategy_type: plan_strategy_type,
+        config_updates,
+    }))
+}
+
+pub fn describe_drop_scaling_strategy(
+    _: &StatementContext,
+    _: DropScalingStrategyStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
+    Ok(StatementDesc::new(None))
+}
+
+pub fn plan_drop_scaling_strategy(
+    scx: &StatementContext,
+    DropScalingStrategyStatement {
+        if_exists,
+        target,
+        strategy_type,
+    }: DropScalingStrategyStatement<Aug>,
+) -> Result<Plan, PlanError> {
+    use mz_sql_parser::ast::ScalingStrategyType as AstStrategyType;
+
+    // Resolve the target
+    let plan_target = resolve_scaling_strategy_target(scx, &target)?;
+
+    // Convert AST strategy type to plan strategy type (if provided)
+    let plan_strategy_type = strategy_type.map(|st| match st {
+        AstStrategyType::TargetSize => crate::plan::ScalingStrategyType::TargetSize,
+        AstStrategyType::ShrinkToFit => crate::plan::ScalingStrategyType::ShrinkToFit,
+        AstStrategyType::Burst => crate::plan::ScalingStrategyType::Burst,
+        AstStrategyType::IdleSuspend => crate::plan::ScalingStrategyType::IdleSuspend,
+    });
+
+    Ok(Plan::DropScalingStrategy(DropScalingStrategyPlan {
+        target: plan_target,
+        strategy_type: plan_strategy_type,
+        if_exists,
+    }))
+}
+
+/// Resolve a scaling strategy target from the AST to a plan target.
+fn resolve_scaling_strategy_target(
+    _scx: &StatementContext,
+    target: &mz_sql_parser::ast::ScalingStrategyTarget<Aug>,
+) -> Result<crate::plan::ScalingStrategyTarget, PlanError> {
+    use mz_sql_parser::ast::ScalingStrategyTarget as AstTarget;
+
+    match target {
+        AstTarget::Cluster(cluster_name) => {
+            Ok(crate::plan::ScalingStrategyTarget::Cluster(cluster_name.id))
+        }
+        AstTarget::AllClusters => Ok(crate::plan::ScalingStrategyTarget::AllClusters),
+        AstTarget::AllClustersLike(pattern) => Ok(
+            crate::plan::ScalingStrategyTarget::AllClustersLike(pattern.clone()),
+        ),
+    }
+}
+
+/// Build a scaling strategy configuration from the provided options.
+/// Returns (config_json, enabled).
+fn build_scaling_strategy_config(
+    strategy_type: crate::plan::ScalingStrategyType,
+    options: &[ScalingStrategyOption<Aug>],
+) -> Result<(serde_json::Value, bool), PlanError> {
+    use mz_sql_parser::ast::ScalingStrategyOptionName;
+
+    let mut config = serde_json::Map::new();
+    config.insert("config_version".to_string(), serde_json::json!(1));
+
+    let mut enabled = true;
+
+    for opt in options {
+        match &opt.name {
+            ScalingStrategyOptionName::Size => {
+                let size = extract_string_option(&opt.value, "SIZE")?;
+                config.insert("size".to_string(), serde_json::json!(size));
+            }
+            ScalingStrategyOptionName::BurstSize => {
+                let size = extract_string_option(&opt.value, "BURST SIZE")?;
+                config.insert("burst_size".to_string(), serde_json::json!(size));
+            }
+            ScalingStrategyOptionName::MaxSize => {
+                let size = extract_string_option(&opt.value, "MAX SIZE")?;
+                config.insert("max_size".to_string(), serde_json::json!(size));
+            }
+            ScalingStrategyOptionName::ReplicaName => {
+                let name = extract_string_option(&opt.value, "REPLICA NAME")?;
+                config.insert("replica_name".to_string(), serde_json::json!(name));
+            }
+            ScalingStrategyOptionName::ReplicaScope => {
+                let scope = extract_string_option(&opt.value, "REPLICA SCOPE")?;
+                // Validate the scope value
+                match scope.to_uppercase().as_str() {
+                    "ALL" | "MANAGED_ONLY" => {}
+                    _ => {
+                        return Err(PlanError::Unstructured(format!(
+                            "REPLICA SCOPE must be 'ALL' or 'MANAGED_ONLY', got '{}'",
+                            scope
+                        )));
+                    }
+                }
+                config.insert("replica_scope".to_string(), serde_json::json!(scope));
+            }
+            ScalingStrategyOptionName::IdleAfter => {
+                let interval = extract_interval_option(&opt.value, "IDLE AFTER")?;
+                config.insert("idle_after_s".to_string(), serde_json::json!(interval));
+            }
+            ScalingStrategyOptionName::Cooldown => {
+                let interval = extract_interval_option(&opt.value, "COOLDOWN")?;
+                config.insert("cooldown_s".to_string(), serde_json::json!(interval));
+            }
+            ScalingStrategyOptionName::CrashWindow => {
+                let interval = extract_interval_option(&opt.value, "CRASH WINDOW")?;
+                config.insert("crash_window_s".to_string(), serde_json::json!(interval));
+            }
+            ScalingStrategyOptionName::MinOomCount => {
+                let count = extract_int_option(&opt.value, "MIN OOM COUNT")?;
+                config.insert("min_oom_count".to_string(), serde_json::json!(count));
+            }
+            ScalingStrategyOptionName::MinCrashCount => {
+                let count = extract_int_option(&opt.value, "MIN CRASH COUNT")?;
+                config.insert("min_crash_count".to_string(), serde_json::json!(count));
+            }
+            ScalingStrategyOptionName::Enabled => {
+                enabled = extract_bool_option(&opt.value, "ENABLED")?;
+            }
+        }
+    }
+
+    // Validate required options for each strategy type
+    validate_strategy_config(strategy_type, &config)?;
+
+    Ok((serde_json::Value::Object(config), enabled))
+}
+
+/// Build config updates from options (for ALTER SCALING STRATEGY).
+fn build_scaling_strategy_config_updates(
+    options: &[ScalingStrategyOption<Aug>],
+) -> Result<serde_json::Value, PlanError> {
+    use mz_sql_parser::ast::ScalingStrategyOptionName;
+
+    let mut config = serde_json::Map::new();
+
+    for opt in options {
+        match &opt.name {
+            ScalingStrategyOptionName::Size => {
+                let size = extract_string_option(&opt.value, "SIZE")?;
+                config.insert("size".to_string(), serde_json::json!(size));
+            }
+            ScalingStrategyOptionName::BurstSize => {
+                let size = extract_string_option(&opt.value, "BURST SIZE")?;
+                config.insert("burst_size".to_string(), serde_json::json!(size));
+            }
+            ScalingStrategyOptionName::MaxSize => {
+                let size = extract_string_option(&opt.value, "MAX SIZE")?;
+                config.insert("max_size".to_string(), serde_json::json!(size));
+            }
+            ScalingStrategyOptionName::ReplicaName => {
+                let name = extract_string_option(&opt.value, "REPLICA NAME")?;
+                config.insert("replica_name".to_string(), serde_json::json!(name));
+            }
+            ScalingStrategyOptionName::ReplicaScope => {
+                let scope = extract_string_option(&opt.value, "REPLICA SCOPE")?;
+                match scope.to_uppercase().as_str() {
+                    "ALL" | "MANAGED_ONLY" => {}
+                    _ => {
+                        return Err(PlanError::Unstructured(format!(
+                            "REPLICA SCOPE must be 'ALL' or 'MANAGED_ONLY', got '{}'",
+                            scope
+                        )));
+                    }
+                }
+                config.insert("replica_scope".to_string(), serde_json::json!(scope));
+            }
+            ScalingStrategyOptionName::IdleAfter => {
+                let interval = extract_interval_option(&opt.value, "IDLE AFTER")?;
+                config.insert("idle_after_s".to_string(), serde_json::json!(interval));
+            }
+            ScalingStrategyOptionName::Cooldown => {
+                let interval = extract_interval_option(&opt.value, "COOLDOWN")?;
+                config.insert("cooldown_s".to_string(), serde_json::json!(interval));
+            }
+            ScalingStrategyOptionName::CrashWindow => {
+                let interval = extract_interval_option(&opt.value, "CRASH WINDOW")?;
+                config.insert("crash_window_s".to_string(), serde_json::json!(interval));
+            }
+            ScalingStrategyOptionName::MinOomCount => {
+                let count = extract_int_option(&opt.value, "MIN OOM COUNT")?;
+                config.insert("min_oom_count".to_string(), serde_json::json!(count));
+            }
+            ScalingStrategyOptionName::MinCrashCount => {
+                let count = extract_int_option(&opt.value, "MIN CRASH COUNT")?;
+                config.insert("min_crash_count".to_string(), serde_json::json!(count));
+            }
+            ScalingStrategyOptionName::Enabled => {
+                let enabled = extract_bool_option(&opt.value, "ENABLED")?;
+                config.insert("enabled".to_string(), serde_json::json!(enabled));
+            }
+        }
+    }
+
+    Ok(serde_json::Value::Object(config))
+}
+
+/// Validate that required options are present for a strategy type.
+fn validate_strategy_config(
+    strategy_type: crate::plan::ScalingStrategyType,
+    config: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), PlanError> {
+    use crate::plan::ScalingStrategyType;
+
+    match strategy_type {
+        ScalingStrategyType::TargetSize => {
+            if !config.contains_key("size") {
+                return Err(PlanError::Unstructured(
+                    "TARGET_SIZE strategy requires SIZE option".to_string(),
+                ));
+            }
+        }
+        ScalingStrategyType::Burst => {
+            if !config.contains_key("burst_size") {
+                return Err(PlanError::Unstructured(
+                    "BURST strategy requires BURST SIZE option".to_string(),
+                ));
+            }
+        }
+        ScalingStrategyType::IdleSuspend => {
+            if !config.contains_key("idle_after_s") {
+                return Err(PlanError::Unstructured(
+                    "IDLE_SUSPEND strategy requires IDLE AFTER option".to_string(),
+                ));
+            }
+        }
+        ScalingStrategyType::ShrinkToFit => {
+            if !config.contains_key("max_size") {
+                return Err(PlanError::Unstructured(
+                    "SHRINK_TO_FIT strategy requires MAX SIZE option".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract a string value from an option.
+fn extract_string_option(
+    value: &Option<WithOptionValue<Aug>>,
+    option_name: &str,
+) -> Result<String, PlanError> {
+    match value {
+        Some(WithOptionValue::Value(Value::String(s))) => Ok(s.clone()),
+        Some(WithOptionValue::Ident(ident)) => Ok(ident.to_string()),
+        Some(other) => Err(PlanError::Unstructured(format!(
+            "{} must be a string, got {:?}",
+            option_name, other
+        ))),
+        None => Err(PlanError::Unstructured(format!(
+            "{} requires a value",
+            option_name
+        ))),
+    }
+}
+
+/// Extract an interval value from an option and return as seconds.
+fn extract_interval_option(
+    value: &Option<WithOptionValue<Aug>>,
+    option_name: &str,
+) -> Result<i64, PlanError> {
+    match value {
+        Some(WithOptionValue::Value(Value::String(s))) => parse_interval_to_seconds(s),
+        Some(WithOptionValue::Value(Value::Interval(iv))) => {
+            // Convert the interval value to seconds using the AST Display
+            use mz_sql_parser::ast::display::{AstDisplay, FormatMode};
+            let s = iv.to_ast_string(FormatMode::Simple);
+            parse_interval_to_seconds(&s)
+        }
+        Some(other) => Err(PlanError::Unstructured(format!(
+            "{} must be an interval, got {:?}",
+            option_name, other
+        ))),
+        None => Err(PlanError::Unstructured(format!(
+            "{} requires a value",
+            option_name
+        ))),
+    }
+}
+
+/// Parse an interval string like '30m', '1h', '5m30s' into seconds.
+fn parse_interval_to_seconds(s: &str) -> Result<i64, PlanError> {
+    // Try to parse with the mz_repr interval parser
+    let interval = mz_repr::strconv::parse_interval(s)
+        .map_err(|e| PlanError::Unstructured(format!("invalid interval '{}': {}", s, e)))?;
+
+    // Convert to seconds: months are not supported, only days and duration
+    // Formula: total_seconds = days * 86400 + duration_micros / 1_000_000
+    let total_seconds = i64::from(interval.days) * 86400 + interval.micros / 1_000_000;
+    Ok(total_seconds)
+}
+
+/// Extract an integer value from an option.
+fn extract_int_option(
+    value: &Option<WithOptionValue<Aug>>,
+    option_name: &str,
+) -> Result<i64, PlanError> {
+    match value {
+        Some(WithOptionValue::Value(Value::Number(n))) => n.parse::<i64>().map_err(|e| {
+            PlanError::Unstructured(format!("{} must be an integer: {}", option_name, e))
+        }),
+        Some(other) => Err(PlanError::Unstructured(format!(
+            "{} must be an integer, got {:?}",
+            option_name, other
+        ))),
+        None => Err(PlanError::Unstructured(format!(
+            "{} requires a value",
+            option_name
+        ))),
+    }
+}
+
+/// Extract a boolean value from an option.
+fn extract_bool_option(
+    value: &Option<WithOptionValue<Aug>>,
+    option_name: &str,
+) -> Result<bool, PlanError> {
+    match value {
+        Some(WithOptionValue::Value(Value::Boolean(b))) => Ok(*b),
+        Some(WithOptionValue::Value(Value::String(s))) => match s.to_lowercase().as_str() {
+            "true" | "t" | "yes" | "on" | "1" => Ok(true),
+            "false" | "f" | "no" | "off" | "0" => Ok(false),
+            _ => Err(PlanError::Unstructured(format!(
+                "{} must be a boolean, got '{}'",
+                option_name, s
+            ))),
+        },
+        Some(other) => Err(PlanError::Unstructured(format!(
+            "{} must be a boolean, got {:?}",
+            option_name, other
+        ))),
+        None => Err(PlanError::Unstructured(format!(
+            "{} requires a value",
+            option_name
+        ))),
     }
 }

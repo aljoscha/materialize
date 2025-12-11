@@ -702,6 +702,19 @@ impl Coordinator {
                         ctx.retire(res);
                     });
                 }
+                // Scaling strategy plans
+                Plan::CreateScalingStrategy(plan) => {
+                    let result = self
+                        .sequence_create_scaling_strategy(ctx.session(), plan)
+                        .await;
+                    ctx.retire(result);
+                }
+                Plan::AlterScalingStrategy(plan) => {
+                    self.sequence_alter_scaling_strategy(ctx, plan).await;
+                }
+                Plan::DropScalingStrategy(plan) => {
+                    self.sequence_drop_scaling_strategy(ctx, plan).await;
+                }
             }
         }
         .instrument(tracing::debug_span!("coord::sequencer::sequence_plan"))

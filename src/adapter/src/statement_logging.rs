@@ -223,6 +223,9 @@ impl From<&ExecuteResponse> for StatementEndedExecutionReason {
             | ExecuteResponse::CreatedContinualTask
             | ExecuteResponse::CreatedType
             | ExecuteResponse::CreatedNetworkPolicy
+            | ExecuteResponse::CreatedScalingStrategy
+            | ExecuteResponse::AlteredScalingStrategy
+            | ExecuteResponse::DroppedScalingStrategy
             | ExecuteResponse::Deallocate { .. }
             | ExecuteResponse::DeclaredCursor
             | ExecuteResponse::Deleted(_)

@@ -2672,8 +2672,9 @@ impl Coordinator {
                         // Cannot select from sinks or indexes.
                         Sink | Index => unreachable!(),
                         Table => {
-                            if !id.is_user() {
+                            if !id.is_user() && !entry.is_writable_builtin_table() {
                                 // We can't read from non-user tables
+                                // (except writable builtin tables like mz_scaling_strategies)
                                 false
                             } else {
                                 // We can't read from tables that are source-exports
@@ -4783,5 +4784,371 @@ impl Coordinator {
 
             None
         }
+    }
+
+    #[instrument]
+    pub(super) async fn sequence_create_scaling_strategy(
+        &mut self,
+        _session: &Session,
+        plan: plan::CreateScalingStrategyPlan,
+    ) -> Result<ExecuteResponse, AdapterError> {
+        use mz_catalog::builtin::MZ_SCALING_STRATEGIES;
+        use mz_sql::plan::{ScalingStrategyTarget, ScalingStrategyType};
+
+        // Generate a unique ID for the strategy
+        let strategy_id = uuid::Uuid::new_v4().to_string();
+
+        // Convert target to cluster_id string and pattern
+        let (cluster_id_str, cluster_pattern) = match &plan.target {
+            ScalingStrategyTarget::Cluster(id) => (Some(id.to_string()), None),
+            ScalingStrategyTarget::AllClusters => (None, None),
+            ScalingStrategyTarget::AllClustersLike(pattern) => (None, Some(pattern.clone())),
+        };
+
+        // Convert strategy type to string
+        let strategy_type_str = match plan.strategy_type {
+            ScalingStrategyType::TargetSize => "target_size",
+            ScalingStrategyType::ShrinkToFit => "shrink_to_fit",
+            ScalingStrategyType::Burst => "burst",
+            ScalingStrategyType::IdleSuspend => "idle_suspend",
+        };
+
+        let now = self.now();
+        let now_ts = mz_ore::now::to_datetime(now);
+
+        // Build the row for mz_scaling_strategies
+        let mut row = Row::default();
+        let mut packer = row.packer();
+        packer.push(Datum::String(&strategy_id));
+        packer.push(match &cluster_id_str {
+            Some(id) => Datum::String(id),
+            None => Datum::Null,
+        });
+        packer.push(match &cluster_pattern {
+            Some(p) => Datum::String(p),
+            None => Datum::Null,
+        });
+        packer.push(Datum::String(strategy_type_str));
+        // Config as JSONB
+        let config_json = plan.config.config.clone();
+        let jsonb = Jsonb::from_serde_json(config_json)
+            .map_err(|e| AdapterError::Internal(format!("invalid JSON config: {}", e)))?;
+        packer.push(jsonb.as_ref().into_datum());
+        packer.push(Datum::from(plan.config.enabled));
+        packer.push(Datum::TimestampTz(now_ts.try_into().map_err(|_| {
+            AdapterError::Internal("invalid timestamp".to_string())
+        })?));
+        packer.push(Datum::TimestampTz(now_ts.try_into().map_err(|_| {
+            AdapterError::Internal("invalid timestamp".to_string())
+        })?));
+
+        // Get the builtin table ID
+        let table_id = self.catalog().resolve_builtin_table(&MZ_SCALING_STRATEGIES);
+
+        // Create the update
+        let update = crate::catalog::BuiltinTableUpdate::row(table_id, row, Diff::ONE);
+
+        // Execute the update and wait for completion
+        let (notify, _) = self.builtin_table_update().execute(vec![update]).await;
+        notify.await;
+
+        Ok(ExecuteResponse::CreatedScalingStrategy)
+    }
+
+    /// Alter scaling strategy by executing an UPDATE statement internally.
+    ///
+    /// This builds the appropriate UPDATE SQL based on the plan and executes it
+    /// through the normal SQL path, letting the SQL engine handle the
+    /// ReadThenWrite semantics.
+    #[instrument]
+    pub(super) async fn sequence_alter_scaling_strategy(
+        &mut self,
+        ctx: ExecuteContext,
+        plan: plan::AlterScalingStrategyPlan,
+    ) {
+        use mz_sql::plan::{ScalingStrategyTarget, ScalingStrategyType};
+        use mz_sql_parser::ast::Raw;
+
+        // Build description of the strategy for error messages
+        let strategy_description = {
+            let target_desc = match &plan.target {
+                ScalingStrategyTarget::Cluster(cluster_id) => format!("cluster {}", cluster_id),
+                ScalingStrategyTarget::AllClusters => "all clusters".to_string(),
+                ScalingStrategyTarget::AllClustersLike(pattern) => {
+                    format!("clusters matching '{}'", pattern)
+                }
+            };
+            let type_desc = match plan.strategy_type {
+                ScalingStrategyType::TargetSize => "TARGET_SIZE",
+                ScalingStrategyType::ShrinkToFit => "SHRINK_TO_FIT",
+                ScalingStrategyType::Burst => "BURST",
+                ScalingStrategyType::IdleSuspend => "IDLE_SUSPEND",
+            };
+            format!("{} for {}", type_desc, target_desc)
+        };
+
+        // Build the UPDATE SQL based on the plan
+        let update_sql = {
+            let mut conditions = Vec::new();
+
+            // Add target condition
+            match &plan.target {
+                ScalingStrategyTarget::Cluster(cluster_id) => {
+                    conditions.push(format!("cluster_id = '{}'", cluster_id));
+                }
+                ScalingStrategyTarget::AllClusters => {
+                    conditions.push("cluster_id IS NULL AND cluster_pattern IS NULL".to_string());
+                }
+                ScalingStrategyTarget::AllClustersLike(pattern) => {
+                    // Escape single quotes in pattern
+                    let escaped_pattern = pattern.replace('\'', "''");
+                    conditions.push(format!("cluster_pattern = '{}'", escaped_pattern));
+                }
+            }
+
+            // Add strategy type condition
+            let strategy_type_str = match plan.strategy_type {
+                ScalingStrategyType::TargetSize => "target_size",
+                ScalingStrategyType::ShrinkToFit => "shrink_to_fit",
+                ScalingStrategyType::Burst => "burst",
+                ScalingStrategyType::IdleSuspend => "idle_suspend",
+            };
+            conditions.push(format!("strategy_type = '{}'", strategy_type_str));
+
+            // Serialize config_updates to JSON string, escaping single quotes
+            let config_json = plan.config_updates.to_string().replace('\'', "''");
+
+            format!(
+                "UPDATE mz_internal.mz_scaling_strategies \
+                 SET config = config || '{}'::jsonb, \
+                     updated_at = now() \
+                 WHERE {}",
+                config_json,
+                conditions.join(" AND ")
+            )
+        };
+
+        // Parse the UPDATE statement
+        let stmts = match mz_sql_parser::parser::parse_statements(&update_sql) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                ctx.retire(Err(AdapterError::ParseError(e)));
+                return;
+            }
+        };
+
+        if stmts.len() != 1 {
+            ctx.retire(Err(AdapterError::Internal(format!(
+                "expected 1 statement, got {}",
+                stmts.len()
+            ))));
+            return;
+        }
+
+        let stmt: Arc<Statement<Raw>> = Arc::new(stmts.into_element().ast);
+
+        // Set up channels to receive the UPDATE result
+        let (sub_tx, sub_rx) = oneshot::channel();
+        let sub_ct = ClientTransmitter::new(sub_tx, self.internal_cmd_tx.clone());
+
+        // Split context to get parts we need
+        let (tx, internal_cmd_tx, session, extra) = ctx.into_parts();
+
+        // Create sub-context for the UPDATE execution
+        // Pass the original extra so it gets properly retired
+        let sub_ctx = ExecuteContext::from_parts(
+            sub_ct,
+            internal_cmd_tx.clone(),
+            session,
+            extra,
+        );
+
+        // Execute the UPDATE statement through the normal SQL path
+        self.handle_execute_inner(stmt, Params::empty(), sub_ctx)
+            .await;
+
+        // Handle the response in a spawned task to not block the coordinator
+        task::spawn(|| "sequence_alter_scaling_strategy", async move {
+            match sub_rx.await {
+                Ok(Response {
+                    result,
+                    session,
+                    otel_ctx,
+                }) => {
+                    otel_ctx.attach_as_parent();
+                    let result = match result {
+                        Ok(ExecuteResponse::Updated(n)) => {
+                            if n == 0 {
+                                // No rows updated - strategy doesn't exist
+                                Err(AdapterError::UnknownScalingStrategy {
+                                    details: strategy_description,
+                                })
+                            } else {
+                                Ok(ExecuteResponse::AlteredScalingStrategy)
+                            }
+                        }
+                        Ok(other) => Err(AdapterError::Internal(format!(
+                            "unexpected response from UPDATE in ALTER SCALING STRATEGY: {:?}",
+                            other
+                        ))),
+                        Err(e) => Err(e),
+                    };
+                    tx.send(result, session);
+                }
+                Err(_) => {
+                    // Channel closed - coordinator went away
+                    tracing::warn!("coordinator went away during ALTER SCALING STRATEGY");
+                }
+            }
+        });
+    }
+
+    /// Drop scaling strategy by executing a DELETE statement internally.
+    ///
+    /// This builds the appropriate DELETE SQL based on the plan and executes it
+    /// through the normal SQL path, letting the SQL engine handle the
+    /// ReadThenWrite semantics.
+    #[instrument]
+    pub(super) async fn sequence_drop_scaling_strategy(
+        &mut self,
+        ctx: ExecuteContext,
+        plan: plan::DropScalingStrategyPlan,
+    ) {
+        use mz_sql::plan::{ScalingStrategyTarget, ScalingStrategyType};
+        use mz_sql_parser::ast::Raw;
+
+        // Build description of the strategy for error messages
+        let strategy_description = {
+            let target_desc = match &plan.target {
+                ScalingStrategyTarget::Cluster(cluster_id) => format!("cluster {}", cluster_id),
+                ScalingStrategyTarget::AllClusters => "all clusters".to_string(),
+                ScalingStrategyTarget::AllClustersLike(pattern) => {
+                    format!("clusters matching '{}'", pattern)
+                }
+            };
+            match &plan.strategy_type {
+                Some(strategy_type) => {
+                    let type_desc = match strategy_type {
+                        ScalingStrategyType::TargetSize => "TARGET_SIZE",
+                        ScalingStrategyType::ShrinkToFit => "SHRINK_TO_FIT",
+                        ScalingStrategyType::Burst => "BURST",
+                        ScalingStrategyType::IdleSuspend => "IDLE_SUSPEND",
+                    };
+                    format!("{} for {}", type_desc, target_desc)
+                }
+                None => format!("any strategy for {}", target_desc),
+            }
+        };
+
+        // Build the DELETE SQL based on the plan
+        let delete_sql = {
+            let mut conditions = Vec::new();
+
+            // Add target condition
+            match &plan.target {
+                ScalingStrategyTarget::Cluster(cluster_id) => {
+                    conditions.push(format!("cluster_id = '{}'", cluster_id));
+                }
+                ScalingStrategyTarget::AllClusters => {
+                    conditions.push("cluster_id IS NULL AND cluster_pattern IS NULL".to_string());
+                }
+                ScalingStrategyTarget::AllClustersLike(pattern) => {
+                    // Escape single quotes in pattern
+                    let escaped_pattern = pattern.replace('\'', "''");
+                    conditions.push(format!("cluster_pattern = '{}'", escaped_pattern));
+                }
+            }
+
+            // Add strategy type condition if specified
+            if let Some(strategy_type) = &plan.strategy_type {
+                let strategy_type_str = match strategy_type {
+                    ScalingStrategyType::TargetSize => "target_size",
+                    ScalingStrategyType::ShrinkToFit => "shrink_to_fit",
+                    ScalingStrategyType::Burst => "burst",
+                    ScalingStrategyType::IdleSuspend => "idle_suspend",
+                };
+                conditions.push(format!("strategy_type = '{}'", strategy_type_str));
+            }
+
+            format!(
+                "DELETE FROM mz_internal.mz_scaling_strategies WHERE {}",
+                conditions.join(" AND ")
+            )
+        };
+
+        // Parse the DELETE statement
+        let stmts = match mz_sql_parser::parser::parse_statements(&delete_sql) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                ctx.retire(Err(AdapterError::ParseError(e)));
+                return;
+            }
+        };
+
+        if stmts.len() != 1 {
+            ctx.retire(Err(AdapterError::Internal(format!(
+                "expected 1 statement, got {}",
+                stmts.len()
+            ))));
+            return;
+        }
+
+        let stmt: Arc<Statement<Raw>> = Arc::new(stmts.into_element().ast);
+
+        // Set up channels to receive the DELETE result
+        let (sub_tx, sub_rx) = oneshot::channel();
+        let sub_ct = ClientTransmitter::new(sub_tx, self.internal_cmd_tx.clone());
+
+        // Split context to get parts we need
+        let (tx, internal_cmd_tx, session, extra) = ctx.into_parts();
+
+        // Create sub-context for the DELETE execution
+        // Pass the original extra so it gets properly retired
+        let sub_ctx = ExecuteContext::from_parts(
+            sub_ct,
+            internal_cmd_tx.clone(),
+            session,
+            extra,
+        );
+
+        // Execute the DELETE statement through the normal SQL path
+        self.handle_execute_inner(stmt, Params::empty(), sub_ctx)
+            .await;
+
+        // Handle the response in a spawned task to not block the coordinator
+        let if_exists = plan.if_exists;
+        task::spawn(|| "sequence_drop_scaling_strategy", async move {
+            match sub_rx.await {
+                Ok(Response {
+                    result,
+                    session,
+                    otel_ctx,
+                }) => {
+                    otel_ctx.attach_as_parent();
+                    let result = match result {
+                        Ok(ExecuteResponse::Deleted(n)) => {
+                            if n == 0 && !if_exists {
+                                // No rows deleted and IF EXISTS wasn't specified
+                                Err(AdapterError::UnknownScalingStrategy {
+                                    details: strategy_description,
+                                })
+                            } else {
+                                Ok(ExecuteResponse::DroppedScalingStrategy)
+                            }
+                        }
+                        Ok(other) => Err(AdapterError::Internal(format!(
+                            "unexpected response from DELETE in DROP SCALING STRATEGY: {:?}",
+                            other
+                        ))),
+                        Err(e) => Err(e),
+                    };
+                    tx.send(result, session);
+                }
+                Err(_) => {
+                    // Channel closed - coordinator went away
+                    tracing::warn!("coordinator went away during DROP SCALING STRATEGY");
+                }
+            }
+        });
     }
 }

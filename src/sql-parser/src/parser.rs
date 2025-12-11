@@ -1982,6 +1982,9 @@ impl<'a> Parser<'a> {
         } else if self.peek_keywords(&[NETWORK, POLICY]) {
             self.parse_create_network_policy()
                 .map_parser_err(StatementKind::CreateNetworkPolicy)
+        } else if self.peek_keywords(&[SCALING, STRATEGY]) {
+            self.parse_create_scaling_strategy()
+                .map_parser_err(StatementKind::CreateScalingStrategy)
         } else {
             let index = self.index;
 
@@ -4823,6 +4826,14 @@ impl<'a> Parser<'a> {
         if self.parse_keyword(OWNED) {
             self.parse_drop_owned()
                 .map_parser_err(StatementKind::DropOwned)
+        } else if self.parse_keywords(&[ALL, SCALING, STRATEGIES]) {
+            // DROP ALL SCALING STRATEGIES FOR CLUSTER ...
+            self.parse_drop_all_scaling_strategies()
+                .map_parser_err(StatementKind::DropScalingStrategy)
+        } else if self.parse_keywords(&[SCALING, STRATEGY]) {
+            // DROP SCALING STRATEGY [IF EXISTS] FOR CLUSTER ... TYPE ...
+            self.parse_drop_scaling_strategy()
+                .map_parser_err(StatementKind::DropScalingStrategy)
         } else {
             self.parse_drop_objects()
                 .map_parser_err(StatementKind::DropObjects)
@@ -5045,6 +5056,174 @@ impl<'a> Parser<'a> {
         };
         let value = self.parse_optional_option_value()?;
         Ok(NetworkPolicyRuleOption { name, value })
+    }
+
+    // ========================================================================
+    // Scaling Strategy Parsing
+    // ========================================================================
+
+    fn parse_create_scaling_strategy(&mut self) -> Result<Statement<Raw>, ParserError> {
+        self.expect_keywords(&[SCALING, STRATEGY])?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        self.expect_keyword(FOR)?;
+        let target = self.parse_scaling_strategy_target()?;
+        self.expect_keyword(TYPE)?;
+        let strategy_type = self.parse_scaling_strategy_type()?;
+        let with_options = if self.parse_keyword(WITH) {
+            self.expect_token(&Token::LParen)?;
+            let options = self.parse_comma_separated(Parser::parse_scaling_strategy_option)?;
+            self.expect_token(&Token::RParen)?;
+            options
+        } else {
+            vec![]
+        };
+        Ok(Statement::CreateScalingStrategy(
+            CreateScalingStrategyStatement {
+                if_not_exists,
+                target,
+                strategy_type,
+                with_options,
+            },
+        ))
+    }
+
+    fn parse_alter_scaling_strategy(&mut self) -> Result<Statement<Raw>, ParserError> {
+        self.expect_keyword(FOR)?;
+        let target = self.parse_scaling_strategy_target()?;
+        self.expect_keyword(TYPE)?;
+        let strategy_type = self.parse_scaling_strategy_type()?;
+        self.expect_keyword(UPDATE)?;
+        self.expect_token(&Token::LParen)?;
+        let options = self.parse_comma_separated(Parser::parse_scaling_strategy_option)?;
+        self.expect_token(&Token::RParen)?;
+        Ok(Statement::AlterScalingStrategy(
+            AlterScalingStrategyStatement {
+                target,
+                strategy_type,
+                action: AlterScalingStrategyAction::UpdateOptions(options),
+            },
+        ))
+    }
+
+    fn parse_drop_scaling_strategy(&mut self) -> Result<Statement<Raw>, ParserError> {
+        let if_exists = self.parse_if_exists()?;
+        self.expect_keyword(FOR)?;
+        let target = self.parse_scaling_strategy_target()?;
+        self.expect_keyword(TYPE)?;
+        let strategy_type = self.parse_scaling_strategy_type()?;
+        Ok(Statement::DropScalingStrategy(
+            DropScalingStrategyStatement {
+                if_exists,
+                target,
+                strategy_type: Some(strategy_type),
+            },
+        ))
+    }
+
+    fn parse_drop_all_scaling_strategies(&mut self) -> Result<Statement<Raw>, ParserError> {
+        let if_exists = self.parse_if_exists()?;
+        self.expect_keyword(FOR)?;
+        let target = self.parse_scaling_strategy_target()?;
+        Ok(Statement::DropScalingStrategy(
+            DropScalingStrategyStatement {
+                if_exists,
+                target,
+                strategy_type: None,
+            },
+        ))
+    }
+
+    fn parse_scaling_strategy_target(&mut self) -> Result<ScalingStrategyTarget<Raw>, ParserError> {
+        if self.parse_keywords(&[ALL, CLUSTERS]) {
+            if self.parse_keyword(LIKE) {
+                let pattern = self.parse_literal_string()?;
+                Ok(ScalingStrategyTarget::AllClustersLike(pattern))
+            } else {
+                Ok(ScalingStrategyTarget::AllClusters)
+            }
+        } else {
+            self.expect_keyword(CLUSTER)?;
+            let name = self.parse_raw_ident()?;
+            Ok(ScalingStrategyTarget::Cluster(name))
+        }
+    }
+
+    fn parse_scaling_strategy_type(&mut self) -> Result<ScalingStrategyType, ParserError> {
+        let ident = self.parse_identifier()?;
+        let normalized = ident.as_str().to_uppercase();
+        match normalized.as_str() {
+            "TARGET_SIZE" => Ok(ScalingStrategyType::TargetSize),
+            "SHRINK_TO_FIT" => Ok(ScalingStrategyType::ShrinkToFit),
+            "BURST" => Ok(ScalingStrategyType::Burst),
+            "IDLE_SUSPEND" => Ok(ScalingStrategyType::IdleSuspend),
+            _ => parser_err!(
+                self,
+                self.peek_prev_pos(),
+                "expected scaling strategy type (TARGET_SIZE, SHRINK_TO_FIT, BURST, IDLE_SUSPEND), found {}",
+                ident
+            ),
+        }
+    }
+
+    fn parse_scaling_strategy_option(&mut self) -> Result<ScalingStrategyOption<Raw>, ParserError> {
+        let name = if self.parse_keyword(SIZE) {
+            ScalingStrategyOptionName::Size
+        } else if self.parse_keywords(&[BURST, SIZE]) {
+            ScalingStrategyOptionName::BurstSize
+        } else if self.parse_keywords(&[MAX, SIZE]) {
+            ScalingStrategyOptionName::MaxSize
+        } else if self.parse_keywords(&[REPLICA, NAME]) {
+            ScalingStrategyOptionName::ReplicaName
+        } else if self.parse_keywords(&[REPLICA, SCOPE]) {
+            ScalingStrategyOptionName::ReplicaScope
+        } else if self.parse_keywords(&[IDLE, AFTER]) {
+            ScalingStrategyOptionName::IdleAfter
+        } else if self.parse_keyword(COOLDOWN) {
+            ScalingStrategyOptionName::Cooldown
+        } else if self.parse_keywords(&[MIN, OOM, COUNT]) {
+            ScalingStrategyOptionName::MinOomCount
+        } else if self.parse_keywords(&[MIN, CRASH, COUNT]) {
+            ScalingStrategyOptionName::MinCrashCount
+        } else if self.parse_keywords(&[CRASH, WINDOW]) {
+            ScalingStrategyOptionName::CrashWindow
+        } else if self.parse_keyword(ENABLED) {
+            ScalingStrategyOptionName::Enabled
+        } else {
+            return self.expected(
+                self.peek_pos(),
+                "scaling strategy option (SIZE, BURST SIZE, MAX SIZE, REPLICA NAME, REPLICA SCOPE, IDLE AFTER, COOLDOWN, ENABLED, MIN OOM COUNT, MIN CRASH COUNT, CRASH WINDOW)",
+                self.peek_token(),
+            );
+        };
+        let value = self.parse_optional_option_value()?;
+        Ok(ScalingStrategyOption { name, value })
+    }
+
+    fn parse_show_scaling_strategies(&mut self) -> Result<ShowStatement<Raw>, ParserError> {
+        let cluster = if self.parse_keywords(&[FOR, CLUSTER]) {
+            Some(self.parse_raw_ident()?)
+        } else {
+            None
+        };
+        Ok(ShowStatement::ShowScalingStrategies(
+            ShowScalingStrategiesStatement { cluster },
+        ))
+    }
+
+    fn parse_show_scaling_actions(&mut self) -> Result<ShowStatement<Raw>, ParserError> {
+        let cluster = if self.parse_keywords(&[FOR, CLUSTER]) {
+            Some(self.parse_raw_ident()?)
+        } else {
+            None
+        };
+        let limit = if self.parse_keyword(LIMIT) {
+            Some(self.parse_literal_uint()?)
+        } else {
+            None
+        };
+        Ok(ShowStatement::ShowScalingActions(
+            ShowScalingActionsStatement { cluster, limit },
+        ))
     }
 
     fn parse_create_table(&mut self) -> Result<Statement<Raw>, ParserError> {
@@ -5593,6 +5772,9 @@ impl<'a> Parser<'a> {
         } else if self.parse_keywords(&[DEFAULT, PRIVILEGES]) {
             self.parse_alter_default_privileges()
                 .map_parser_err(StatementKind::AlterDefaultPrivileges)
+        } else if self.parse_keywords(&[SCALING, STRATEGY]) {
+            self.parse_alter_scaling_strategy()
+                .map_parser_err(StatementKind::AlterScalingStrategy)
         } else {
             self.parse_alter_object()
         }
@@ -7987,7 +8169,11 @@ impl<'a> Parser<'a> {
                 "SHOW REDACTED is only supported for SHOW REDACTED CREATE ..."
             );
         }
-        if self.parse_one_of_keywords(&[COLUMNS, FIELDS]).is_some() {
+        if self.parse_keywords(&[SCALING, STRATEGIES]) {
+            self.parse_show_scaling_strategies()
+        } else if self.parse_keywords(&[SCALING, ACTIONS]) {
+            self.parse_show_scaling_actions()
+        } else if self.parse_one_of_keywords(&[COLUMNS, FIELDS]).is_some() {
             self.parse_show_columns()
         } else if self.parse_keyword(OBJECTS) {
             let from = if self.parse_keywords(&[FROM]) {

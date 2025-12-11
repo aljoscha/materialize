@@ -2078,6 +2078,12 @@ fn plan_set_expr(
                 }
                 ShowStatement::ShowVariable(_) => bail_unsupported!("SHOW variable in subqueries"),
                 ShowStatement::InspectShard(_) => sql_bail!("unsupported INSPECT statement"),
+                ShowStatement::ShowScalingStrategies(stmt) => {
+                    show::show_scaling_strategies(qcx.scx, stmt.cluster)?.plan_hir(qcx)
+                }
+                ShowStatement::ShowScalingActions(stmt) => {
+                    show::show_scaling_actions(qcx.scx, stmt.cluster, stmt.limit)?.plan_hir(qcx)
+                }
             }
         }
     }
