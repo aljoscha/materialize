@@ -5545,6 +5545,150 @@ pub static MZ_LICENSE_KEYS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTab
     access: vec![PUBLIC_SELECT],
 });
 
+// Auto-scaling strategy tables
+pub static MZ_SCALING_STRATEGIES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
+    name: "mz_scaling_strategies",
+    schema: MZ_INTERNAL_SCHEMA,
+    oid: oid::TABLE_MZ_SCALING_STRATEGIES_OID,
+    desc: RelationDesc::builder()
+        .with_column("id", SqlScalarType::String.nullable(false))
+        .with_column("cluster_id", SqlScalarType::String.nullable(true))
+        .with_column("cluster_pattern", SqlScalarType::String.nullable(true))
+        .with_column("strategy_type", SqlScalarType::String.nullable(false))
+        .with_column("config", SqlScalarType::Jsonb.nullable(false))
+        .with_column("enabled", SqlScalarType::Bool.nullable(false))
+        .with_column(
+            "created_at",
+            SqlScalarType::TimestampTz { precision: None }.nullable(false),
+        )
+        .with_column(
+            "updated_at",
+            SqlScalarType::TimestampTz { precision: None }.nullable(false),
+        )
+        .with_key(vec![0])
+        .finish(),
+    column_comments: BTreeMap::from_iter([
+        ("id", "Unique identifier for this scaling strategy."),
+        (
+            "cluster_id",
+            "The ID of the cluster this strategy applies to, or NULL for all-clusters strategies.",
+        ),
+        (
+            "cluster_pattern",
+            "Pattern for LIKE-based strategies, or NULL for specific cluster strategies.",
+        ),
+        (
+            "strategy_type",
+            "The type of scaling strategy: TARGET_SIZE, SHRINK_TO_FIT, BURST, or IDLE_SUSPEND.",
+        ),
+        (
+            "config",
+            "JSON configuration for the strategy. Schema varies by strategy_type.",
+        ),
+        ("enabled", "Whether this strategy is currently enabled."),
+        ("created_at", "Timestamp when this strategy was created."),
+        (
+            "updated_at",
+            "Timestamp when this strategy was last modified.",
+        ),
+    ]),
+    is_retained_metrics_object: false,
+    access: vec![PUBLIC_SELECT],
+});
+
+pub static MZ_SCALING_STRATEGY_STATE: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
+    name: "mz_scaling_strategy_state",
+    schema: MZ_INTERNAL_SCHEMA,
+    oid: oid::TABLE_MZ_SCALING_STRATEGY_STATE_OID,
+    desc: RelationDesc::builder()
+        .with_column("strategy_id", SqlScalarType::String.nullable(false))
+        .with_column("cluster_id", SqlScalarType::String.nullable(false))
+        .with_column("state_version", SqlScalarType::Int32.nullable(false))
+        .with_column("payload", SqlScalarType::Jsonb.nullable(false))
+        .with_column(
+            "updated_at",
+            SqlScalarType::TimestampTz { precision: None }.nullable(false),
+        )
+        .with_key(vec![0, 1])
+        .finish(),
+    column_comments: BTreeMap::from_iter([
+        (
+            "strategy_id",
+            "The ID of the scaling strategy this state belongs to.",
+        ),
+        (
+            "cluster_id",
+            "The ID of the cluster this state is for (per-cluster state even for ALL CLUSTERS strategies).",
+        ),
+        (
+            "state_version",
+            "Version number for schema evolution of the payload.",
+        ),
+        (
+            "payload",
+            "JSON payload containing strategy-specific state (e.g., cooldown tracking, pending replicas).",
+        ),
+        ("updated_at", "Timestamp when this state was last updated."),
+    ]),
+    is_retained_metrics_object: false,
+    access: vec![PUBLIC_SELECT],
+});
+
+pub static MZ_SCALING_ACTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
+    name: "mz_scaling_actions",
+    schema: MZ_INTERNAL_SCHEMA,
+    oid: oid::TABLE_MZ_SCALING_ACTIONS_OID,
+    desc: RelationDesc::builder()
+        .with_column("action_id", SqlScalarType::Int64.nullable(false))
+        .with_column("strategy_id", SqlScalarType::String.nullable(false))
+        .with_column("cluster_id", SqlScalarType::String.nullable(false))
+        .with_column("action_type", SqlScalarType::String.nullable(false))
+        .with_column("action_sql", SqlScalarType::String.nullable(false))
+        .with_column("reason", SqlScalarType::String.nullable(false))
+        .with_column("executed", SqlScalarType::Bool.nullable(false))
+        .with_column("error_message", SqlScalarType::String.nullable(true))
+        .with_column(
+            "created_at",
+            SqlScalarType::TimestampTz { precision: None }.nullable(false),
+        )
+        .with_key(vec![0])
+        .finish(),
+    column_comments: BTreeMap::from_iter([
+        (
+            "action_id",
+            "Unique, monotonically increasing ID for this action.",
+        ),
+        (
+            "strategy_id",
+            "The ID of the scaling strategy that produced this action.",
+        ),
+        ("cluster_id", "The ID of the cluster this action affects."),
+        (
+            "action_type",
+            "Type of action: create_replica, drop_replica, or resize_replica.",
+        ),
+        (
+            "action_sql",
+            "The SQL statement that was or would be executed.",
+        ),
+        (
+            "reason",
+            "Human-readable explanation for why this action was taken.",
+        ),
+        (
+            "executed",
+            "Whether the action was actually executed (false if auto_scaling_enabled is off).",
+        ),
+        (
+            "error_message",
+            "Error message if the action failed, or NULL on success.",
+        ),
+        ("created_at", "Timestamp when this action was created."),
+    ]),
+    is_retained_metrics_object: false,
+    access: vec![PUBLIC_SELECT],
+});
+
 // These will be replaced with per-replica tables once source/sink multiplexing on
 // a single cluster is supported.
 pub static MZ_SOURCE_STATISTICS_RAW: LazyLock<BuiltinSource> = LazyLock::new(|| BuiltinSource {
@@ -13839,6 +13983,9 @@ pub static BUILTINS_STATIC: LazyLock<Vec<Builtin<NameReference>>> = LazyLock::ne
         Builtin::Table(&MZ_NETWORK_POLICIES),
         Builtin::Table(&MZ_NETWORK_POLICY_RULES),
         Builtin::Table(&MZ_LICENSE_KEYS),
+        Builtin::Table(&MZ_SCALING_STRATEGIES),
+        Builtin::Table(&MZ_SCALING_STRATEGY_STATE),
+        Builtin::Table(&MZ_SCALING_ACTIONS),
         Builtin::View(&MZ_RELATIONS),
         Builtin::View(&MZ_OBJECT_OID_ALIAS),
         Builtin::View(&MZ_OBJECTS),
