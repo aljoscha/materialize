@@ -753,6 +753,10 @@ impl mz_sql::catalog::CatalogItem for CatalogCollectionEntry {
         self.entry.writable_table_details()
     }
 
+    fn is_writable_builtin_table(&self) -> bool {
+        self.entry.is_writable_builtin_table()
+    }
+
     fn replacement_target(&self) -> Option<CatalogItemId> {
         self.entry.replacement_target()
     }
@@ -885,6 +889,9 @@ pub struct Table {
     pub is_retained_metrics_object: bool,
     /// Where data for this table comes from, e.g. `INSERT` statements or an upstream source.
     pub data_source: TableDataSource,
+    /// Whether this is a builtin table that allows writes via SQL (INSERT/UPDATE/DELETE).
+    /// Most builtin tables are read-only, but some (like mz_scaling_strategies) are writable.
+    pub is_writable_builtin: bool,
 }
 
 impl Table {
@@ -3463,6 +3470,14 @@ impl mz_sql::catalog::CatalogItem for CatalogEntry {
             Some(defaults.as_slice())
         } else {
             None
+        }
+    }
+
+    fn is_writable_builtin_table(&self) -> bool {
+        if let CatalogItem::Table(table) = self.item() {
+            table.is_writable_builtin
+        } else {
+            false
         }
     }
 

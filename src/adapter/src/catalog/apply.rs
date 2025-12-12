@@ -783,6 +783,7 @@ impl CatalogState {
                         data_source: TableDataSource::TableWrites {
                             defaults: vec![Expr::null(); table.desc.arity()],
                         },
+                        is_writable_builtin: table.writable,
                     }),
                     MZ_SYSTEM_ROLE_ID,
                     PrivilegeMap::from_mz_acl_items(acl_items),

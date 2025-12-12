@@ -301,7 +301,8 @@ pub fn plan_insert_query(
         transform_ast::transform(scx, default)?;
     }
 
-    if table.id().is_system() {
+    // Block writes to system tables, except for writable builtin tables (like mz_scaling_strategies)
+    if table.id().is_system() && !table.is_writable_builtin_table() {
         sql_bail!(
             "cannot insert into system table '{}'",
             table_name.full_name_str()
@@ -632,7 +633,8 @@ pub fn plan_copy_from(
         )
     })?;
 
-    if table.id().is_system() {
+    // Block writes to system tables, except for writable builtin tables (like mz_scaling_strategies)
+    if table.id().is_system() && !table.is_writable_builtin_table() {
         sql_bail!(
             "cannot insert into system table '{}'",
             table_name.full_name_str()
@@ -795,7 +797,8 @@ pub fn plan_mutation_query_inner(
             table_name.full_name_str()
         )
     })?;
-    if id.is_system() {
+    // Block writes to system tables, except for writable builtin tables (like mz_scaling_strategies)
+    if id.is_system() && !item.is_writable_builtin_table() {
         sql_bail!(
             "cannot mutate system table '{}'",
             table_name.full_name_str()

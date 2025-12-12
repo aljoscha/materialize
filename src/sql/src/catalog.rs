@@ -836,6 +836,10 @@ pub trait CatalogItem {
     /// catalog item is a table that accepts writes.
     fn writable_table_details(&self) -> Option<&[Expr<Aug>]>;
 
+    /// Returns true if this is a builtin table that allows writes via SQL.
+    /// Most builtin tables are read-only, but some (like mz_scaling_strategies) are writable.
+    fn is_writable_builtin_table(&self) -> bool;
+
     /// The item this catalog item replaces, if any.
     fn replacement_target(&self) -> Option<CatalogItemId>;
 

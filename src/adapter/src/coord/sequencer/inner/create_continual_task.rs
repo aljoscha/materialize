@@ -75,6 +75,7 @@ impl Coordinator {
                 data_source: TableDataSource::TableWrites {
                     defaults: Vec::new(),
                 },
+                is_writable_builtin: false,
             }),
             referenced_by: Vec::new(),
             used_by: Vec::new(),

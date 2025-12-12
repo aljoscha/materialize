@@ -170,6 +170,10 @@ pub struct BuiltinTable {
     pub is_retained_metrics_object: bool,
     /// ACL items to apply to the object
     pub access: Vec<MzAclItem>,
+    /// Whether this builtin table supports writes via INSERT/UPDATE/DELETE.
+    /// Most builtin tables are read-only and managed internally, but some
+    /// (like mz_scaling_strategies) can be modified by users.
+    pub writable: bool,
 }
 
 #[derive(Clone, Debug, Hash, Serialize)]
@@ -2037,6 +2041,7 @@ pub static MZ_ICEBERG_SINKS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTa
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_KAFKA_SINKS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -2057,6 +2062,7 @@ pub static MZ_KAFKA_SINKS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTabl
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_KAFKA_CONNECTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_kafka_connections",
@@ -2083,6 +2089,7 @@ pub static MZ_KAFKA_CONNECTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| Built
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_KAFKA_SOURCES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_kafka_sources",
@@ -2109,6 +2116,7 @@ pub static MZ_KAFKA_SOURCES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTa
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_POSTGRES_SOURCES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_postgres_sources",
@@ -2135,6 +2143,7 @@ pub static MZ_POSTGRES_SOURCES: LazyLock<BuiltinTable> = LazyLock::new(|| Builti
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_POSTGRES_SOURCE_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_postgres_source_tables",
@@ -2161,6 +2170,7 @@ pub static MZ_POSTGRES_SOURCE_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|| 
     ]),
     is_retained_metrics_object: true,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_MYSQL_SOURCE_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_mysql_source_tables",
@@ -2187,6 +2197,7 @@ pub static MZ_MYSQL_SOURCE_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|| Bui
     ]),
     is_retained_metrics_object: true,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_SQL_SERVER_SOURCE_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_sql_server_source_tables",
@@ -2213,6 +2224,7 @@ pub static MZ_SQL_SERVER_SOURCE_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|
     ]),
     is_retained_metrics_object: true,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_KAFKA_SOURCE_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_kafka_source_tables",
@@ -2246,6 +2258,7 @@ pub static MZ_KAFKA_SOURCE_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|| Bui
     ]),
     is_retained_metrics_object: true,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_OBJECT_DEPENDENCIES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_object_dependencies",
@@ -2270,6 +2283,7 @@ pub static MZ_OBJECT_DEPENDENCIES: LazyLock<BuiltinTable> = LazyLock::new(|| Bui
     ]),
     is_retained_metrics_object: true,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_COMPUTE_DEPENDENCIES: LazyLock<BuiltinSource> = LazyLock::new(|| BuiltinSource {
     name: "mz_compute_dependencies",
@@ -2325,6 +2339,7 @@ pub static MZ_DATABASES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable 
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_SCHEMAS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_schemas",
@@ -2362,6 +2377,7 @@ pub static MZ_SCHEMAS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_COLUMNS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_columns",
@@ -2398,6 +2414,7 @@ pub static MZ_COLUMNS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_INDEXES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_indexes",
@@ -2439,6 +2456,7 @@ pub static MZ_INDEXES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_INDEX_COLUMNS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_index_columns",
@@ -2475,6 +2493,7 @@ pub static MZ_INDEX_COLUMNS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTa
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_tables",
@@ -2521,6 +2540,7 @@ pub static MZ_TABLES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: true,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_CONNECTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_connections",
@@ -2573,6 +2593,7 @@ pub static MZ_CONNECTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTabl
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_SSH_TUNNEL_CONNECTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_ssh_tunnel_connections",
@@ -2596,6 +2617,7 @@ pub static MZ_SSH_TUNNEL_CONNECTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| 
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_SOURCES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_sources",
@@ -2672,6 +2694,7 @@ pub static MZ_SOURCES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: true,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_SINKS: LazyLock<BuiltinTable> = LazyLock::new(|| {
     BuiltinTable {
@@ -2745,6 +2768,7 @@ pub static MZ_SINKS: LazyLock<BuiltinTable> = LazyLock::new(|| {
         ]),
         is_retained_metrics_object: true,
         access: vec![PUBLIC_SELECT],
+        writable: false,
     }
 });
 pub static MZ_VIEWS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -2789,6 +2813,7 @@ pub static MZ_VIEWS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_MATERIALIZED_VIEWS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_materialized_views",
@@ -2849,6 +2874,7 @@ pub static MZ_MATERIALIZED_VIEWS: LazyLock<BuiltinTable> = LazyLock::new(|| Buil
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_MATERIALIZED_VIEW_REFRESH_STRATEGIES: LazyLock<BuiltinTable> = LazyLock::new(|| {
     BuiltinTable {
@@ -2895,6 +2921,7 @@ pub static MZ_MATERIALIZED_VIEW_REFRESH_STRATEGIES: LazyLock<BuiltinTable> = Laz
         ]),
         is_retained_metrics_object: false,
         access: vec![PUBLIC_SELECT],
+        writable: false,
     }
 });
 pub static MZ_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -2939,6 +2966,7 @@ pub static MZ_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_CONTINUAL_TASKS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_continual_tasks",
@@ -2964,6 +2992,7 @@ pub static MZ_CONTINUAL_TASKS: LazyLock<BuiltinTable> = LazyLock::new(|| Builtin
     column_comments: BTreeMap::new(),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_NETWORK_POLICIES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_network_policies",
@@ -2997,6 +3026,7 @@ pub static MZ_NETWORK_POLICIES: LazyLock<BuiltinTable> = LazyLock::new(|| Builti
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_NETWORK_POLICY_RULES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_network_policy_rules",
@@ -3030,6 +3060,7 @@ pub static MZ_NETWORK_POLICY_RULES: LazyLock<BuiltinTable> = LazyLock::new(|| Bu
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 /// PostgreSQL-specific metadata about types that doesn't make sense to expose
 /// in the `mz_types` table as part of our public, stable API.
@@ -3045,6 +3076,7 @@ pub static MZ_TYPE_PG_METADATA: LazyLock<BuiltinTable> = LazyLock::new(|| Builti
     column_comments: BTreeMap::new(),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_ARRAY_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_array_types",
@@ -3060,6 +3092,7 @@ pub static MZ_ARRAY_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTabl
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_BASE_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_base_types",
@@ -3071,6 +3104,7 @@ pub static MZ_BASE_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable
     column_comments: BTreeMap::from_iter([("id", "The ID of the type.")]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_LIST_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_list_types",
@@ -3098,6 +3132,7 @@ pub static MZ_LIST_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_MAP_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_map_types",
@@ -3139,6 +3174,7 @@ pub static MZ_MAP_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable 
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_ROLES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_roles",
@@ -3170,6 +3206,7 @@ pub static MZ_ROLES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_ROLE_MEMBERS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_role_members",
@@ -3196,6 +3233,7 @@ pub static MZ_ROLE_MEMBERS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTab
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_ROLE_PARAMETERS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_role_parameters",
@@ -3222,6 +3260,7 @@ pub static MZ_ROLE_PARAMETERS: LazyLock<BuiltinTable> = LazyLock::new(|| Builtin
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_ROLE_AUTH: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_role_auth",
@@ -3253,6 +3292,7 @@ pub static MZ_ROLE_AUTH: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable 
     ]),
     is_retained_metrics_object: false,
     access: vec![rbac::owner_privilege(ObjectType::Table, MZ_SYSTEM_ROLE_ID)],
+    writable: false,
 });
 pub static MZ_PSEUDO_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_pseudo_types",
@@ -3264,6 +3304,7 @@ pub static MZ_PSEUDO_TYPES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTab
     column_comments: BTreeMap::from_iter([("id", "The ID of the type.")]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_FUNCTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| {
     BuiltinTable {
@@ -3321,6 +3362,7 @@ pub static MZ_FUNCTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| {
         ]),
         is_retained_metrics_object: false,
         access: vec![PUBLIC_SELECT],
+        writable: false,
     }
 });
 pub static MZ_OPERATORS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -3339,6 +3381,7 @@ pub static MZ_OPERATORS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable 
     column_comments: BTreeMap::new(),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 pub static MZ_AGGREGATES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     name: "mz_aggregates",
@@ -3352,6 +3395,7 @@ pub static MZ_AGGREGATES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable
     column_comments: BTreeMap::new(),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_CLUSTERS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -3427,6 +3471,7 @@ pub static MZ_CLUSTERS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_CLUSTER_WORKLOAD_CLASSES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -3441,6 +3486,7 @@ pub static MZ_CLUSTER_WORKLOAD_CLASSES: LazyLock<BuiltinTable> = LazyLock::new(|
     column_comments: BTreeMap::new(),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub const MZ_CLUSTER_WORKLOAD_CLASSES_IND: BuiltinIndex = BuiltinIndex {
@@ -3477,6 +3523,7 @@ pub static MZ_CLUSTER_SCHEDULES: LazyLock<BuiltinTable> = LazyLock::new(|| Built
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_SECRETS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -3513,6 +3560,7 @@ pub static MZ_SECRETS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_CLUSTER_REPLICAS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -3553,6 +3601,7 @@ pub static MZ_CLUSTER_REPLICAS: LazyLock<BuiltinTable> = LazyLock::new(|| Builti
     ]),
     is_retained_metrics_object: true,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_INTERNAL_CLUSTER_REPLICAS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -3568,6 +3617,7 @@ pub static MZ_INTERNAL_CLUSTER_REPLICAS: LazyLock<BuiltinTable> = LazyLock::new(
     )]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_PENDING_CLUSTER_REPLICAS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -3583,6 +3633,7 @@ pub static MZ_PENDING_CLUSTER_REPLICAS: LazyLock<BuiltinTable> = LazyLock::new(|
     )]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_CLUSTER_REPLICA_STATUS_HISTORY: LazyLock<BuiltinSource> = LazyLock::new(|| {
@@ -3721,6 +3772,7 @@ pub static MZ_CLUSTER_REPLICA_SIZES: LazyLock<BuiltinTable> = LazyLock::new(|| B
     ]),
     is_retained_metrics_object: true,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_AUDIT_EVENTS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -3767,6 +3819,7 @@ pub static MZ_AUDIT_EVENTS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTab
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_SOURCE_STATUS_HISTORY: LazyLock<BuiltinSource> = LazyLock::new(|| BuiltinSource {
@@ -4772,6 +4825,7 @@ pub static MZ_STORAGE_USAGE_BY_SHARD: LazyLock<BuiltinTable> = LazyLock::new(|| 
     column_comments: BTreeMap::new(),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_EGRESS_IPS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -4793,6 +4847,7 @@ pub static MZ_EGRESS_IPS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_AWS_PRIVATELINK_CONNECTIONS: LazyLock<BuiltinTable> =
@@ -4813,6 +4868,7 @@ pub static MZ_AWS_PRIVATELINK_CONNECTIONS: LazyLock<BuiltinTable> =
         ]),
         is_retained_metrics_object: false,
         access: vec![PUBLIC_SELECT],
+        writable: false,
     });
 
 pub static MZ_AWS_CONNECTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -4893,6 +4949,7 @@ pub static MZ_AWS_CONNECTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| Builtin
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_CLUSTER_REPLICA_METRICS_HISTORY: LazyLock<BuiltinSource> =
@@ -5311,6 +5368,7 @@ pub static MZ_SUBSCRIPTIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTa
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_SESSIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -5348,6 +5406,7 @@ pub static MZ_SESSIONS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_DEFAULT_PRIVILEGES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -5387,6 +5446,7 @@ pub static MZ_DEFAULT_PRIVILEGES: LazyLock<BuiltinTable> = LazyLock::new(|| Buil
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_SYSTEM_PRIVILEGES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -5402,6 +5462,7 @@ pub static MZ_SYSTEM_PRIVILEGES: LazyLock<BuiltinTable> = LazyLock::new(|| Built
     )]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_COMMENTS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -5431,6 +5492,7 @@ pub static MZ_COMMENTS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_SOURCE_REFERENCES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -5453,6 +5515,7 @@ pub static MZ_SOURCE_REFERENCES: LazyLock<BuiltinTable> = LazyLock::new(|| Built
     column_comments: BTreeMap::new(),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_WEBHOOKS_SOURCES: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTable {
@@ -5477,6 +5540,7 @@ pub static MZ_WEBHOOKS_SOURCES: LazyLock<BuiltinTable> = LazyLock::new(|| Builti
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 pub static MZ_HISTORY_RETENTION_STRATEGIES: LazyLock<BuiltinTable> = LazyLock::new(|| {
@@ -5502,6 +5566,7 @@ pub static MZ_HISTORY_RETENTION_STRATEGIES: LazyLock<BuiltinTable> = LazyLock::n
         ]),
         is_retained_metrics_object: false,
         access: vec![PUBLIC_SELECT],
+        writable: false,
     }
 });
 
@@ -5543,6 +5608,7 @@ pub static MZ_LICENSE_KEYS: LazyLock<BuiltinTable> = LazyLock::new(|| BuiltinTab
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 // Auto-scaling strategy tables
@@ -6025,6 +6091,7 @@ pub static MZ_OBJECT_GLOBAL_IDS: LazyLock<BuiltinTable> = LazyLock::new(|| Built
     ]),
     is_retained_metrics_object: false,
     access: vec![PUBLIC_SELECT],
+    writable: false,
 });
 
 // TODO (SangJunBak): Remove once mz_object_history is released and used in the Console https://github.com/MaterializeInc/console/issues/3342

@@ -1158,6 +1158,7 @@ impl CatalogState {
                             }
                         },
                     },
+                    is_writable_builtin: false,
                 })
             }
             Plan::CreateSource(CreateSourcePlan {
