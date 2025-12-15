@@ -190,6 +190,7 @@ impl Coordinator {
         let mut execution_timestamps_to_set = BTreeSet::new();
         let mut vpc_endpoints_to_create: Vec<(CatalogItemId, VpcEndpointConfig)> = vec![];
         let mut sinks_to_create: Vec<(CatalogItemId, Sink)> = vec![];
+        let mut sinks_to_alter: Vec<(CatalogItemId, Sink, Sink)> = vec![];
 
         // Replacing a materialized view causes the replacement's catalog entry
         // to be dropped. Its compute and storage collections are transferred to
@@ -309,7 +310,7 @@ impl Coordinator {
                     prev: prev_sink,
                     new: new_sink,
                 }) => {
-                    tracing::debug!(?prev_sink, ?new_sink, "not handling AlterSink in here yet");
+                    sinks_to_alter.push((catalog_id, prev_sink, new_sink));
                 }
                 CatalogImplication::Sink(CatalogImplicationKind::Dropped(sink, full_name)) => {
                     storage_sink_gids_to_drop.push(sink.global_id());
@@ -567,6 +568,11 @@ impl Coordinator {
         for (_item_id, sink) in sinks_to_create {
             self.handle_create_sink(&mut storage_policies_to_initialize, sink)
                 .await?;
+        }
+
+        // Alter sinks (storage exports) - update the export description.
+        for (_item_id, _prev_sink, new_sink) in sinks_to_alter {
+            self.handle_alter_sink(new_sink).await?;
         }
 
         // It is _very_ important that we only initialize read policies after we
@@ -1541,6 +1547,76 @@ impl Coordinator {
             .entry(CompactionWindow::Default)
             .or_default()
             .insert(global_id);
+
+        Ok(())
+    }
+
+    #[instrument(level = "debug")]
+    async fn handle_alter_sink(&mut self, sink: Sink) -> Result<(), AdapterError> {
+        let global_id = sink.global_id();
+
+        // Validate `sink.from` is in fact a storage collection
+        self.controller.storage.check_exists(sink.from)?;
+
+        // The AsOf is used to determine at what time to snapshot reading from
+        // the persist collection. This is primarily relevant when we do _not_
+        // want to include the snapshot in the sink.
+        //
+        // We choose the smallest as_of that is legal, according to the sinked
+        // collection's since.
+        let id_bundle = crate::CollectionIdBundle {
+            storage_ids: BTreeSet::from([sink.from]),
+            compute_ids: BTreeMap::new(),
+        };
+
+        // We're putting in place read holds, such that alter_export, below,
+        // which calls update_read_capabilities, can successfully do so.
+        // Otherwise, the since of dependencies might move along concurrently,
+        // pulling the rug from under us!
+        //
+        // Note: The caller (sequence_alter_sink_finish) also holds read holds
+        // on the `from` collection, which ensures that the since hasn't
+        // advanced past the as_of that was validated before the catalog
+        // transaction.
+        let read_holds = self.acquire_read_holds(&id_bundle);
+        let as_of = read_holds.least_valid_read();
+
+        let storage_sink_from_entry = self.catalog().get_entry_by_global_id(&sink.from);
+        let storage_sink_desc = mz_storage_types::sinks::StorageSinkDesc {
+            from: sink.from,
+            from_desc: storage_sink_from_entry
+                .relation_desc()
+                .expect("sinks can only be built on items with descs")
+                .into_owned(),
+            connection: sink
+                .connection
+                .clone()
+                .into_inline_connection(self.catalog().state()),
+            envelope: sink.envelope,
+            as_of,
+            with_snapshot: sink.with_snapshot,
+            version: sink.version,
+            from_storage_metadata: (),
+            to_storage_metadata: (),
+            commit_interval: sink.commit_interval,
+        };
+
+        // Alter the export.
+        self.controller
+            .storage
+            .alter_export(
+                global_id,
+                ExportDescription {
+                    sink: storage_sink_desc,
+                    instance_id: sink.cluster_id,
+                },
+            )
+            .await
+            .unwrap_or_terminate("cannot fail to alter export");
+
+        // Drop read holds after the export has been altered, at which point
+        // storage will have updated its own read holds.
+        drop(read_holds);
 
         Ok(())
     }

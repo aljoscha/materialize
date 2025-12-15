@@ -60,7 +60,6 @@ use mz_sql::plan::{
     StatementContext,
 };
 use mz_sql::pure::{PurifiedSourceExport, generate_subsource_statements};
-use mz_storage_types::sinks::StorageSinkDesc;
 use mz_storage_types::sources::GenericSourceConnection;
 // Import `plan` module, but only import select elements to avoid merge conflicts on use statements.
 use mz_sql::plan::{
@@ -82,7 +81,6 @@ use mz_sql_parser::ast::{
     WithOptionValue,
 };
 use mz_ssh_util::keys::SshKeyPairSet;
-use mz_storage_client::controller::ExportDescription;
 use mz_storage_types::AlterCompatible;
 use mz_storage_types::connections::inline::IntoInlineConnection;
 use mz_storage_types::controller::StorageError;
@@ -111,7 +109,7 @@ use crate::session::{
     EndTransactionAction, RequireLinearization, Session, TransactionOps, TransactionStatus,
     WriteLocks, WriteOp,
 };
-use crate::util::{ClientTransmitter, ResultExt, viewable_variables};
+use crate::util::{ClientTransmitter, viewable_variables};
 use crate::{PeekResponseUnary, ReadHolds};
 
 mod cluster;
@@ -3390,49 +3388,19 @@ impl Coordinator {
             to_item: CatalogItem::Sink(new_sink),
         }];
 
+        // The alter_export call is now handled in apply_catalog_implications
+        // via handle_alter_sink.
         match self
             .catalog_transact(Some(ctx.ctx().session_mut()), ops)
             .await
         {
-            Ok(()) => {}
+            Ok(()) => {
+                ctx.retire(Ok(ExecuteResponse::AlteredObject(ObjectType::Sink)));
+            }
             Err(err) => {
                 ctx.retire(Err(err));
-                return;
             }
         }
-
-        let storage_sink_desc = StorageSinkDesc {
-            from: sink_plan.from,
-            from_desc: from_entry
-                .relation_desc()
-                .expect("sinks can only be built on items with descs")
-                .into_owned(),
-            connection: sink_plan
-                .connection
-                .clone()
-                .into_inline_connection(self.catalog().state()),
-            envelope: sink_plan.envelope,
-            as_of,
-            with_snapshot,
-            version: sink_plan.version,
-            from_storage_metadata: (),
-            to_storage_metadata: (),
-            commit_interval: sink_plan.commit_interval,
-        };
-
-        self.controller
-            .storage
-            .alter_export(
-                global_id,
-                ExportDescription {
-                    sink: storage_sink_desc,
-                    instance_id: in_cluster,
-                },
-            )
-            .await
-            .unwrap_or_terminate("cannot fail to alter source desc");
-
-        ctx.retire(Ok(ExecuteResponse::AlteredObject(ObjectType::Sink)));
     }
 
     #[instrument]
