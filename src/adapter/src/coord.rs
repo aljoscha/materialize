@@ -287,6 +287,17 @@ pub enum Message {
         stmt: Arc<Statement<Raw>>,
         params: mz_sql::plan::Params,
     },
+    /// Execute a SQL statement for internal widget use.
+    ///
+    /// Similar to `ExecuteSingleStatementTransaction`, but returns the statement
+    /// result directly (e.g., rows for SELECT) instead of a COMMIT response.
+    /// This is used by widgets that need to query system tables.
+    ExecuteWidgetSql {
+        ctx: ExecuteContext,
+        otel_ctx: OpenTelemetryContext,
+        stmt: Arc<Statement<Raw>>,
+        params: mz_sql::plan::Params,
+    },
     PeekStageReady {
         ctx: ExecuteContext,
         span: Span,
@@ -408,6 +419,7 @@ impl Message {
             Message::ExecuteSingleStatementTransaction { .. } => {
                 "execute_single_statement_transaction"
             }
+            Message::ExecuteWidgetSql { .. } => "execute_widget_sql",
             Message::PeekStageReady { .. } => "peek_stage_ready",
             Message::ExplainTimestampStageReady { .. } => "explain_timestamp_stage_ready",
             Message::CreateIndexStageReady { .. } => "create_index_stage_ready",

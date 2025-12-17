@@ -1608,7 +1608,14 @@ impl CatalogState {
         // Keep in sync with `get_schemas_mut`
         match (database_spec, schema_spec) {
             (ResolvedDatabaseSpecifier::Ambient, SchemaSpecifier::Temporary) => {
-                &self.temporary_schemas[conn_id]
+                // The `mz_temp` schema is per-connection. Some internal sessions
+                // may not have had a temp schema created, but still have a
+                // search path that includes `mz_temp`. Treat missing temp
+                // schemas as empty by falling back to the always-present system
+                // temp schema.
+                self.temporary_schemas
+                    .get(conn_id)
+                    .unwrap_or(&self.temporary_schemas[&SYSTEM_CONN_ID])
             }
             (ResolvedDatabaseSpecifier::Ambient, SchemaSpecifier::Id(id)) => {
                 &self.ambient_schemas_by_id[id]

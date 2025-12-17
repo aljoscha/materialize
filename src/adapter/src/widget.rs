@@ -22,10 +22,12 @@
 pub mod auto_scaling;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use mz_controller_types::ClusterId;
 use mz_ore::now::NowFn;
 use mz_ore::task::spawn;
@@ -35,6 +37,27 @@ use tokio::select;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
+
+pub type WidgetSqlRowBatchStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<mz_repr::Row>, String>> + Send>>;
+
+/// Result of starting a widget SQL execution.
+///
+/// This is intentionally stream-oriented so the widget can drain results
+/// asynchronously without blocking the coordinator main loop.
+pub enum WidgetSqlResult {
+    Rows(Vec<mz_repr::Row>),
+    Stream(WidgetSqlRowBatchStream),
+}
+
+impl fmt::Debug for WidgetSqlResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WidgetSqlResult::Rows(rows) => f.debug_tuple("Rows").field(rows).finish(),
+            WidgetSqlResult::Stream(_) => f.debug_tuple("Stream").field(&"<stream>").finish(),
+        }
+    }
+}
 
 /// A semi-autonomous extension that runs within environmentd.
 ///
@@ -76,22 +99,11 @@ pub trait Widget: Send + Sync + 'static {
 
 /// A request from the widget to the coordinator for data.
 ///
-/// This provides a generic interface for widgets to read from builtin tables
-/// and execute SQL queries. The coordinator handles the request and returns
-/// raw row data that the widget then interprets according to its needs.
+/// This provides a generic interface for widgets to execute SQL queries.
+/// The coordinator handles the request and returns raw row data that the
+/// widget then interprets according to its needs.
 #[derive(Debug)]
 pub enum WidgetDataRequest {
-    /// Read all rows from a builtin table.
-    ///
-    /// The widget specifies the table by CatalogItemId, and the coordinator returns
-    /// the raw rows. The widget is responsible for parsing the rows according
-    /// to the table's schema.
-    ReadBuiltinTable {
-        /// The CatalogItemId of the builtin table to read.
-        table_id: mz_repr::CatalogItemId,
-        /// Channel to send the rows back to the widget.
-        response_tx: oneshot::Sender<Result<Vec<mz_repr::Row>, String>>,
-    },
     /// Execute a SQL query and return the results.
     ///
     /// This allows widgets to execute read-only SQL queries against the system.
@@ -101,7 +113,7 @@ pub enum WidgetDataRequest {
         /// The SQL query to execute.
         sql: String,
         /// Channel to send the result rows back to the widget.
-        response_tx: oneshot::Sender<Result<Vec<mz_repr::Row>, String>>,
+        response_tx: oneshot::Sender<Result<WidgetSqlResult, String>>,
     },
 }
 
@@ -138,9 +150,9 @@ impl WidgetContext {
 
     /// Read all rows from a builtin table.
     ///
-    /// This sends a request to the coordinator to read from the specified builtin
-    /// table. The coordinator returns raw rows that the widget must parse according
-    /// to the table's schema.
+    /// This generates a SQL query to read from the specified builtin table
+    /// and executes it via the coordinator. The widget must parse the returned
+    /// rows according to the table's schema.
     ///
     /// # Arguments
     /// * `table_id` - The CatalogItemId of the builtin table to read
@@ -151,21 +163,21 @@ impl WidgetContext {
         &self,
         table_id: mz_repr::CatalogItemId,
     ) -> Result<Vec<mz_repr::Row>, WidgetError> {
-        let (response_tx, response_rx) = oneshot::channel();
-        self.request_tx
-            .send(WidgetDataRequest::ReadBuiltinTable {
-                table_id,
-                response_tx,
-            })
-            .map_err(|e| {
-                WidgetError::Internal(format!("failed to send table read request: {}", e))
-            })?;
-        response_rx
-            .await
-            .map_err(|e| {
-                WidgetError::Internal(format!("failed to receive table read response: {}", e))
-            })?
-            .map_err(|e| WidgetError::Internal(format!("table read failed: {}", e)))
+        // Look up the table name from the catalog
+        let entry = self.catalog.try_get_entry(&table_id).ok_or_else(|| {
+            WidgetError::Internal(format!("builtin table not found in catalog: {:?}", table_id))
+        })?;
+
+        // Use resolve_full_name to get schema and item names as strings
+        let full_name = self.catalog.resolve_full_name(entry.name(), None);
+        let schema_name = &full_name.schema;
+        let table_name = &full_name.item;
+
+        // Generate SELECT * FROM query
+        let sql = format!("SELECT * FROM \"{}\".\"{}\"", schema_name, table_name);
+
+        // Execute via the SQL path
+        self.execute_sql(&sql).await
     }
 
     /// Execute a SQL query and return the result rows.
@@ -189,12 +201,26 @@ impl WidgetContext {
             .map_err(|e| {
                 WidgetError::Internal(format!("failed to send SQL execution request: {}", e))
             })?;
-        response_rx
+        let result = response_rx
             .await
             .map_err(|e| {
                 WidgetError::Internal(format!("failed to receive SQL execution response: {}", e))
             })?
             .map_err(|e| WidgetError::Internal(format!("SQL execution failed: {}", e)))
+            ?;
+
+        match result {
+            WidgetSqlResult::Rows(rows) => Ok(rows),
+            WidgetSqlResult::Stream(mut stream) => {
+                let mut rows_out = Vec::new();
+                while let Some(batch) = stream.next().await {
+                    rows_out.extend(batch.map_err(|e| {
+                        WidgetError::Internal(format!("SQL execution failed: {}", e))
+                    })?);
+                }
+                Ok(rows_out)
+            }
+        }
     }
 }
 

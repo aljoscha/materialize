@@ -217,9 +217,15 @@ impl Coordinator {
     /// Clears coordinator state for a connection.
     pub(crate) async fn clear_connection(&mut self, conn_id: &ConnectionId) {
         self.staged_cancellation.remove(conn_id);
-        self.retire_compute_sinks_for_conn(conn_id, ActiveComputeSinkRetireReason::Finished)
-            .await;
-        self.retire_cluster_reconfigurations_for_conn(conn_id).await;
+        // Some internal/background execution paths construct ephemeral sessions
+        // that are not present in `active_conns`. Those sessions cannot have any
+        // tracked compute sinks or cluster reconfigurations, because we only
+        // track those for active client connections.
+        if self.active_conns.contains_key(conn_id) {
+            self.retire_compute_sinks_for_conn(conn_id, ActiveComputeSinkRetireReason::Finished)
+                .await;
+            self.retire_cluster_reconfigurations_for_conn(conn_id).await;
+        }
 
         // Release this transaction's compaction hold on collections.
         if let Some(txn_reads) = self.txn_read_holds.remove(conn_id) {

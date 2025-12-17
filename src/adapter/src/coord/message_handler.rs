@@ -11,9 +11,12 @@
 //! messages from various sources (ex: controller, clients, background tasks, etc).
 
 use std::collections::{BTreeMap, BTreeSet, btree_map};
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
+use futures::Stream;
+use futures::StreamExt;
 use maplit::btreemap;
 use mz_catalog::memory::objects::ClusterReplicaProcessStatus;
 use mz_controller::ControllerResponse;
@@ -43,6 +46,34 @@ use crate::coord::{
 };
 use crate::telemetry::{EventDetails, SegmentClientExt};
 use crate::{AdapterNotice, TimestampContext};
+
+struct WidgetSqlStream {
+    inner: Pin<Box<dyn Stream<Item = Result<Vec<Row>, String>> + Send>>,
+    internal_cmd_tx: tokio::sync::mpsc::UnboundedSender<Message>,
+    conn_id: mz_adapter_types::connection::ConnectionId,
+}
+
+impl Stream for WidgetSqlStream {
+    type Item = Result<Vec<Row>, String>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl Drop for WidgetSqlStream {
+    fn drop(&mut self) {
+        // Ephemeral widget SQL sessions are not tracked in `active_conns`, so we
+        // cannot use `Command::Terminate` (which is for client sessions). But we
+        // can still try to cancel any in-flight peeks tied to this connection id.
+        let _ = self
+            .internal_cmd_tx
+            .send(Message::CancelPendingPeeks { conn_id: self.conn_id.clone() });
+    }
+}
 
 impl Coordinator {
     /// BOXED FUTURE: As of Nov 2023 the returned Future from this function was 74KB. This would
@@ -149,6 +180,17 @@ impl Coordinator {
                     .boxed_local()
                     .await;
             }
+            Message::ExecuteWidgetSql {
+                ctx,
+                otel_ctx,
+                stmt,
+                params,
+            } => {
+                otel_ctx.attach_as_parent();
+                self.sequence_execute_widget_sql(ctx, stmt, params)
+                    .boxed_local()
+                    .await;
+            }
             Message::PeekStageReady { ctx, span, stage } => {
                 self.sequence_staged(ctx, span, stage).boxed_local().await;
             }
@@ -210,7 +252,148 @@ impl Coordinator {
                 self.handle_widget_data_request(request).await;
             }
         }
+}
+
+async fn execute_widget_sql_via_coordinator(
+    internal_cmd_tx: tokio::sync::mpsc::UnboundedSender<Message>,
+    _now: mz_ore::now::NowFn,
+    build_info: &'static mz_build_info::BuildInfo,
+    helm_chart_version: Option<String>,
+    session_metrics: crate::metrics::SessionMetrics,
+    sql: String,
+) -> Result<crate::widget::WidgetSqlResult, String> {
+    use mz_adapter_types::connection::ConnectionId;
+    use mz_ore::collections::CollectionExt;
+    use mz_sql::plan::Params;
+    use mz_sql_parser::ast::Raw;
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    // Parse SQL.
+    let stmts = mz_sql_parser::parser::parse_statements(&sql)
+        .map_err(|e| format!("SQL parse error: {}", e))?;
+
+    if stmts.len() != 1 {
+        return Err(format!(
+            "widget SQL must be exactly one statement, got {}",
+            stmts.len()
+        ));
     }
+
+    let stmt: Arc<mz_sql::ast::Statement<Raw>> = Arc::new(stmts.into_element().ast);
+
+    // Allocate a unique-ish connection id for widget SQL execution.
+    //
+    // Keep it below 2^31 so it remains i32-compatible for any pgwire logging.
+    //
+    // Note: this must not overlap with other internal/widget connection ids.
+    static NEXT_WIDGET_SQL_CONN_ID: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(2_010_000_000);
+    let conn_id = ConnectionId::Static(
+        NEXT_WIDGET_SQL_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    );
+
+    // Execute via the coordinator message loop so staged work (e.g., peeks) can
+    // complete while this task awaits the response.
+    let (sub_tx, sub_rx) = oneshot::channel();
+    let sub_ct = crate::util::ClientTransmitter::new(sub_tx, internal_cmd_tx.clone());
+
+    let mut session = crate::session::Session::new(
+        build_info,
+        crate::session::SessionConfig {
+            conn_id: conn_id.clone(),
+            uuid: Uuid::new_v4(),
+            user: mz_sql::session::user::SYSTEM_USER.name.clone(),
+            client_ip: None,
+            external_metadata_rx: None,
+            internal_user_metadata: None,
+            helm_chart_version,
+        },
+        session_metrics,
+    );
+    session.initialize_role_metadata(mz_sql::session::user::MZ_SYSTEM_ROLE_ID);
+
+    let ctx = crate::coord::ExecuteContext::from_parts(
+        sub_ct,
+        internal_cmd_tx.clone(),
+        session,
+        crate::coord::ExecuteContextExtra::default(),
+    );
+
+    internal_cmd_tx
+        .send(Message::ExecuteWidgetSql {
+            ctx,
+            otel_ctx: OpenTelemetryContext::obtain(),
+            stmt,
+            params: Params::empty(),
+        })
+        .map_err(|e| format!("failed to send widget SQL to coordinator: {e}"))?;
+
+    let resp = sub_rx
+        .await
+        .map_err(|_| "widget SQL execution response channel dropped".to_string())?;
+
+    let crate::command::Response {
+        result,
+        session: _,
+        otel_ctx: _,
+    } = resp;
+
+    let execute_response = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(e.to_string());
+        }
+    };
+
+    let mut response = execute_response;
+    loop {
+        match response {
+            crate::ExecuteResponse::CopyTo { resp, .. } => {
+                response = *resp;
+            }
+            crate::ExecuteResponse::SendingRowsImmediate { mut rows } => {
+                let mut rows_out: Vec<Row> = Vec::new();
+                while let Some(row_ref) = rows.next() {
+                    rows_out.push(row_ref.to_owned());
+                }
+                return Ok(crate::widget::WidgetSqlResult::Rows(rows_out));
+            }
+            crate::ExecuteResponse::SendingRowsStreaming { rows, .. } => {
+                let internal_cmd_tx_for_drop = internal_cmd_tx.clone();
+
+                let batch_stream = rows.map(|unary| match unary {
+                    crate::coord::peek::PeekResponseUnary::Rows(mut iter) => {
+                        let mut batch = Vec::new();
+                        while let Some(row_ref) = iter.next() {
+                            batch.push(row_ref.to_owned());
+                        }
+                        Ok(batch)
+                    }
+                    crate::coord::peek::PeekResponseUnary::Error(e) => Err(e),
+                    crate::coord::peek::PeekResponseUnary::Canceled => {
+                        Err("widget SQL execution canceled".to_string())
+                    }
+                });
+
+                let stream = WidgetSqlStream {
+                    inner: Box::pin(batch_stream),
+                    internal_cmd_tx: internal_cmd_tx_for_drop,
+                    conn_id,
+                };
+
+                return Ok(crate::widget::WidgetSqlResult::Stream(Box::pin(stream)));
+            }
+            other => {
+                return Err(format!(
+                    "widget SQL must be a single SELECT-like statement that returns rows, got {}",
+                    other.tag().unwrap_or_else(|| format!("{:?}", other))
+                ));
+            }
+        }
+    }
+}
 
     /// Handle a message from a widget.
     async fn handle_widget_message(&mut self, msg: crate::widget::WidgetMessage) {
@@ -563,224 +746,35 @@ impl Coordinator {
     }
 
     /// Handle a data request from a widget.
-    ///
-    /// This reads data from builtin tables and returns it to the widget.
-    /// The widget specifies which table to read by its CatalogItemId.
     async fn handle_widget_data_request(&mut self, request: crate::widget::WidgetDataRequest) {
         use crate::widget::WidgetDataRequest;
         match request {
-            WidgetDataRequest::ReadBuiltinTable {
-                table_id,
-                response_tx,
-            } => {
-                tracing::debug!(?table_id, "handling widget builtin table read request");
-
-                let result = self.read_builtin_table_for_widget(table_id).await;
-
-                if response_tx.send(result).is_err() {
-                    tracing::debug!("widget dropped before receiving table read response");
-                }
-            }
             WidgetDataRequest::ExecuteSql { sql, response_tx } => {
                 tracing::debug!(%sql, "handling widget SQL execution request");
+                let internal_cmd_tx = self.internal_cmd_tx.clone();
+                let now = self.catalog().config().now.clone();
+                let build_info = self.catalog().config().build_info;
+                let helm_chart_version = self.catalog().config().helm_chart_version.clone();
+                let session_metrics = self.metrics.session_metrics();
 
-                let result = self.execute_sql_for_widget(&sql).await;
+                task::spawn(|| "widget_sql_execution", async move {
+                    let result = Coordinator::execute_widget_sql_via_coordinator(
+                        internal_cmd_tx,
+                        now,
+                        build_info,
+                        helm_chart_version,
+                        session_metrics,
+                        sql,
+                    )
+                    .await;
 
-                if response_tx.send(result).is_err() {
-                    tracing::debug!("widget dropped before receiving SQL execution response");
-                }
-            }
-        }
-    }
-
-    /// Execute a SQL query for a widget.
-    ///
-    /// This executes read-only SQL queries (SELECT statements) against system tables.
-    /// Currently, this only supports simple single-table reads. For complex queries
-    /// with joins/aggregations, use `read_builtin_table` to read raw data and
-    /// process it in Rust.
-    ///
-    /// The query is executed with system privileges.
-    async fn execute_sql_for_widget(&mut self, sql: &str) -> Result<Vec<Row>, String> {
-        use mz_adapter_types::connection::ConnectionId;
-        use mz_ore::collections::CollectionExt;
-        use mz_sql::plan::Params;
-        use mz_sql_parser::ast::Raw;
-        use std::sync::Arc;
-        use tokio::sync::oneshot;
-        use uuid::Uuid;
-
-        // Step 1: Parse the SQL
-        let stmts = mz_sql_parser::parser::parse_statements(sql)
-            .map_err(|e| format!("SQL parse error: {}", e))?;
-
-        if stmts.len() != 1 {
-            return Err(format!(
-                "widget SQL must be exactly one statement, got {}",
-                stmts.len()
-            ));
-        }
-
-        let stmt: Arc<mz_sql::ast::Statement<Raw>> = Arc::new(stmts.into_element().ast);
-
-        // Execute through the normal single-statement execution path using a
-        // system session, then collect the produced rows.
-        let (sub_tx, sub_rx) = oneshot::channel();
-        let sub_ct = crate::util::ClientTransmitter::new(sub_tx, self.internal_cmd_tx.clone());
-
-        // Allocate a unique-ish connection id for widget SQL execution.
-        //
-        // Keep it below 2^31 so it remains i32-compatible for any pgwire logging.
-        static NEXT_WIDGET_CONN_ID: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(2_000_000_000);
-        let conn_id = ConnectionId::Static(
-            NEXT_WIDGET_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        );
-
-        let mut session = crate::session::Session::new(
-            self.catalog().config().build_info,
-            crate::session::SessionConfig {
-                conn_id: conn_id.clone(),
-                uuid: Uuid::new_v4(),
-                user: mz_sql::session::user::SYSTEM_USER.name.clone(),
-                client_ip: None,
-                external_metadata_rx: None,
-                internal_user_metadata: None,
-                helm_chart_version: self.catalog().config().helm_chart_version.clone(),
-            },
-            self.metrics.session_metrics(),
-        );
-        session.initialize_role_metadata(mz_sql::session::user::MZ_SYSTEM_ROLE_ID);
-        session.start_transaction_single_stmt(self.now_datetime());
-
-        let ctx = crate::coord::ExecuteContext::from_parts(
-            sub_ct,
-            self.internal_cmd_tx.clone(),
-            session,
-            crate::coord::ExecuteContextExtra::default(),
-        );
-
-        self.handle_execute_inner(stmt, Params::empty(), ctx).await;
-
-        let resp = sub_rx
-            .await
-            .map_err(|_| "widget SQL execution response channel dropped".to_string())?;
-
-        let crate::command::Response {
-            result,
-            session,
-            otel_ctx: _,
-        } = resp;
-
-        let execute_response = result.map_err(|e| e.to_string())?;
-
-        let mut rows_out: Vec<Row> = Vec::new();
-        let mut response = execute_response;
-        loop {
-            match response {
-                crate::ExecuteResponse::CopyTo { resp, .. } => {
-                    response = *resp;
-                }
-                crate::ExecuteResponse::SendingRowsImmediate { mut rows } => {
-                    while let Some(row_ref) = rows.next() {
-                        rows_out.push(row_ref.to_owned());
+                    if response_tx.send(result).is_err() {
+                        tracing::debug!(
+                            "widget dropped before receiving SQL execution response"
+                        );
                     }
-                    break;
-                }
-                crate::ExecuteResponse::SendingRowsStreaming { mut rows, .. } => {
-                    use crate::coord::peek::PeekResponseUnary;
-                    use futures::StreamExt;
-
-                    while let Some(unary) = rows.next().await {
-                        match unary {
-                            PeekResponseUnary::Rows(mut iter) => {
-                                while let Some(row_ref) = iter.next() {
-                                    rows_out.push(row_ref.to_owned());
-                                }
-                            }
-                            PeekResponseUnary::Error(e) => return Err(e),
-                            PeekResponseUnary::Canceled => {
-                                return Err("widget SQL execution canceled".to_string());
-                            }
-                        }
-                    }
-                    break;
-                }
-                other => {
-                    return Err(format!(
-                        "widget SQL must be a single SELECT-like statement that returns rows, got {}",
-                        other.tag().unwrap_or_else(|| format!("{:?}", other))
-                    ));
-                }
+                });
             }
-        }
-
-        // Always clear per-connection coordinator state for this ephemeral session.
-        self.clear_connection(&conn_id).await;
-        // Clear session-side transaction state.
-        let mut session = session;
-        let _ = session.clear_transaction();
-
-        Ok(rows_out)
-    }
-
-    /// Read all rows from a builtin table for a widget.
-    ///
-    /// This looks up the table by CatalogItemId, resolves it to a GlobalId,
-    /// and reads the latest snapshot from storage.
-    async fn read_builtin_table_for_widget(
-        &self,
-        table_id: mz_repr::CatalogItemId,
-    ) -> Result<Vec<Row>, String> {
-        // Get the catalog entry for this item
-        let entry = self.catalog().try_get_entry(&table_id);
-        let entry = match entry {
-            Some(entry) => entry,
-            None => {
-                return Err(format!(
-                    "builtin table not found in catalog: {:?}",
-                    table_id
-                ));
-            }
-        };
-
-        // Ensure it's a table
-        let table = match entry.table() {
-            Some(table) => table,
-            None => {
-                return Err(format!("catalog item {:?} is not a table", table_id));
-            }
-        };
-
-        // Get the GlobalId for reading (the latest version)
-        let global_id = table.global_id_writes();
-
-        tracing::debug!(
-            ?table_id,
-            ?global_id,
-            table_name = %entry.name().item,
-            "reading builtin table for widget"
-        );
-
-        // Read the latest snapshot from storage
-        match self
-            .controller
-            .storage_collections
-            .snapshot_latest(global_id)
-            .await
-        {
-            Ok(rows) => {
-                tracing::debug!(
-                    ?table_id,
-                    num_rows = rows.len(),
-                    "read builtin table for widget"
-                );
-                Ok(rows)
-            }
-            Err(e) => Err(format!(
-                "failed to read builtin table {:?}: {}",
-                table_id, e
-            )),
         }
     }
 

@@ -1124,9 +1124,11 @@ impl Catalog {
     }
 
     fn item_exists_in_temp_schemas(&self, conn_id: &ConnectionId, item_name: &str) -> bool {
-        self.state.temporary_schemas[conn_id]
-            .items
-            .contains_key(item_name)
+        self.state
+            .temporary_schemas
+            .get(conn_id)
+            .map(|schema| schema.items.contains_key(item_name))
+            .unwrap_or(false)
     }
 
     /// Drops schema for connection if it exists. Returns an error if it exists and has items.

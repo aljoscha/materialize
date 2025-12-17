@@ -787,6 +787,84 @@ impl Coordinator {
         );
     }
 
+    /// Execute a SQL statement for internal widget use.
+    ///
+    /// Similar to [`Self::sequence_execute_single_statement_transaction`], but
+    /// returns the statement result directly (e.g., rows for SELECT) instead of
+    /// a COMMIT response. This is used by widgets that need to query system tables.
+    #[mz_ore::instrument(level = "debug")]
+    pub(crate) async fn sequence_execute_widget_sql(
+        &mut self,
+        ctx: ExecuteContext,
+        stmt: Arc<Statement<Raw>>,
+        params: Params,
+    ) {
+        // Put the session into single statement implicit so anything can execute.
+        let (tx, internal_cmd_tx, mut session, extra) = ctx.into_parts();
+        assert!(matches!(session.transaction(), TransactionStatus::Default));
+        session.start_transaction_single_stmt(self.now_datetime());
+        let conn_id = session.conn_id().unhandled();
+
+        // Execute the saved statement in a temp transmitter so we can run COMMIT.
+        let (sub_tx, sub_rx) = oneshot::channel();
+        let sub_ct = ClientTransmitter::new(sub_tx, self.internal_cmd_tx.clone());
+        let sub_ctx = ExecuteContext::from_parts(sub_ct, internal_cmd_tx, session, extra);
+        self.handle_execute_inner(stmt, params, sub_ctx).await;
+
+        // The response can need off-thread processing. Wait for it elsewhere so the coordinator can
+        // continue processing.
+        let internal_cmd_tx = self.internal_cmd_tx.clone();
+        mz_ore::task::spawn(
+            || format!("execute_widget_sql:{conn_id}"),
+            async move {
+                let Ok(Response {
+                    result,
+                    session,
+                    otel_ctx,
+                }) = sub_rx.await
+                else {
+                    // Coordinator went away.
+                    return;
+                };
+                otel_ctx.attach_as_parent();
+
+                // For widget SQL, we need to preserve the statement result (e.g., rows)
+                // and only commit the transaction afterward. The caller expects the
+                // statement result, not the COMMIT response.
+                let statement_result = result;
+
+                let (sub_tx, sub_rx) = oneshot::channel();
+                let _ = internal_cmd_tx.send(Message::Command(
+                    otel_ctx,
+                    Command::Commit {
+                        action: EndTransactionAction::Commit,
+                        session,
+                        tx: sub_tx,
+                    },
+                ));
+                let Ok(commit_response) = sub_rx.await else {
+                    // Coordinator went away.
+                    return;
+                };
+                assert!(matches!(
+                    commit_response.session.transaction(),
+                    TransactionStatus::Default
+                ));
+
+                // Unlike sequence_execute_single_statement_transaction, we return the
+                // statement result directly. The caller (widget) expects to receive
+                // the rows from a SELECT, not a COMMIT response.
+                //
+                // If the statement failed, we return that error. If COMMIT failed
+                // after a successful statement, we still return the statement result
+                // since the widget needs the data (and COMMIT failure for a read-only
+                // query is not expected).
+                tx.send(statement_result, commit_response.session);
+            }
+            .instrument(Span::current()),
+        );
+    }
+
     /// Creates a role during connection startup.
     ///
     /// This should not be called from anywhere except connection startup.
