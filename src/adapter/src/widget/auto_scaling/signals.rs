@@ -169,6 +169,7 @@ GROUP BY cluster_id";
         let rows = ctx.execute_sql(sql).await?;
         debug!(num_rows = rows.len(), "Read activity aggregates for widget");
 
+        let mut updated_clusters = 0usize;
         for row in rows {
             let datums: Vec<Datum> = row.iter().collect();
             let cluster_id_str = match datums.get(0) {
@@ -186,8 +187,19 @@ GROUP BY cluster_id";
             };
 
             snapshot.set_last_activity(cluster_id, finished_at);
+            updated_clusters += 1;
+            debug!(
+                cluster_id = %cluster_id,
+                last_activity_ts = %finished_at,
+                "Collected activity signal"
+            );
         }
 
+        debug!(
+            updated_clusters,
+            total_tracked_clusters = snapshot.clusters.len(),
+            "Finished collecting activity signals"
+        );
         Ok(())
     }
 
@@ -235,6 +247,7 @@ GROUP BY r.cluster_id, r.name";
             "Read hydration aggregates for widget"
         );
 
+        let mut updated_replicas = 0usize;
         for row in rows {
             let datums: Vec<Datum> = row.iter().collect();
             let cluster_id_str = match datums.get(0) {
@@ -262,6 +275,15 @@ GROUP BY r.cluster_id, r.name";
                 continue;
             }
 
+            debug!(
+                cluster_id = %cluster_id,
+                replica_name = %replica_name,
+                total_objects,
+                hydrated_objects,
+                is_hydrated = (total_objects == 0 || hydrated_objects >= total_objects),
+                "Collected hydration signal"
+            );
+            updated_replicas += 1;
             snapshot.set_hydration_status(
                 cluster_id,
                 replica_name,
@@ -288,6 +310,31 @@ GROUP BY r.cluster_id, r.name";
                     }
                 }
             }
+        }
+
+        debug!(
+            updated_replicas,
+            total_tracked_clusters = snapshot.clusters.len(),
+            "Finished collecting hydration signals"
+        );
+        for (cluster_id, cluster_info) in &snapshot.clusters {
+            let Some(signals) = snapshot.signals.get(cluster_id) else {
+                continue;
+            };
+            let hydrated = signals
+                .hydration_status
+                .values()
+                .filter(|s| s.is_hydrated())
+                .count();
+            debug!(
+                cluster_id = %cluster_id,
+                cluster_name = %cluster_info.name,
+                replicas_total = cluster_info.replicas.len(),
+                replicas_with_status = signals.hydration_status.len(),
+                replicas_hydrated = hydrated,
+                cluster_hydrated = signals.is_cluster_hydrated(),
+                "Hydration summary"
+            );
         }
 
         Ok(())
@@ -322,6 +369,7 @@ GROUP BY r.cluster_id, r.name",
             lookback_hours, "Read crash aggregates for widget"
         );
 
+        let mut updated_replicas = 0usize;
         for row in rows {
             let datums: Vec<Datum> = row.iter().collect();
             let cluster_id_str = match datums.get(0) {
@@ -353,6 +401,15 @@ GROUP BY r.cluster_id, r.name",
                 continue;
             }
 
+            debug!(
+                cluster_id = %cluster_id,
+                replica_name = %replica_name,
+                total_crashes,
+                oom_count,
+                latest_crash_time = ?latest_crash_time,
+                "Collected crash signal"
+            );
+            updated_replicas += 1;
             snapshot.add_crash_info(
                 cluster_id,
                 replica_name,
@@ -364,6 +421,11 @@ GROUP BY r.cluster_id, r.name",
             );
         }
 
+        debug!(
+            updated_replicas,
+            total_tracked_clusters = snapshot.clusters.len(),
+            "Finished collecting crash signals"
+        );
         Ok(())
     }
 

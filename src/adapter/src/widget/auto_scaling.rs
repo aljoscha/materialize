@@ -597,11 +597,43 @@ impl Widget for AutoScalingWidget {
                 continue;
             }
 
+            let hydrated_replicas = signals
+                .hydration_status
+                .values()
+                .filter(|s| s.is_hydrated())
+                .count();
+            let total_crashes: u64 = signals.crash_info.values().map(|c| c.total_crashes).sum();
+            let total_ooms: u64 = signals.crash_info.values().map(|c| c.oom_count).sum();
+
             info!(
                 widget = self.name(),
                 cluster = %cluster_info.name,
                 num_strategies = strategy_configs.len(),
                 "Processing cluster with strategies"
+            );
+
+            debug!(
+                widget = self.name(),
+                cluster = %cluster_info.name,
+                cluster_id = %cluster_info.id,
+                current_replicas = ?cluster_info
+                    .replicas
+                    .iter()
+                    .map(|r| format!("{}:{}", r.name, r.size))
+                    .collect::<Vec<_>>(),
+                last_activity_ts = ?signals.last_activity_ts,
+                seconds_since_activity = ?signals.seconds_since_activity(snapshot.now),
+                hydration_replicas = signals.hydration_status.len(),
+                hydrated_replicas,
+                cluster_hydrated = signals.is_cluster_hydrated(),
+                crash_replicas = signals.crash_info.len(),
+                total_crashes,
+                total_ooms,
+                strategies = ?strategy_configs
+                    .iter()
+                    .map(|c| format!("{}({})", c.strategy_type, c.id))
+                    .collect::<Vec<_>>(),
+                "Auto-scaling inputs"
             );
 
             // Run strategies to get desired state
@@ -631,6 +663,17 @@ impl Widget for AutoScalingWidget {
                 now,
             ) {
                 Ok((desired_state, new_states)) => {
+                    debug!(
+                        widget = self.name(),
+                        cluster = %cluster_info.name,
+                        desired_replicas = ?desired_state
+                            .target_replicas
+                            .iter()
+                            .map(|(name, spec)| format!("{}:{}", name, spec.size))
+                            .collect::<Vec<_>>(),
+                        reasons = ?desired_state.reasons,
+                        "Auto-scaling decision"
+                    );
                     // Persist updated per-strategy state.
                     for (strategy_id, state) in new_states {
                         let delete_sql = format!(
