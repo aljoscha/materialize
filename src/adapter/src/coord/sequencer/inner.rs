@@ -2040,6 +2040,8 @@ impl Coordinator {
                         response,
                         action,
                     },
+                    target_timestamp: None,
+                    timestamped_result_tx: None,
                 });
                 return;
             }
