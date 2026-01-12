@@ -164,6 +164,58 @@ impl Coordinator {
             Message::SubscribeStageReady { ctx, span, stage } => {
                 self.sequence_staged(ctx, span, stage).boxed_local().await;
             }
+            Message::ReadThenWriteSubscribeStageReady { ctx, span, stage } => {
+                self.sequence_staged(ctx, span, stage).boxed_local().await;
+            }
+            Message::ReadThenWriteSubscribeAttemptWrite {
+                target_id,
+                diffs,
+                write_ts,
+                sink_id: _,
+                result_tx,
+            } => {
+                self.handle_read_then_write_subscribe_attempt_write(
+                    target_id, diffs, write_ts, result_tx,
+                )
+                .boxed_local()
+                .await;
+            }
+            Message::DropReadThenWriteSubscribe { sink_id } => {
+                self.drop_read_then_write_subscribe(sink_id)
+                    .boxed_local()
+                    .await;
+            }
+            Message::StartReadThenWriteSubscribe {
+                conn_id,
+                session_uuid,
+                df_desc,
+                cluster_id,
+                replica_id,
+                depends_on,
+                as_of,
+                arity,
+                sink_id,
+                start_time,
+                response_tx,
+                read_holds,
+            } => {
+                self.handle_start_read_then_write_subscribe(
+                    conn_id,
+                    session_uuid,
+                    df_desc,
+                    cluster_id,
+                    replica_id,
+                    depends_on,
+                    as_of,
+                    arity,
+                    sink_id,
+                    start_time,
+                    response_tx,
+                    read_holds,
+                )
+                .boxed_local()
+                .await;
+            }
             Message::IntrospectionSubscribeStageReady { span, stage } => {
                 self.sequence_staged((), span, stage).boxed_local().await;
             }

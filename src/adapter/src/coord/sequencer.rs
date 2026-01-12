@@ -96,6 +96,8 @@ use crate::util::ClientTransmitter;
 
 mod inner;
 
+pub(crate) use inner::ReadThenWriteSubscribeStage;
+
 impl Coordinator {
     /// BOXED FUTURE: As of Nov 2023 the returned Future from this function was 34KB. This would
     /// get stored on the stack which is bad for runtime performance, and blow up our stack usage.
@@ -463,7 +465,10 @@ impl Coordinator {
                     self.sequence_insert(ctx, plan).await;
                 }
                 Plan::ReadThenWrite(plan) => {
-                    self.sequence_read_then_write(ctx, plan).await;
+                    // WIP: add dyncfg to gate subscribe-based read-then-write.
+                    // self.sequence_read_then_write(ctx, plan).await;
+                    self.sequence_read_then_write_subscribe(ctx, plan, target_cluster)
+                        .await;
                 }
                 Plan::AlterNoop(plan) => {
                     ctx.retire(Ok(ExecuteResponse::AlteredObject(plan.object_type)));

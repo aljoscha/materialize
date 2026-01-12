@@ -136,7 +136,7 @@ use mz_repr::explain::{ExplainConfig, ExplainFormat};
 use mz_repr::global_id::TransientIdGen;
 use mz_repr::optimize::OptimizerFeatures;
 use mz_repr::role_id::RoleId;
-use mz_repr::{CatalogItemId, Diff, GlobalId, RelationDesc, Timestamp};
+use mz_repr::{CatalogItemId, Diff, GlobalId, RelationDesc, Row, Timestamp};
 use mz_secrets::cache::CachingSecretsReader;
 use mz_secrets::{SecretsController, SecretsReader};
 use mz_sql::ast::{Raw, Statement};
@@ -171,7 +171,7 @@ use thiserror::Error;
 use timely::progress::{Antichain, Timestamp as _};
 use tokio::runtime::Handle as TokioHandle;
 use tokio::select;
-use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
+use tokio::sync::{OwnedMutexGuard, Semaphore, mpsc, oneshot, watch};
 use tokio::time::{Interval, MissedTickBehavior};
 use tracing::{Instrument, Level, Span, debug, info, info_span, span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -201,14 +201,14 @@ use crate::metrics::Metrics;
 use crate::optimize::dataflows::{
     ComputeInstanceSnapshot, DataflowBuilder, dataflow_import_id_bundle,
 };
-use crate::optimize::{self, Optimize, OptimizerConfig};
+use crate::optimize::{self, LirDataflowDescription, Optimize, OptimizerConfig};
 use crate::session::{EndTransactionAction, Session};
 use crate::statement_logging::{
     StatementEndedExecutionReason, StatementLifecycleEvent, StatementLoggingId,
 };
 use crate::util::{ClientTransmitter, ResultExt};
 use crate::webhook::{WebhookAppenderInvalidator, WebhookConcurrencyLimiter};
-use crate::{AdapterNotice, ReadHolds, flags};
+use crate::{AdapterNotice, PeekResponseUnary, ReadHolds, flags};
 
 pub(crate) mod appends;
 pub(crate) mod catalog_serving;
@@ -312,6 +312,41 @@ pub enum Message {
         ctx: ExecuteContext,
         span: Span,
         stage: SubscribeStage,
+    },
+    ReadThenWriteSubscribeStageReady {
+        ctx: ExecuteContext,
+        span: Span,
+        stage: crate::coord::sequencer::ReadThenWriteSubscribeStage,
+    },
+    ReadThenWriteSubscribeAttemptWrite {
+        target_id: CatalogItemId,
+        diffs: Vec<(Row, Diff)>,
+        write_ts: Timestamp,
+        sink_id: GlobalId,
+        result_tx: tokio::sync::oneshot::Sender<crate::coord::appends::TimestampedWriteResult>,
+    },
+    DropReadThenWriteSubscribe {
+        sink_id: GlobalId,
+    },
+    /// Start a read-then-write subscribe after semaphore was acquired.
+    /// Sent from the spawned OCC task back to the coordinator to create
+    /// the subscribe and return the channel.
+    StartReadThenWriteSubscribe {
+        conn_id: ConnectionId,
+        session_uuid: Uuid,
+        df_desc: LirDataflowDescription,
+        cluster_id: ComputeInstanceId,
+        replica_id: Option<ReplicaId>,
+        depends_on: BTreeSet<GlobalId>,
+        as_of: Timestamp,
+        arity: usize,
+        sink_id: GlobalId,
+        start_time: EpochMillis,
+        /// Channel to send the subscribe receiver back to the OCC loop
+        response_tx: tokio::sync::oneshot::Sender<mpsc::UnboundedReceiver<PeekResponseUnary>>,
+        /// Read holds passed directly through stages to avoid connection-keyed storage issues.
+        /// These are kept alive until after the dataflow is shipped, then dropped.
+        read_holds: ReadHolds<Timestamp>,
     },
     IntrospectionSubscribeStageReady {
         span: Span,
@@ -419,6 +454,14 @@ impl Message {
                 "create_materialized_view_stage_ready"
             }
             Message::SubscribeStageReady { .. } => "subscribe_stage_ready",
+            Message::ReadThenWriteSubscribeStageReady { .. } => {
+                "read_then_write_subscribe_stage_ready"
+            }
+            Message::ReadThenWriteSubscribeAttemptWrite { .. } => {
+                "read_then_write_subscribe_attempt_write"
+            }
+            Message::DropReadThenWriteSubscribe { .. } => "drop_read_then_write_subscribe",
+            Message::StartReadThenWriteSubscribe { .. } => "start_read_then_write_subscribe",
             Message::IntrospectionSubscribeStageReady { .. } => {
                 "introspection_subscribe_stage_ready"
             }
@@ -1794,6 +1837,23 @@ pub struct Coordinator {
 
     /// Pending writes waiting for a group commit.
     pending_writes: Vec<PendingWriteTxn>,
+
+    /// Semaphore to limit concurrent OCC (optimistic concurrency control)
+    /// read-then-write operations.
+    ///
+    /// When multiple read-then-write operations (DELETE/UPDATE) run
+    /// concurrently, each one maintains a subscribe that continually receives
+    /// updates and must consolidate data. Allowing too many concurrent
+    /// operations causes wasted work as all subscribes receive and process
+    /// updates even though only one can write at a given timestamp. Worst case,
+    /// with N concurrent occ loops, whenever one loop succeeds N-1 loops have
+    /// to update their state, so we do `O(n^2)` work.
+    ///
+    /// This semaphore (with 4 permits) limits concurrency at the operation
+    /// level. Each read-then-write operation acquires a permit before starting
+    /// its subscribe, ensuring bounded resource usage. Additional operations
+    /// wait until a permit becomes available.
+    occ_write_semaphore: Arc<Semaphore>,
 
     /// For the realtime timeline, an explicit SELECT or INSERT on a table will bump the
     /// table's timestamps, but there are cases where timestamps are not bumped but
@@ -3484,6 +3544,7 @@ impl Coordinator {
                         // writes.
                         let user_write_spans = self.pending_writes.iter().flat_map(|x| match x {
                             PendingWriteTxn::User{span, ..} => Some(span),
+                            PendingWriteTxn::InternalTimestamped{span, ..} => Some(span),
                             PendingWriteTxn::System{..} => None,
                         });
                         let span = match user_write_spans.exactly_one() {
@@ -4412,6 +4473,7 @@ pub fn serve(
                     write_locks: BTreeMap::new(),
                     deferred_write_ops: BTreeMap::new(),
                     pending_writes: Vec::new(),
+                    occ_write_semaphore: Arc::new(Semaphore::new(4)),
                     advance_timelines_interval,
                     secrets_controller,
                     caching_secrets_reader,

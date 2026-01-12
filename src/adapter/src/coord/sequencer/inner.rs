@@ -123,8 +123,11 @@ mod create_materialized_view;
 mod create_view;
 mod explain_timestamp;
 mod peek;
+mod read_then_write_subscribe;
 mod secret;
 mod subscribe;
+
+pub(crate) use read_then_write_subscribe::ReadThenWriteSubscribeStage;
 
 /// Attempts to evaluate an expression. If an error is returned then the error is sent
 /// to the client and the function is exited.
@@ -2040,8 +2043,6 @@ impl Coordinator {
                         response,
                         action,
                     },
-                    target_timestamp: None,
-                    timestamped_result_tx: None,
                 });
                 return;
             }
