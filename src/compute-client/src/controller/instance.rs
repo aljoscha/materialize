@@ -1553,7 +1553,12 @@ where
                     };
                     ComputeSinkConnection::ContinualTask(conn)
                 }
-                ComputeSinkConnection::Subscribe(conn) => ComputeSinkConnection::Subscribe(conn),
+                ComputeSinkConnection::Subscribe(conn) => {
+                    // Subscribe connections have explicit configuration (no type parameter to resolve).
+                    // For PersistBatches mode, the shard_id/persist_location/relation_desc are
+                    // provided explicitly by the adapter.
+                    ComputeSinkConnection::Subscribe(conn)
+                }
                 ComputeSinkConnection::CopyToS3Oneshot(conn) => {
                     ComputeSinkConnection::CopyToS3Oneshot(conn)
                 }
@@ -2204,6 +2209,7 @@ where
         // frontiers until all replicas have advanced to the empty one.
         let write_frontier = match &response {
             SubscribeResponse::Batch(batch) => batch.upper.clone(),
+            SubscribeResponse::StashedBatch(batch) => batch.upper.clone(),
             SubscribeResponse::DroppedAt(_) => Antichain::new(),
         };
 
@@ -2260,6 +2266,12 @@ where
                         },
                     ));
                 }
+            }
+            SubscribeResponse::StashedBatch(_batch) => {
+                // TODO: Forward stashed batch to adapter for processing.
+                // For now, this is unimplemented and will require adapter-side changes
+                // to read batches from persist and stream rows to the client.
+                unimplemented!("StashedBatch handling not yet implemented")
             }
             SubscribeResponse::DroppedAt(frontier) => {
                 // We should never get here: Replicas only drop subscribe collections in response

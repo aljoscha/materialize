@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 use differential_dataflow::lattice::Lattice;
 use mz_compute_types::ComputeInstanceId;
 use mz_compute_types::plan::Plan;
-use mz_compute_types::sinks::{ComputeSinkConnection, ComputeSinkDesc, SubscribeSinkConnection};
+use mz_compute_types::sinks::{
+    ComputeSinkConnection, ComputeSinkDesc, SubscribeOutputFormat, SubscribeSinkConnection,
+};
 use mz_ore::collections::CollectionExt;
 use mz_ore::soft_assert_or_log;
 use mz_repr::{GlobalId, RelationDesc, Timestamp};
@@ -209,7 +211,9 @@ impl Optimize<SubscribeFrom> for Optimizer {
                 let sink_description = ComputeSinkDesc {
                     from: from_id,
                     from_desc,
-                    connection: ComputeSinkConnection::Subscribe(SubscribeSinkConnection::default()),
+                    connection: ComputeSinkConnection::Subscribe(SubscribeSinkConnection {
+                        output_format: SubscribeOutputFormat::Rows,
+                    }),
                     with_snapshot: self.with_snapshot,
                     up_to: self.up_to.map(Antichain::from_elem).unwrap_or_default(),
                     // No `FORCE NOT NULL` for subscribes
@@ -248,7 +252,9 @@ impl Optimize<SubscribeFrom> for Optimizer {
                 let sink_description = ComputeSinkDesc {
                     from: self.view_id,
                     from_desc: RelationDesc::new(expr.typ(), desc.iter_names()),
-                    connection: ComputeSinkConnection::Subscribe(SubscribeSinkConnection::default()),
+                    connection: ComputeSinkConnection::Subscribe(SubscribeSinkConnection {
+                        output_format: SubscribeOutputFormat::Rows,
+                    }),
                     with_snapshot: self.with_snapshot,
                     up_to: self.up_to.map(Antichain::from_elem).unwrap_or_default(),
                     // No `FORCE NOT NULL` for subscribes

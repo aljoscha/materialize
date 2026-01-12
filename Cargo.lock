@@ -6029,6 +6029,7 @@ dependencies = [
  "mz-dyncfg",
  "mz-expr",
  "mz-ore",
+ "mz-persist-types",
  "mz-repr",
  "mz-storage-types",
  "serde",

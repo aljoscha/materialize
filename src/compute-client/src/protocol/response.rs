@@ -274,10 +274,12 @@ pub enum CopyToResponse {
 }
 
 /// Various responses that can be communicated about the progress of a SUBSCRIBE command.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SubscribeResponse<T = mz_repr::Timestamp> {
     /// A batch of updates over a non-empty interval of time.
     Batch(SubscribeBatch<T>),
+    /// A batch of updates stored in persist batches.
+    StashedBatch(StashedSubscribeBatch<T>),
     /// The SUBSCRIBE dataflow was dropped, leaving updates from this frontier onward unspecified.
     DroppedAt(Antichain<T>),
 }
@@ -285,8 +287,11 @@ pub enum SubscribeResponse<T = mz_repr::Timestamp> {
 impl<T> SubscribeResponse<T> {
     /// Converts `self` to an error if a maximum size is exceeded.
     pub fn to_error_if_exceeds(&mut self, max_result_size: usize) {
-        if let SubscribeResponse::Batch(batch) = self {
-            batch.to_error_if_exceeds(max_result_size);
+        match self {
+            SubscribeResponse::Batch(batch) => batch.to_error_if_exceeds(max_result_size),
+            // Stashed batches are already in persist, size was validated during creation.
+            SubscribeResponse::StashedBatch(_) => {}
+            SubscribeResponse::DroppedAt(_) => {}
         }
     }
 }
@@ -320,6 +325,34 @@ impl<T> SubscribeBatch<T> {
                 ));
             }
         }
+    }
+}
+
+/// A batch of subscribe updates that have been stashed in persist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StashedSubscribeBatch<T = mz_repr::Timestamp> {
+    /// The lower frontier of the batch of updates.
+    pub lower: Antichain<T>,
+    /// The upper frontier of the batch of updates.
+    pub upper: Antichain<T>,
+    /// The shard where batches are stored.
+    pub shard_id: ShardId,
+    /// Batches containing the updates, or an error if one occurred.
+    pub batches: Result<Vec<ProtoBatch>, String>,
+}
+
+impl<T: PartialEq> PartialEq for StashedSubscribeBatch<T> {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare frontiers and shard_id; batches are not compared since ProtoBatch
+        // doesn't implement PartialEq.
+        self.lower == other.lower
+            && self.upper == other.upper
+            && self.shard_id == other.shard_id
+            && match (&self.batches, &other.batches) {
+                (Ok(a), Ok(b)) => a.len() == b.len(),
+                (Err(a), Err(b)) => a == b,
+                _ => false,
+            }
     }
 }
 

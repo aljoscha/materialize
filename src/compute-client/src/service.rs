@@ -343,6 +343,24 @@ where
                     None
                 }
             }
+            SubscribeResponse::StashedBatch(batch) => {
+                // For stashed batches, update frontiers and forward directly.
+                // The batches are already in persist, so no need for stashing logic.
+                let frontiers = &mut tracked.frontiers;
+                let old_frontier = frontiers.frontier().to_owned();
+                frontiers.update_iter(batch.lower.iter().map(|t| (t.clone(), -1)));
+                frontiers.update_iter(batch.upper.iter().map(|t| (t.clone(), 1)));
+                let new_frontier = frontiers.frontier().to_owned();
+
+                if old_frontier != new_frontier && !tracked.dropped {
+                    Some(ComputeResponse::SubscribeResponse(
+                        subscribe_id,
+                        SubscribeResponse::StashedBatch(batch),
+                    ))
+                } else {
+                    None
+                }
+            }
             SubscribeResponse::DroppedAt(frontier) => {
                 tracked
                     .frontiers

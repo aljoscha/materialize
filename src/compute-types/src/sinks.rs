@@ -9,6 +9,7 @@
 
 //! Types for describing dataflow sinks.
 
+use mz_persist_types::{PersistLocation, ShardId};
 use mz_repr::refresh_schedule::RefreshSchedule;
 use mz_repr::{CatalogItemId, GlobalId, RelationDesc, Timestamp};
 use mz_storage_types::connections::aws::AwsConnection;
@@ -70,9 +71,35 @@ impl<S> ComputeSinkConnection<S> {
     }
 }
 
-/// TODO(database-issues#7533): Add documentation.
-#[derive(Default, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SubscribeSinkConnection {}
+/// Configuration for a subscribe sink.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SubscribeSinkConnection {
+    /// The output format for this subscribe.
+    pub output_format: SubscribeOutputFormat,
+}
+
+/// Configuration for subscribe sink output format.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum SubscribeOutputFormat {
+    /// Send results inline in SubscribeResponse as rows.
+    Rows,
+    /// Write results as persist batches to the specified shard.
+    PersistBatches(SubscribePersistBatchesConfig),
+}
+
+/// Configuration for persist batch output mode.
+///
+/// The target shard is a dedicated shard for this subscribe's batch output,
+/// distinct from any source collection shards.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SubscribePersistBatchesConfig {
+    /// The persist shard to write batches to.
+    pub shard_id: ShardId,
+    /// The persist location where the shard is located.
+    pub persist_location: PersistLocation,
+    /// The relation description for data written to the shard.
+    pub relation_desc: RelationDesc,
+}
 
 /// Connection attributes required to do a oneshot copy to s3.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

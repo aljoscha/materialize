@@ -941,6 +941,7 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
             if let Some(collection) = self.compute_state.collections.get_mut(&sink_id) {
                 let new_frontier = match &response {
                     SubscribeResponse::Batch(b) => b.upper.clone(),
+                    SubscribeResponse::StashedBatch(b) => b.upper.clone(),
                     SubscribeResponse::DroppedAt(_) => Antichain::new(),
                 };
 
