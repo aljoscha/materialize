@@ -25,7 +25,7 @@ use mz_storage_types::sources::Timeline;
 use mz_timestamp_oracle::TimestampOracle;
 use prometheus::Histogram;
 use timely::progress::Antichain;
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use uuid::Uuid;
 
 use crate::catalog::Catalog;
@@ -66,6 +66,8 @@ pub struct PeekClient {
     persist_client: PersistClient,
     /// Statement logging state for frontend peek sequencing.
     pub statement_logging_frontend: StatementLoggingFrontend,
+    /// Semaphore for limiting concurrent OCC (optimistic concurrency control) write operations.
+    pub occ_write_semaphore: Arc<Semaphore>,
 }
 
 impl PeekClient {
@@ -77,6 +79,7 @@ impl PeekClient {
         optimizer_metrics: OptimizerMetrics,
         persist_client: PersistClient,
         statement_logging_frontend: StatementLoggingFrontend,
+        occ_write_semaphore: Arc<Semaphore>,
     ) -> Self {
         Self {
             coordinator_client,
@@ -87,6 +90,7 @@ impl PeekClient {
             statement_logging_frontend,
             oracles: Default::default(), // lazily populated
             persist_client,
+            occ_write_semaphore,
         }
     }
 
@@ -149,6 +153,12 @@ impl PeekClient {
         self.coordinator_client.send(f(tx));
         rx.await
             .expect("if the coordinator is still alive, it shouldn't have dropped our call")
+    }
+
+    /// Returns a clone of the coordinator client, for use in cleanup guards
+    /// that need to send fire-and-forget commands.
+    pub(crate) fn coordinator_client(&self) -> &crate::Client {
+        &self.coordinator_client
     }
 
     /// Acquire read holds on the given compute/storage collections, and

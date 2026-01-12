@@ -255,11 +255,6 @@ pub enum AdapterError {
     AlterClusterTimeout,
     AlterClusterWhilePendingReplicas,
     AuthenticationError(AuthenticationError),
-    /// The requested write timestamp has already passed.
-    TimestampPassed {
-        target: Timestamp,
-        current: Timestamp,
-    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -623,7 +618,6 @@ impl AdapterError {
                 SqlState::INVALID_PASSWORD
             }
             AdapterError::AuthenticationError(_) => SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
-            AdapterError::TimestampPassed { .. } => SqlState::INTERNAL_ERROR,
         }
     }
 
@@ -962,13 +956,6 @@ impl fmt::Display for AdapterError {
             }
             AdapterError::AlterClusterWhilePendingReplicas => {
                 write!(f, "cannot alter clusters with pending updates")
-            }
-            AdapterError::TimestampPassed { target, current } => {
-                write!(
-                    f,
-                    "requested write timestamp {} has already passed (current: {})",
-                    target, current
-                )
             }
         }
     }

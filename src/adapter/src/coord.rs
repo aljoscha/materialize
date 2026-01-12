@@ -171,7 +171,7 @@ use thiserror::Error;
 use timely::progress::{Antichain, Timestamp as _};
 use tokio::runtime::Handle as TokioHandle;
 use tokio::select;
-use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
+use tokio::sync::{OwnedMutexGuard, Semaphore, mpsc, oneshot, watch};
 use tokio::time::{Interval, MissedTickBehavior};
 use tracing::{Instrument, Level, Span, debug, info, info_span, span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -231,6 +231,7 @@ mod indexes;
 mod introspection;
 mod message_handler;
 mod privatelink_status;
+mod read_then_write;
 mod sql;
 mod validity;
 
@@ -381,6 +382,9 @@ impl Message {
                 Command::UnregisterFrontendPeek { .. } => "unregister-frontend-peek",
                 Command::ExplainTimestamp { .. } => "explain-timestamp",
                 Command::FrontendStatementLogging(..) => "frontend-statement-logging",
+                Command::CreateReadThenWriteSubscribe { .. } => "create-read-then-write-subscribe",
+                Command::AttemptTimestampedWrite { .. } => "attempt-timestamped-write",
+                Command::DropReadThenWriteSubscribe { .. } => "drop-read-then-write-subscribe",
             },
             Message::ControllerReady {
                 controller: ControllerReadiness::Compute,
@@ -1794,6 +1798,23 @@ pub struct Coordinator {
 
     /// Pending writes waiting for a group commit.
     pending_writes: Vec<PendingWriteTxn>,
+
+    /// Semaphore to limit concurrent OCC (optimistic concurrency control)
+    /// read-then-write operations.
+    ///
+    /// When multiple read-then-write operations (DELETE/UPDATE) run
+    /// concurrently, each one maintains a subscribe that continually receives
+    /// updates and must consolidate data. Allowing too many concurrent
+    /// operations causes wasted work as all subscribes receive and process
+    /// updates even though only one can write at a given timestamp. Worst case,
+    /// with N concurrent occ loops, whenever one loop succeeds N-1 loops have
+    /// to update their state, so we do `O(n^2)` work.
+    ///
+    /// This semaphore (with 4 permits) limits concurrency at the operation
+    /// level. Each read-then-write operation acquires a permit before starting
+    /// its subscribe, ensuring bounded resource usage. Additional operations
+    /// wait until a permit becomes available.
+    occ_write_semaphore: Arc<Semaphore>,
 
     /// For the realtime timeline, an explicit SELECT or INSERT on a table will bump the
     /// table's timestamps, but there are cases where timestamps are not bumped but
@@ -3484,6 +3505,7 @@ impl Coordinator {
                         // writes.
                         let user_write_spans = self.pending_writes.iter().flat_map(|x| match x {
                             PendingWriteTxn::User{span, ..} => Some(span),
+                            PendingWriteTxn::InternalTimestamped{span, ..} => Some(span),
                             PendingWriteTxn::System{..} => None,
                         });
                         let span = match user_write_spans.exactly_one() {
@@ -4388,6 +4410,8 @@ pub fn serve(
                 }
 
                 let catalog = Arc::new(catalog);
+                let max_concurrent_occ_writes =
+                    usize::cast_from(catalog.system_config().max_concurrent_occ_writes());
 
                 let caching_secrets_reader = CachingSecretsReader::new(secrets_controller.reader());
                 let mut coord = Coordinator {
@@ -4412,6 +4436,7 @@ pub fn serve(
                     write_locks: BTreeMap::new(),
                     deferred_write_ops: BTreeMap::new(),
                     pending_writes: Vec::new(),
+                    occ_write_semaphore: Arc::new(Semaphore::new(max_concurrent_occ_writes)),
                     advance_timelines_interval,
                     secrets_controller,
                     caching_secrets_reader,

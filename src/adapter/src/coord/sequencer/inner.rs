@@ -139,6 +139,67 @@ macro_rules! return_if_err {
 
 pub(super) use return_if_err;
 
+/// Validates that all dependencies are valid for read-then-write operations.
+///
+/// Ensures all objects the selection depends on are valid for `ReadThenWrite` operations:
+///
+/// - They do not refer to any objects whose notion of time moves differently than that of
+///   user tables. This limitation is meant to ensure no writes occur between this read and the
+///   subsequent write.
+/// - They do not use mz_now(), whose time produced during read will differ from the write
+///   timestamp.
+pub(crate) fn validate_read_dependencies(
+    catalog: &Catalog,
+    id: &CatalogItemId,
+) -> Result<(), AdapterError> {
+    use CatalogItemType::*;
+    use mz_catalog::memory::objects;
+    let mut ids_to_check = Vec::new();
+    let valid = match catalog.try_get_entry(id) {
+        Some(entry) => {
+            if let CatalogItem::View(objects::View { optimized_expr, .. })
+            | CatalogItem::MaterializedView(objects::MaterializedView {
+                optimized_expr, ..
+            }) = entry.item()
+            {
+                if optimized_expr.contains_temporal() {
+                    return Err(AdapterError::Unsupported(
+                        "calls to mz_now in write statements",
+                    ));
+                }
+            }
+            match entry.item().typ() {
+                typ @ (Func | View | MaterializedView | ContinualTask) => {
+                    ids_to_check.extend(entry.uses());
+                    let valid_id = id.is_user() || matches!(typ, Func);
+                    valid_id
+                }
+                Source | Secret | Connection => false,
+                // Cannot select from sinks or indexes.
+                Sink | Index => unreachable!(),
+                Table => {
+                    if !id.is_user() {
+                        // We can't read from non-user tables
+                        false
+                    } else {
+                        // We can't read from tables that are source-exports
+                        entry.source_export_details().is_none()
+                    }
+                }
+                Type => true,
+            }
+        }
+        None => false,
+    };
+    if !valid {
+        return Err(AdapterError::InvalidTableMutationSelection);
+    }
+    for id in ids_to_check {
+        validate_read_dependencies(catalog, &id)?;
+    }
+    Ok(())
+}
+
 struct DropOps {
     ops: Vec<catalog::Op>,
     dropped_active_db: bool,
@@ -2040,8 +2101,6 @@ impl Coordinator {
                         response,
                         action,
                     },
-                    target_timestamp: None,
-                    timestamped_result_tx: None,
                 });
                 return;
             }
@@ -2664,66 +2723,6 @@ impl Coordinator {
                 "calls to mz_now in write statements",
             )));
             return;
-        }
-
-        // Ensure all objects `selection` depends on are valid for `ReadThenWrite` operations:
-        //
-        // - They do not refer to any objects whose notion of time moves differently than that of
-        // user tables. This limitation is meant to ensure no writes occur between this read and the
-        // subsequent write.
-        // - They do not use mz_now(), whose time produced during read will differ from the write
-        //   timestamp.
-        fn validate_read_dependencies(
-            catalog: &Catalog,
-            id: &CatalogItemId,
-        ) -> Result<(), AdapterError> {
-            use CatalogItemType::*;
-            use mz_catalog::memory::objects;
-            let mut ids_to_check = Vec::new();
-            let valid = match catalog.try_get_entry(id) {
-                Some(entry) => {
-                    if let CatalogItem::View(objects::View { optimized_expr, .. })
-                    | CatalogItem::MaterializedView(objects::MaterializedView {
-                        optimized_expr,
-                        ..
-                    }) = entry.item()
-                    {
-                        if optimized_expr.contains_temporal() {
-                            return Err(AdapterError::Unsupported(
-                                "calls to mz_now in write statements",
-                            ));
-                        }
-                    }
-                    match entry.item().typ() {
-                        typ @ (Func | View | MaterializedView | ContinualTask) => {
-                            ids_to_check.extend(entry.uses());
-                            let valid_id = id.is_user() || matches!(typ, Func);
-                            valid_id
-                        }
-                        Source | Secret | Connection => false,
-                        // Cannot select from sinks or indexes.
-                        Sink | Index => unreachable!(),
-                        Table => {
-                            if !id.is_user() {
-                                // We can't read from non-user tables
-                                false
-                            } else {
-                                // We can't read from tables that are source-exports
-                                entry.source_export_details().is_none()
-                            }
-                        }
-                        Type => true,
-                    }
-                }
-                None => false,
-            };
-            if !valid {
-                return Err(AdapterError::InvalidTableMutationSelection);
-            }
-            for id in ids_to_check {
-                validate_read_dependencies(catalog, &id)?;
-            }
-            Ok(())
         }
 
         for gid in selection.depends_on() {

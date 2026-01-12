@@ -1096,6 +1096,7 @@ impl SystemVars {
             &MAX_RESULT_SIZE,
             &MAX_COPY_FROM_SIZE,
             &ALLOWED_CLUSTER_REPLICA_SIZES,
+            &MAX_CONCURRENT_OCC_WRITES,
             &upsert_rocksdb::UPSERT_ROCKSDB_COMPACTION_STYLE,
             &upsert_rocksdb::UPSERT_ROCKSDB_OPTIMIZE_COMPACTION_MEMTABLE_BUDGET,
             &upsert_rocksdb::UPSERT_ROCKSDB_LEVEL_COMPACTION_DYNAMIC_LEVEL_BYTES,
@@ -1644,6 +1645,11 @@ impl SystemVars {
             .into_iter()
             .map(|s| s.as_str().into())
             .collect()
+    }
+
+    /// Returns the value of the `max_concurrent_occ_writes` configuration parameter.
+    pub fn max_concurrent_occ_writes(&self) -> u32 {
+        *self.expect_value(&MAX_CONCURRENT_OCC_WRITES)
     }
 
     /// Returns the value of the `default_cluster_replication_factor` configuration parameter.

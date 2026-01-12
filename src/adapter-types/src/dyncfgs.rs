@@ -131,6 +131,12 @@ pub const PERSIST_FAST_PATH_ORDER: Config<bool> = Config::new(
     "If set, send queries with a compatible literal constraint or ordering clause down the Persist fast path.",
 );
 
+pub const FRONTEND_READ_THEN_WRITE: Config<bool> = Config::new(
+    "enable_adapter_frontend_occ_read_then_write",
+    true,
+    "Use frontend sequencing for DELETE/UPDATE operations.",
+);
+
 /// Adds the full set of all adapter `Config`s.
 pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
     configs
@@ -151,4 +157,5 @@ pub fn all_dyncfgs(configs: ConfigSet) -> ConfigSet {
         .add(&ENABLE_PASSWORD_AUTH)
         .add(&CONSTRAINT_BASED_TIMESTAMP_SELECTION)
         .add(&PERSIST_FAST_PATH_ORDER)
+        .add(&FRONTEND_READ_THEN_WRITE)
 }
