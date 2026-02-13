@@ -31,7 +31,7 @@ use mz_persist_client::PersistClient;
 use mz_pgcopy::CopyFormatParams;
 use mz_repr::global_id::TransientIdGen;
 use mz_repr::role_id::RoleId;
-use mz_repr::{CatalogItemId, ColumnIndex, GlobalId, RowIterator, SqlRelationType};
+use mz_repr::{CatalogItemId, ColumnIndex, GlobalId, Row, RowIterator, SqlRelationType};
 use mz_sql::ast::{FetchDirection, Raw, Statement};
 use mz_sql::catalog::ObjectType;
 use mz_sql::optimizer_metrics::OptimizerMetrics;
@@ -86,7 +86,7 @@ pub enum Command {
     },
 
     AuthenticatePassword {
-        tx: oneshot::Sender<Result<(), AdapterError>>,
+        tx: oneshot::Sender<Result<AuthResponse, AdapterError>>,
         role_name: String,
         password: Option<Password>,
     },
@@ -260,6 +260,9 @@ pub enum Command {
     /// Register a pending peek initiated by frontend sequencing. This is needed for:
     /// - statement logging
     /// - query cancellation
+    ///
+    /// Fire-and-forget: no response channel. The coordinator always succeeds at registration
+    /// (watch set installation failures are logged but don't prevent the peek from proceeding).
     RegisterFrontendPeek {
         uuid: Uuid,
         conn_id: ConnectionId,
@@ -269,16 +272,16 @@ pub enum Command {
         /// If statement logging is enabled, contains all info needed for installing watch sets
         /// and logging the statement execution.
         watch_set: Option<WatchSetCreation>,
-        tx: oneshot::Sender<Result<(), AdapterError>>,
     },
 
     /// Unregister a pending peek that was registered but failed to issue.
     /// This is used for cleanup when `client.peek()` fails after `RegisterFrontendPeek` succeeds.
     /// The `ExecuteContextExtra` is dropped without logging the statement retirement, because the
     /// frontend will log the error.
+    ///
+    /// Fire-and-forget: no response channel needed.
     UnregisterFrontendPeek {
         uuid: Uuid,
-        tx: oneshot::Sender<()>,
     },
 
     /// Generate a timestamp explanation.
@@ -372,20 +375,12 @@ pub struct Response<T> {
     pub otel_ctx: OpenTelemetryContext,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct SuperuserAttribute(pub Option<bool>);
-
 /// The response to [`Client::startup`](crate::Client::startup).
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub struct StartupResponse {
     /// RoleId for the user.
     pub role_id: RoleId,
-    /// The role's superuser attribute in the Catalog.
-    /// This attribute is None for Cloud. Cloud is able
-    /// to derive the role's superuser status from
-    /// external_metadata_rx.
-    pub superuser_attribute: SuperuserAttribute,
     /// A future that completes when all necessary Builtin Table writes have completed.
     #[derivative(Debug = "ignore")]
     pub write_notify: BuiltinTableAppendNotify,
@@ -402,6 +397,20 @@ pub struct StartupResponse {
     pub optimizer_metrics: OptimizerMetrics,
     pub persist_client: PersistClient,
     pub statement_logging_frontend: StatementLoggingFrontend,
+    /// Optional mock data for peek testing. When set, PeekClient will return
+    /// these rows for PeekExisting queries on the given GlobalIds, bypassing
+    /// the compute layer entirely.
+    pub mock_peek_data: Option<BTreeMap<GlobalId, Vec<Row>>>,
+}
+
+/// The response to [`Client::authenticate`](crate::Client::authenticate).
+#[derive(Derivative)]
+#[derivative(Debug)]
+pub struct AuthResponse {
+    /// RoleId for the user.
+    pub role_id: RoleId,
+    /// If the user is a superuser.
+    pub superuser: bool,
 }
 
 #[derive(Derivative)]
@@ -417,6 +426,7 @@ pub struct SASLChallengeResponse {
 #[derivative(Debug)]
 pub struct SASLVerifyProofResponse {
     pub verifier: String,
+    pub auth_resp: AuthResponse,
 }
 
 // Facile implementation for `StartupResponse`, which does not use the `allowed`

@@ -120,8 +120,8 @@ pub use statement::ddl::{
     PlannedAlterRoleOption, PlannedRoleVariable, SqlServerConfigOptionExtracted,
 };
 pub use statement::{
-    StatementClassification, StatementContext, StatementDesc, describe, plan, plan_copy_from,
-    resolve_cluster_for_materialized_view,
+    StatementClassification, StatementContext, StatementDesc, describe, plan,
+    plan_and_describe_select, plan_copy_from, resolve_cluster_for_materialized_view,
 };
 
 use self::statement::ddl::ClusterAlterOptionExtracted;

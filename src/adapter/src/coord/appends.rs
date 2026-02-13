@@ -24,7 +24,7 @@ use mz_ore::metrics::MetricsFutureExt;
 use mz_ore::task;
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_ore::{assert_none, instrument};
-use mz_repr::{CatalogItemId, Timestamp};
+use mz_repr::{CatalogItemId, GlobalId, Timestamp};
 use mz_sql::names::ResolvedIds;
 use mz_sql::plan::{ExplainPlanPlan, ExplainTimestampPlan, Explainee, ExplaineeStatement, Plan};
 use mz_sql::session::metadata::SessionMetadata;
@@ -1059,10 +1059,35 @@ pub(crate) fn waiting_on_startup_appends(
         Some(wait_future) => {
             let depends_on = depends_on
                 .into_iter()
-                .map(|gid| catalog.get_entry_by_global_id(&gid).id())
+                .map(|gid| catalog.resolve_item_id(&gid))
                 .collect();
             Some((depends_on, wait_future.boxed()))
         }
         None => None,
     }
+}
+
+/// Variant of [`waiting_on_startup_appends`] that accepts pre-computed `source_ids`
+/// to avoid redundant `depends_on()` calls when the caller has already computed them.
+pub(crate) fn waiting_on_startup_appends_with_source_ids(
+    catalog: &Catalog,
+    session: &mut Session,
+    source_ids: &BTreeSet<GlobalId>,
+) -> Option<BoxFuture<'static, ()>> {
+    let depends_on_required_id = REQUIRED_BUILTIN_TABLES
+        .iter()
+        .map(|table| catalog.resolve_builtin_table(&**table))
+        .any(|id| {
+            catalog
+                .get_global_ids(&id)
+                .any(|gid| source_ids.contains(&gid))
+        });
+
+    if !depends_on_required_id {
+        return None;
+    }
+
+    session
+        .clear_builtin_table_updates()
+        .map(|wait_future| wait_future.boxed())
 }

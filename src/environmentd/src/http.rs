@@ -42,7 +42,6 @@ use hyper_openssl::client::legacy::MaybeHttpsStream;
 use hyper_util::rt::TokioIo;
 use mz_adapter::session::{Session as AdapterSession, SessionConfig as AdapterSessionConfig};
 use mz_adapter::{AdapterError, AdapterNotice, Client, SessionClient, WebhookAppenderCache};
-use mz_auth::Authenticated;
 use mz_auth::password::Password;
 use mz_authenticator::Authenticator;
 use mz_controller::ReplicaHttpLocator;
@@ -53,7 +52,7 @@ use mz_ore::metrics::MetricsRegistry;
 use mz_ore::now::{NowFn, SYSTEM_TIME, epoch_to_uuid_v7};
 use mz_ore::str::StrExt;
 use mz_pgwire_common::{ConnectionCounter, ConnectionHandle};
-use mz_repr::user::ExternalUserMetadata;
+use mz_repr::user::{ExternalUserMetadata, InternalUserMetadata};
 use mz_server_core::listeners::{AllowedRoles, AuthenticatorKind, HttpRoutesEnabled};
 use mz_server_core::{Connection, ConnectionHandler, ReloadingSslContext, Server};
 use mz_sql::session::metadata::SessionMetadata;
@@ -557,7 +556,7 @@ async fn x_materialize_user_header_auth(mut req: Request, next: Next) -> impl In
         req.extensions_mut().insert(AuthedUser {
             name: username,
             external_metadata_rx: None,
-            authenticated: Authenticated,
+            internal_metadata: None,
         });
     }
     Ok(next.run(req).await)
@@ -575,7 +574,7 @@ enum ConnProtocol {
 pub struct AuthedUser {
     name: String,
     external_metadata_rx: Option<watch::Receiver<ExternalUserMetadata>>,
-    authenticated: Authenticated,
+    internal_metadata: Option<InternalUserMetadata>,
 }
 
 pub struct AuthedClient {
@@ -598,17 +597,14 @@ impl AuthedClient {
         F: FnOnce(&mut AdapterSession),
     {
         let conn_id = adapter_client.new_conn_id()?;
-        let mut session = adapter_client.new_session(
-            AdapterSessionConfig {
-                conn_id,
-                uuid: epoch_to_uuid_v7(&(now)()),
-                user: user.name,
-                client_ip: Some(peer_addr),
-                external_metadata_rx: user.external_metadata_rx,
-                helm_chart_version,
-            },
-            user.authenticated,
-        );
+        let mut session = adapter_client.new_session(AdapterSessionConfig {
+            conn_id,
+            uuid: epoch_to_uuid_v7(&(now)()),
+            user: user.name,
+            client_ip: Some(peer_addr),
+            external_metadata_rx: user.external_metadata_rx,
+            helm_chart_version,
+        });
         let connection_guard = active_connection_counter.allocate_connection(session.user())?;
 
         session_config(&mut session);
@@ -768,8 +764,8 @@ pub async fn handle_login(
     let Ok(adapter_client) = adapter_client_rx.clone().await else {
         return StatusCode::INTERNAL_SERVER_ERROR;
     };
-    let authenticated = match adapter_client.authenticate(&username, &password).await {
-        Ok(authenticated) => authenticated,
+    let auth_response = match adapter_client.authenticate(&username, &password).await {
+        Ok(auth_response) => auth_response,
         Err(err) => {
             warn!(?err, "HTTP login failed authentication");
             return StatusCode::UNAUTHORIZED;
@@ -780,7 +776,9 @@ pub async fn handle_login(
         username,
         created_at: SystemTime::now(),
         last_activity: SystemTime::now(),
-        authenticated,
+        internal_metadata: InternalUserMetadata {
+            superuser: auth_response.superuser,
+        },
     };
     // Store session data
     let session = session.and_then(|Extension(session)| Some(session));
@@ -837,7 +835,7 @@ async fn http_auth(
             req.extensions_mut().insert(AuthedUser {
                 name: session_data.username,
                 external_metadata_rx: None,
-                authenticated: session_data.authenticated,
+                internal_metadata: Some(session_data.internal_metadata),
             });
             return Ok(next.run(req).await);
         }
@@ -997,22 +995,22 @@ async fn auth(
     allowed_roles: AllowedRoles,
     include_www_authenticate_header: bool,
 ) -> Result<AuthedUser, AuthError> {
-    let (name, external_metadata_rx, authenticated) = match authenticator {
+    let (name, external_metadata_rx, internal_metadata) = match authenticator {
         Authenticator::Frontegg(frontegg) => match creds {
             Some(Credentials::Password { username, password }) => {
-                let (auth_session, authenticated) =
+                let (auth_session, _authenticated) =
                     frontegg.authenticate(&username, &password.0).await?;
                 let name = auth_session.user().into();
                 let external_metadata_rx = Some(auth_session.external_metadata_rx());
-                (name, external_metadata_rx, authenticated)
+                (name, external_metadata_rx, None)
             }
             Some(Credentials::Token { token }) => {
-                let (claims, authenticated) = frontegg.validate_access_token(&token, None)?;
+                let (claims, _authenticated) = frontegg.validate_access_token(&token, None)?;
                 let (_, external_metadata_rx) = watch::channel(ExternalUserMetadata {
                     user_id: claims.user_id,
                     admin: claims.is_admin,
                 });
-                (claims.user, Some(external_metadata_rx), authenticated)
+                (claims.user, Some(external_metadata_rx), None)
             }
             None => {
                 return Err(AuthError::MissingHttpAuthentication {
@@ -1022,11 +1020,14 @@ async fn auth(
         },
         Authenticator::Password(adapter_client) => match creds {
             Some(Credentials::Password { username, password }) => {
-                let authenticated = adapter_client
+                let auth_response = adapter_client
                     .authenticate(&username, &password)
                     .await
                     .map_err(|_| AuthError::InvalidCredentials)?;
-                (username, None, authenticated)
+                let internal_metadata = Some(InternalUserMetadata {
+                    superuser: auth_response.superuser,
+                });
+                (username, None, internal_metadata)
             }
             _ => {
                 return Err(AuthError::MissingHttpAuthentication {
@@ -1045,21 +1046,21 @@ async fn auth(
         Authenticator::Oidc(oidc) => match creds {
             Some(Credentials::Token { token }) => {
                 // Validate JWT token
-                let (claims, authenticated) = oidc
+                let (claims, _authenticated) = oidc
                     .authenticate(&token, None)
                     .await
                     .map_err(|_| AuthError::InvalidCredentials)?;
                 let name = claims.username().to_string();
-                (name, None, authenticated)
+                (name, None, None)
             }
             Some(Credentials::Password { username, password }) => {
                 // Allow JWT to be passed as password
-                let (claims, authenticated) = oidc
+                let (claims, _authenticated) = oidc
                     .authenticate(&password.0, Some(&username))
                     .await
                     .map_err(|_| AuthError::InvalidCredentials)?;
                 let name = claims.username().to_string();
-                (name, None, authenticated)
+                (name, None, None)
             }
             None => {
                 return Err(AuthError::MissingHttpAuthentication {
@@ -1075,7 +1076,7 @@ async fn auth(
                 Some(Credentials::Password { username, .. }) => username,
                 _ => HTTP_DEFAULT_USER.name.to_owned(),
             };
-            (name, None, Authenticated)
+            (name, None, None)
         }
     };
 
@@ -1084,7 +1085,7 @@ async fn auth(
     Ok(AuthedUser {
         name,
         external_metadata_rx,
-        authenticated,
+        internal_metadata,
     })
 }
 
@@ -1151,7 +1152,7 @@ pub struct TowerSessionData {
     username: String,
     created_at: SystemTime,
     last_activity: SystemTime,
-    authenticated: Authenticated,
+    internal_metadata: InternalUserMetadata,
 }
 
 #[cfg(test)]

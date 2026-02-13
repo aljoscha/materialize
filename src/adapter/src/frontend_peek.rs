@@ -10,12 +10,12 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use itertools::{Either, Itertools};
 use mz_adapter_types::dyncfgs::CONSTRAINT_BASED_TIMESTAMP_SELECTION;
 use mz_adapter_types::timestamp_selection::ConstraintBasedTimestampSelection;
 use mz_compute_types::ComputeInstanceId;
-use mz_controller_types::ClusterId;
 use mz_expr::{CollectionPlan, ResultSpec};
 use mz_ore::cast::{CastFrom, CastLossy};
 use mz_ore::collections::CollectionExt;
@@ -23,7 +23,7 @@ use mz_ore::now::EpochMillis;
 use mz_ore::{soft_assert_eq_or_log, soft_assert_or_log, soft_panic_or_log};
 use mz_repr::optimize::{OptimizerFeatures, OverrideFrom};
 use mz_repr::role_id::RoleId;
-use mz_repr::{Datum, GlobalId, IntoRowIterator, Timestamp};
+use mz_repr::{Datum, GlobalId, IntoRowIterator, RelationDesc, Timestamp};
 use mz_sql::ast::Raw;
 use mz_sql::catalog::CatalogCluster;
 use mz_sql::plan::Params;
@@ -32,11 +32,15 @@ use mz_sql::rbac;
 use mz_sql::session::metadata::SessionMetadata;
 use mz_sql::session::vars::IsolationLevel;
 use mz_sql_parser::ast::{CopyDirection, CopyRelation, ExplainStage, ShowStatement, Statement};
+use mz_storage_types::sources::Timeline;
 use mz_transform::EmptyStatisticsOracle;
 use mz_transform::dataflow::DataflowMetainfo;
 use opentelemetry::trace::TraceContextExt;
-use tracing::{Span, debug, warn};
+use timely::progress::{Antichain, Timestamp as TimelyTimestamp};
+use tracing::{Span, debug};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+use mz_catalog::memory::objects::CatalogItem;
 
 use crate::catalog::{Catalog, CatalogState};
 use crate::command::Command;
@@ -52,6 +56,7 @@ use crate::explain::insights::PlanInsightsContext;
 use crate::explain::optimizer_trace::OptimizerTrace;
 use crate::optimize::dataflows::{ComputeInstanceSnapshot, DataflowBuilder};
 use crate::optimize::{Optimize, OptimizerError};
+use crate::peek_client::PlanCacheEntry;
 use crate::session::{Session, TransactionOps, TransactionStatus};
 use crate::statement_logging::WatchSetCreation;
 use crate::statement_logging::{StatementEndedExecutionReason, StatementLifecycleEvent};
@@ -61,7 +66,120 @@ use crate::{
 };
 use crate::{coord, metrics};
 
+/// Extract the target ReadHold from a ReadHolds struct for a fast-path peek plan.
+/// This removes the appropriate hold from the ReadHolds (compute hold for PeekExisting,
+/// storage hold for PeekPersist) and returns it. For Constant plans, returns None.
+fn extract_target_read_hold(
+    peek_plan: &PeekPlan,
+    compute_instance: ComputeInstanceId,
+    read_holds: &mut ReadHolds<Timestamp>,
+) -> Option<mz_storage_types::read_holds::ReadHold<Timestamp>> {
+    match peek_plan {
+        PeekPlan::FastPath(FastPathPlan::PeekExisting(_coll_id, idx_id, _, _)) => Some(
+            read_holds
+                .compute_holds
+                .remove(&(compute_instance, *idx_id))
+                .expect("missing compute read hold for PeekExisting"),
+        ),
+        PeekPlan::FastPath(FastPathPlan::PeekPersist(coll_id, _, _)) => Some(
+            read_holds
+                .storage_holds
+                .remove(coll_id)
+                .expect("missing storage read hold for PeekPersist"),
+        ),
+        _ => None,
+    }
+}
+
 impl PeekClient {
+    /// Fast path that bypasses declare/portal for plan-cached queries.
+    ///
+    /// Called directly from the pgwire simple query path when the plan cache
+    /// has this SQL. Handles statement logging, query metrics, and delegates
+    /// to `try_frontend_peek_cached`. Returns `Ok(Some(response))` if handled.
+    pub(crate) async fn try_cached_peek_direct(
+        &mut self,
+        session: &mut Session,
+        catalog: Arc<Catalog>,
+        cached: Arc<PlanCacheEntry>,
+        params: &Params,
+        logging: &Arc<qcell::QCell<crate::statement_logging::PreparedStatementLoggingInfo>>,
+        lifecycle_timestamps: crate::session::LifecycleTimestamps,
+    ) -> Result<Option<ExecuteResponse>, AdapterError> {
+        // Increment query_total metric using cached counter handle.
+        let session_type = metrics::session_type_label_value(session.user());
+        let statement_type = metrics::statement_type_label_value(&cached.parsed_stmt);
+        self.query_total_counter(session_type, statement_type).inc();
+
+        // Set up statement logging.
+        let statement_logging_id = {
+            let result = self.statement_logging_frontend.begin_statement_execution(
+                session,
+                params,
+                logging,
+                catalog.system_config(),
+                Some(lifecycle_timestamps),
+            );
+            if let Some((logging_id, began_execution, mseh_update, prepared_statement)) = result {
+                self.log_began_execution(began_execution, mseh_update, prepared_statement);
+                Some(logging_id)
+            } else {
+                None
+            }
+        };
+
+        let peek_start = Instant::now();
+
+        let result = self
+            .try_frontend_peek_cached(session, catalog, cached, statement_logging_id)
+            .await;
+
+        // Log end of execution (mirrors try_frontend_peek).
+        if let Some(logging_id) = statement_logging_id {
+            let reason = match &result {
+                Ok(Some(ExecuteResponse::SendingRowsStreaming { .. })) => {
+                    self.peek_outer_histogram()
+                        .observe(peek_start.elapsed().as_secs_f64());
+                    return result;
+                }
+                Ok(Some(resp @ ExecuteResponse::CopyTo { resp: inner, .. })) => {
+                    match inner.as_ref() {
+                        ExecuteResponse::SendingRowsStreaming { .. } => {
+                            self.peek_outer_histogram()
+                                .observe(peek_start.elapsed().as_secs_f64());
+                            return result;
+                        }
+                        _ => resp.into(),
+                    }
+                }
+                Ok(None) => {
+                    soft_panic_or_log!(
+                        "Bailed out from try_frontend_peek_cached after logging began"
+                    );
+                    self.log_ended_execution(
+                        logging_id,
+                        StatementEndedExecutionReason::Errored {
+                            error: "Internal error: bailed out from try_frontend_peek_cached"
+                                .to_string(),
+                        },
+                    );
+                    self.peek_outer_histogram()
+                        .observe(peek_start.elapsed().as_secs_f64());
+                    return result;
+                }
+                Ok(Some(resp)) => resp.into(),
+                Err(e) => StatementEndedExecutionReason::Errored {
+                    error: e.to_string(),
+                },
+            };
+            self.log_ended_execution(logging_id, reason);
+        }
+
+        self.peek_outer_histogram()
+            .observe(peek_start.elapsed().as_secs_f64());
+        result
+    }
+
     /// Attempt to sequence a peek from the session task.
     ///
     /// Returns `Ok(Some(response))` if we handled the peek, or `Ok(None)` to fall back to the
@@ -74,6 +192,11 @@ impl PeekClient {
         portal_name: &str,
         session: &mut Session,
         outer_ctx_extra: &mut Option<ExecuteContextGuard>,
+        declare_catalog: Option<Arc<Catalog>>,
+        declare_resolved_ids: Option<mz_sql::names::ResolvedIds>,
+        declare_plan: Option<mz_sql::plan::Plan>,
+        declare_sql: Option<Arc<str>>,
+        declare_desc: Option<mz_sql::plan::StatementDesc>,
     ) -> Result<Option<ExecuteResponse>, AdapterError> {
         // # From handle_execute
 
@@ -90,13 +213,12 @@ impl PeekClient {
             }
         }
 
-        // TODO(peek-seq): This snapshot is wasted when we end up bailing out from the frontend peek
-        // sequencing. We could solve this is with that optimization where we
-        // continuously keep a catalog snapshot in the session, and only get a new one when the
-        // catalog revision has changed, which we could see with an atomic read.
-        // But anyhow, this problem will just go away when we reach the point that we never fall
-        // back to the old sequencing.
-        let catalog = self.catalog_snapshot("try_frontend_peek").await;
+        // Reuse the catalog snapshot from declare() if available, avoiding a
+        // redundant round-trip through the adapter command channel.
+        let catalog = match declare_catalog {
+            Some(catalog) => catalog,
+            None => self.catalog_snapshot("try_frontend_peek").await,
+        };
 
         // Extract things from the portal.
         let (stmt, params, logging, lifecycle_timestamps) = {
@@ -220,8 +342,20 @@ impl PeekClient {
                 .and_then(|guard| guard.defuse().retire())
         };
 
+        let peek_start = Instant::now();
+
         let result = self
-            .try_frontend_peek_inner(session, catalog, stmt, params, statement_logging_id)
+            .try_frontend_peek_inner(
+                session,
+                catalog,
+                stmt,
+                params,
+                statement_logging_id,
+                declare_resolved_ids,
+                declare_plan,
+                declare_sql,
+                declare_desc,
+            )
             .await;
 
         // Log the end of execution if we are logging this statement and execution has already
@@ -232,6 +366,10 @@ impl PeekClient {
                 Ok(Some(ExecuteResponse::SendingRowsStreaming { .. })) => {
                     // Don't log here - the peek is still executing.
                     // It will be logged when handle_peek_notification is called.
+                    self.metrics()
+                        .frontend_peek_seconds
+                        .with_label_values(&["try_frontend_peek"])
+                        .observe(peek_start.elapsed().as_secs_f64());
                     return result;
                 }
                 // COPY TO needs to check its inner response
@@ -240,6 +378,10 @@ impl PeekClient {
                         ExecuteResponse::SendingRowsStreaming { .. } => {
                             // Don't log here - the peek is still executing.
                             // It will be logged when handle_peek_notification is called.
+                            self.metrics()
+                                .frontend_peek_seconds
+                                .with_label_values(&["try_frontend_peek"])
+                                .observe(peek_start.elapsed().as_secs_f64());
                             return result;
                         }
                         // For non-streaming COPY TO responses, use the outer CopyTo for conversion
@@ -260,6 +402,10 @@ impl PeekClient {
                                 .to_string(),
                         },
                     );
+                    self.metrics()
+                        .frontend_peek_seconds
+                        .with_label_values(&["try_frontend_peek"])
+                        .observe(peek_start.elapsed().as_secs_f64());
                     return result;
                 }
                 // All other success responses - use the From implementation
@@ -275,11 +421,16 @@ impl PeekClient {
             self.log_ended_execution(logging_id, reason);
         }
 
+        self.metrics()
+            .frontend_peek_seconds
+            .with_label_values(&["try_frontend_peek"])
+            .observe(peek_start.elapsed().as_secs_f64());
         result
     }
 
     /// This is encapsulated in an inner function so that the outer function can still do statement
     /// logging after the `?` returns of the inner function.
+    #[mz_ore::instrument(level = "debug")]
     async fn try_frontend_peek_inner(
         &mut self,
         session: &mut Session,
@@ -287,7 +438,13 @@ impl PeekClient {
         stmt: Option<Arc<Statement<Raw>>>,
         params: Params,
         statement_logging_id: Option<crate::statement_logging::StatementLoggingId>,
+        declare_resolved_ids: Option<mz_sql::names::ResolvedIds>,
+        declare_plan: Option<mz_sql::plan::Plan>,
+        declare_sql: Option<Arc<str>>,
+        declare_desc: Option<mz_sql::plan::StatementDesc>,
     ) -> Result<Option<ExecuteResponse>, AdapterError> {
+        let inner_start = Instant::now();
+
         let stmt = match stmt {
             Some(stmt) => stmt,
             None => {
@@ -304,15 +461,44 @@ impl PeekClient {
             ])
             .inc();
 
+        // Plan cache fast path: if we have a cached optimization result for this SQL,
+        // skip planning and optimization entirely and jump to timestamp determination
+        // and peek execution.
+        if let Some(sql_key) = &declare_sql {
+            if let Some(cached) = self.plan_cache.get(sql_key).map(Arc::clone) {
+                return self
+                    .try_frontend_peek_cached(session, catalog, cached, statement_logging_id)
+                    .await;
+            }
+        }
+
         // # From handle_execute_inner
 
-        let conn_catalog = catalog.for_session(session);
-        // (`resolved_ids` should be derivable from `stmt`. If `stmt` is later transformed to
-        // remove/add IDs, then `resolved_ids` should be updated to also remove/add those IDs.)
-        let (stmt, resolved_ids) = mz_sql::names::resolve(&conn_catalog, (*stmt).clone())?;
-
-        let pcx = session.pcx();
-        let plan = mz_sql::plan::plan(Some(pcx), &conn_catalog, stmt, &params, &resolved_ids)?;
+        // Reuse the plan and resolved_ids from declare() if available, avoiding
+        // redundant name resolution and planning (which each call plan_root_query).
+        let (plan, resolved_ids, conn_catalog) = match (declare_plan, declare_resolved_ids) {
+            (Some(plan), Some(resolved_ids)) => {
+                // We have both the plan and resolved_ids from declare().
+                // We still need a conn_catalog for RBAC and downstream processing.
+                let conn_catalog = catalog.for_session(session);
+                (plan, resolved_ids, conn_catalog)
+            }
+            _ => {
+                // Fall back to the full resolve + plan path.
+                let conn_catalog = catalog.for_session(session);
+                let (resolved_stmt, resolved_ids) =
+                    mz_sql::names::resolve(&conn_catalog, (*stmt).clone())?;
+                let pcx = session.pcx();
+                let plan = mz_sql::plan::plan(
+                    Some(pcx),
+                    &conn_catalog,
+                    resolved_stmt,
+                    &params,
+                    &resolved_ids,
+                )?;
+                (plan, resolved_ids, conn_catalog)
+            }
+        };
 
         let (select_plan, explain_ctx, copy_to_ctx) = match &plan {
             Plan::Select(select_plan) => {
@@ -430,13 +616,22 @@ impl PeekClient {
         // We have checked the plan kind above.
         assert!(plan.allowed_in_read_only());
 
+        // Compute source_ids early so we can share them across multiple consumers
+        // (auto_run_on_catalog_server, validate_timeline_context, check_log_reads, etc.)
+        // instead of calling depends_on() independently in each.
+        let source_ids = select_plan.source.depends_on();
+        let could_run_expensive_function = select_plan.source.could_run_expensive_function();
+
         let target_cluster = match session.transaction().cluster() {
             // Use the current transaction's cluster.
             Some(cluster_id) => TargetCluster::Transaction(cluster_id),
             // If there isn't a current cluster set for a transaction, then try to auto route.
-            None => {
-                coord::catalog_serving::auto_run_on_catalog_server(&conn_catalog, session, &plan)
-            }
+            None => coord::catalog_serving::auto_run_on_catalog_server_with_source_ids(
+                &conn_catalog,
+                session,
+                &source_ids,
+                could_run_expensive_function,
+            ),
         };
         let (cluster, target_cluster_id, target_cluster_name) = {
             let cluster = catalog.resolve_target_cluster(target_cluster, session)?;
@@ -465,9 +660,11 @@ impl PeekClient {
             &resolved_ids,
         )?;
 
-        if let Some((_, wait_future)) =
-            coord::appends::waiting_on_startup_appends(&*catalog, session, &plan)
-        {
+        if let Some(wait_future) = coord::appends::waiting_on_startup_appends_with_source_ids(
+            &*catalog,
+            session,
+            &source_ids,
+        ) {
             wait_future.await;
         }
 
@@ -544,11 +741,31 @@ impl PeekClient {
             })
             .transpose()?;
 
-        let source_ids = select_plan.source.depends_on();
+        // Fast path for validate_timeline_context: when the query depends on a single
+        // Table or Source, we can return the timeline directly without creating BTreeSets,
+        // Vecs, or traversing transitive dependencies.
         // TODO(peek-seq): validate_timeline_context can be expensive in real scenarios (not in
         // simple benchmarks), because it traverses transitive dependencies even of indexed views and
         // materialized views (also traversing their MIR plans).
-        let mut timeline_context = catalog.validate_timeline_context(source_ids.iter().copied())?;
+        let mut timeline_context = if source_ids.len() == 1 {
+            let gid = *source_ids.iter().next().unwrap();
+            if let Some(item_id) = catalog.try_resolve_item_id(&gid) {
+                let entry = catalog.state().get_entry(&item_id);
+                match entry.item() {
+                    CatalogItem::Table(table) => {
+                        TimelineContext::TimelineDependent(table.timeline())
+                    }
+                    CatalogItem::Source(source) => {
+                        TimelineContext::TimelineDependent(source.timeline.clone())
+                    }
+                    _ => catalog.validate_timeline_context(source_ids.iter().copied())?,
+                }
+            } else {
+                catalog.validate_timeline_context(source_ids.iter().copied())?
+            }
+        } else {
+            catalog.validate_timeline_context(source_ids.iter().copied())?
+        };
         if matches!(timeline_context, TimelineContext::TimestampIndependent)
             && select_plan.source.contains_temporal()?
         {
@@ -577,8 +794,8 @@ impl PeekClient {
         let oracle_read_ts = match timeline {
             Some(timeline) if needs_linearized_read_ts => {
                 let oracle = self.ensure_oracle(timeline).await?;
-                let oracle_read_ts = oracle.read_ts().await;
-                Some(oracle_read_ts)
+                let ts = oracle.read_ts().await;
+                Some(ts)
             }
             Some(_) | None => None,
         };
@@ -623,7 +840,9 @@ impl PeekClient {
             .in_immediate_multi_stmt_txn(&select_plan.when);
 
         // Fetch or generate a timestamp for this query and fetch or acquire read holds.
-        let (determination, read_holds) = match session.get_transaction_timestamp_determination() {
+        let (determination, mut read_holds) = match session
+            .get_transaction_timestamp_determination()
+        {
             // Use the transaction's timestamp if it exists and this isn't an AS OF query.
             // (`in_immediate_multi_stmt_txn` is false for AS OF queries.)
             Some(
@@ -783,22 +1002,34 @@ impl PeekClient {
         // necessary to support PG's `BEGIN` semantics, whose behavior can
         // depend on whether or not reads have occurred in the txn.
         let requires_linearization = (&explain_ctx).into();
-        let mut transaction_determination = determination.clone();
-        if select_plan.when.is_transactional() {
-            session.add_transaction_ops(TransactionOps::Peeks {
-                determination: transaction_determination,
-                cluster_id: target_cluster_id,
-                requires_linearization,
-            })?;
-        } else if matches!(session.transaction(), &TransactionStatus::InTransaction(_)) {
-            // If the query uses AS OF, then ignore the timestamp.
-            transaction_determination.timestamp_context = TimestampContext::NoTimestamp;
-            session.add_transaction_ops(TransactionOps::Peeks {
-                determination: transaction_determination,
-                cluster_id: target_cluster_id,
-                requires_linearization,
-            })?;
-        };
+        // For implicit single-statement transactions (the common case for simple
+        // SELECT queries via the simple query protocol), skip recording transaction
+        // ops. The ops are only needed for multi-statement transactions to ensure
+        // consistent timestamps across statements. For implicit single-statement
+        // transactions, the transaction is immediately committed locally via
+        // end_transaction_local() which just drops the ops without reading them.
+        // This avoids cloning the entire TimestampDetermination (including
+        // Antichain Vecs) on every query.
+        if !session.transaction().is_implicit()
+            || session.transaction().is_in_multi_statement_transaction()
+        {
+            let mut transaction_determination = determination.clone();
+            if select_plan.when.is_transactional() {
+                session.add_transaction_ops(TransactionOps::Peeks {
+                    determination: transaction_determination,
+                    cluster_id: target_cluster_id,
+                    requires_linearization,
+                })?;
+            } else if matches!(session.transaction(), &TransactionStatus::InTransaction(_)) {
+                // If the query uses AS OF, then ignore the timestamp.
+                transaction_determination.timestamp_context = TimestampContext::NoTimestamp;
+                session.add_transaction_ops(TransactionOps::Peeks {
+                    determination: transaction_determination,
+                    cluster_id: target_cluster_id,
+                    requires_linearization,
+                })?;
+            }
+        }
 
         // # From peek_optimize
 
@@ -845,8 +1076,32 @@ impl PeekClient {
             }
         }
 
+        // Enum for branching among various execution steps after optimization
+        enum Execution {
+            Peek {
+                global_lir_plan: optimize::peek::GlobalLirPlan,
+                optimization_finished_at: EpochMillis,
+                plan_insights_optimizer_trace: Option<OptimizerTrace>,
+                insights_ctx: Option<Box<PlanInsightsContext>>,
+            },
+            CopyToS3 {
+                global_lir_plan: optimize::copy_to::GlobalLirPlan,
+                source_ids: BTreeSet<GlobalId>,
+            },
+            ExplainPlan {
+                df_meta: DataflowMetainfo,
+                explain_ctx: ExplainPlanContext,
+                optimizer: optimize::peek::Optimizer,
+                insights_ctx: Option<Box<PlanInsightsContext>>,
+            },
+            ExplainPushdown {
+                imports: BTreeMap<GlobalId, mz_expr::MapFilterProject>,
+                determination: TimestampDetermination<Timestamp>,
+            },
+        }
+
         let source_ids_for_closure = source_ids.clone();
-        let optimization_future = mz_ore::task::spawn_blocking(
+        let optimization_result = mz_ore::task::spawn_blocking(
             || "optimize peek",
             move || {
                 span.in_scope(|| {
@@ -988,8 +1243,12 @@ impl PeekClient {
                                             .desc
                                             .source_imports
                                             .into_iter()
-                                            .filter_map(|(id, import)| {
-                                                import.desc.arguments.operators.map(|mfp| (id, mfp))
+                                            .filter_map(|(id, source_import)| {
+                                                source_import
+                                                    .desc
+                                                    .arguments
+                                                    .operators
+                                                    .map(|mfp| (id, mfp))
                                             })
                                             .collect(),
                                         PeekPlan::FastPath(_) => {
@@ -1041,42 +1300,19 @@ impl PeekClient {
                     }
                 })
             },
-        );
-        let optimization_timeout = *session.vars().statement_timeout();
-        let optimization_result =
-            // Note: spawn_blocking tasks cannot be cancelled, so on timeout we stop waiting but the
-            // optimization task continues running in the background until completion. See
-            // https://github.com/MaterializeInc/database-issues/issues/8644 for properly cancelling
-            // optimizer runs.
-            match tokio::time::timeout(optimization_timeout, optimization_future).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(optimizer_error)) => {
-                    return Err(AdapterError::Internal(format!(
-                        "internal error in optimizer: {}",
-                        optimizer_error
-                    )));
-                }
-                Err(_elapsed) => {
-                    warn!("optimize peek timed out after {:?}", optimization_timeout);
-                    return Err(AdapterError::StatementTimeout);
-                }
-            };
+        )
+        .await
+        .map_err(|optimizer_error| {
+            AdapterError::Internal(format!("internal error in optimizer: {}", optimizer_error))
+        })?;
 
         // Log optimization finished
         if let Some(logging_id) = &statement_logging_id {
             self.log_lifecycle_event(*logging_id, StatementLifecycleEvent::OptimizationFinished);
         }
 
-        // Assert that read holds are correct for the execution plan
-        Self::assert_read_holds_correct(
-            &read_holds,
-            &optimization_result,
-            &determination,
-            target_cluster_id,
-        );
-
         // Handle the optimization result: either generate EXPLAIN output or continue with execution
-        match optimization_result {
+        let result = match optimization_result {
             Execution::ExplainPlan {
                 df_meta,
                 explain_ctx,
@@ -1132,8 +1368,42 @@ impl PeekClient {
                 // Continue with normal execution
                 // # From peek_finish
 
-                // The typ here was generated from the HIR SQL type and simply stored in LIR.
                 let (peek_plan, df_meta, typ) = global_lir_plan.unapply();
+
+                // Populate the plan cache for future queries with the same SQL text.
+                if let (Some(sql_key), Some(desc)) = (&declare_sql, &declare_desc) {
+                    // Pre-build the RelationDesc for the peek command at cache population time.
+                    // This avoids per-query format!("peek_{i}") and RelationDesc::new() overhead.
+                    let cols = (0..typ.arity()).map(|i| format!("peek_{i}"));
+                    let result_desc = Arc::new(RelationDesc::new(typ.clone(), cols));
+                    let single_compute_collection_ids = if input_id_bundle.compute_ids.len() == 1 {
+                        let (_, ids) = input_id_bundle.compute_ids.first_key_value().unwrap();
+                        Some(ids.iter().copied().collect::<Vec<_>>())
+                    } else {
+                        None
+                    };
+                    let relation_desc_for_response =
+                        desc.relation_desc.as_ref().map(|rd| Arc::new(rd.clone()));
+                    self.plan_cache.insert(
+                        Arc::clone(sql_key),
+                        Arc::new(PlanCacheEntry {
+                            desc: desc.clone(),
+                            peek_plan: peek_plan.clone(),
+                            df_meta: df_meta.clone(),
+                            typ: typ.clone(),
+                            source_ids: source_ids.clone(),
+                            finishing: select_plan.finishing.clone(),
+                            when: select_plan.when.clone(),
+                            input_id_bundle: input_id_bundle.clone(),
+                            timeline_context: timeline_context.clone(),
+                            target_cluster_id,
+                            parsed_stmt: Arc::clone(&stmt),
+                            result_desc,
+                            single_compute_collection_ids,
+                            relation_desc_for_response,
+                        }),
+                    );
+                }
 
                 coord::sequencer::emit_optimizer_notices(
                     &*catalog,
@@ -1214,17 +1484,37 @@ impl PeekClient {
                             mz_compute_types::dyncfgs::PEEK_RESPONSE_STASH_READ_MEMORY_BUDGET_BYTES
                                 .get(catalog.system_config().dyncfgs());
 
+                        // Build RelationDesc for the peek command (not cached on first execution).
+                        let cols = (0..typ.arity()).map(|i| format!("peek_{i}"));
+                        let result_desc = Arc::new(RelationDesc::new(typ, cols));
+                        // Extract the target read hold from the ReadHolds struct
+                        // to avoid passing the entire struct (with its BTreeMaps).
+                        let target_hold = match &fast_path_plan {
+                            FastPathPlan::PeekExisting(_coll_id, idx_id, _, _) => Some(
+                                read_holds
+                                    .compute_holds
+                                    .remove(&(target_cluster_id, *idx_id))
+                                    .expect("missing compute read hold for PeekExisting"),
+                            ),
+                            FastPathPlan::PeekPersist(coll_id, _, _) => Some(
+                                read_holds
+                                    .storage_holds
+                                    .remove(coll_id)
+                                    .expect("missing storage read hold for PeekPersist"),
+                            ),
+                            FastPathPlan::Constant(..) => None,
+                        };
                         self.implement_fast_path_peek_plan(
                             fast_path_plan,
                             determination.timestamp_context.timestamp_or_default(),
                             select_plan.finishing,
                             target_cluster_id,
                             target_replica,
-                            typ,
+                            result_desc,
                             max_result_size,
                             max_query_result_size,
                             row_set_finishing_seconds,
-                            read_holds,
+                            target_hold,
                             peek_stash_read_batch_size_bytes,
                             peek_stash_read_memory_budget_bytes,
                             session.conn_id().clone(),
@@ -1234,6 +1524,65 @@ impl PeekClient {
                         .await?
                     }
                     PeekPlan::SlowPath(dataflow_plan) => {
+                        {
+                            // Assert that we have some read holds for all the imports of the dataflow.
+                            for id in dataflow_plan.desc.source_imports.keys() {
+                                soft_assert_or_log!(
+                                    read_holds.storage_holds.contains_key(id),
+                                    "missing read hold for the source import {}",
+                                    id
+                                );
+                            }
+                            for id in dataflow_plan.desc.index_imports.keys() {
+                                soft_assert_or_log!(
+                                    read_holds
+                                        .compute_ids()
+                                        .map(|(_instance, coll)| coll)
+                                        .contains(id),
+                                    "missing read hold for the index import {}",
+                                    id,
+                                );
+                            }
+
+                            // Also check the holds against the as_of.
+                            for (id, h) in read_holds.storage_holds.iter() {
+                                let as_of = dataflow_plan
+                                    .desc
+                                    .as_of
+                                    .clone()
+                                    .expect("dataflow has an as_of")
+                                    .into_element();
+                                soft_assert_or_log!(
+                                    h.since().less_equal(&as_of),
+                                    "storage read hold at {:?} for collection {} is not enough for as_of {:?}",
+                                    h.since(),
+                                    id,
+                                    as_of
+                                );
+                            }
+                            for ((instance, id), h) in read_holds.compute_holds.iter() {
+                                soft_assert_eq_or_log!(
+                                    *instance,
+                                    target_cluster_id,
+                                    "the read hold on {} is on the wrong cluster",
+                                    id
+                                );
+                                let as_of = dataflow_plan
+                                    .desc
+                                    .as_of
+                                    .clone()
+                                    .expect("dataflow has an as_of")
+                                    .into_element();
+                                soft_assert_or_log!(
+                                    h.since().less_equal(&as_of),
+                                    "compute read hold at {:?} for collection {} is not enough for as_of {:?}",
+                                    h.since(),
+                                    id,
+                                    as_of
+                                );
+                            }
+                        }
+
                         if let Some(logging_id) = &statement_logging_id {
                             self.log_set_transient_index_id(*logging_id, dataflow_plan.id);
                         }
@@ -1347,7 +1696,12 @@ impl PeekClient {
 
                 Ok(Some(response))
             }
-        }
+        };
+        self.metrics()
+            .frontend_peek_seconds
+            .with_label_values(&["try_frontend_peek_inner"])
+            .observe(inner_start.elapsed().as_secs_f64());
+        result
     }
 
     /// (Similar to Coordinator::determine_timestamp)
@@ -1356,6 +1710,7 @@ impl PeekClient {
     /// The caller is responsible for eventually dropping those read holds.
     ///
     /// Note: self is taken &mut because of the lazy fetching in `get_compute_instance_client`.
+    #[mz_ore::instrument(level = "debug")]
     pub(crate) async fn frontend_determine_timestamp(
         &mut self,
         catalog_state: &CatalogState,
@@ -1368,6 +1723,9 @@ impl PeekClient {
         real_time_recency_ts: Option<Timestamp>,
     ) -> Result<(TimestampDetermination<Timestamp>, ReadHolds<Timestamp>), AdapterError> {
         // this is copy-pasted from Coordinator
+
+        // Ensure the instance ID string is cached (avoids per-query to_string() formatting).
+        self.instance_id_str(compute_instance);
 
         let constraint_based = ConstraintBasedTimestampSelection::from_str(
             &CONSTRAINT_BASED_TIMESTAMP_SELECTION.get(catalog_state.system_config().dyncfgs()),
@@ -1384,6 +1742,17 @@ impl PeekClient {
                     compute_instance,
                 )
             })?;
+        // Only clone `upper` when we need it for the StrictSerializable comparison
+        // below. For the common Serializable case, pass `upper` by move to avoid
+        // an unnecessary Antichain (Vec) clone on every query.
+        let needs_strict_serializable_comparison = isolation_level
+            == &IsolationLevel::StrictSerializable
+            && real_time_recency_ts.is_none();
+        let upper_for_strict = if needs_strict_serializable_comparison {
+            Some(upper.clone())
+        } else {
+            None
+        };
         let (det, read_holds) = <Coordinator as TimestampProvider>::determine_timestamp_for_inner(
             session,
             id_bundle,
@@ -1395,7 +1764,7 @@ impl PeekClient {
             isolation_level,
             &constraint_based,
             read_holds,
-            upper.clone(),
+            upper,
         )?;
 
         session
@@ -1406,14 +1775,11 @@ impl PeekClient {
                     false => "false",
                 },
                 isolation_level.as_str(),
-                &compute_instance.to_string(),
+                &self.cached_instance_id_strs[&compute_instance],
                 constraint_based.as_str(),
             ])
             .inc();
-        if !det.respond_immediately()
-            && isolation_level == &IsolationLevel::StrictSerializable
-            && real_time_recency_ts.is_none()
-        {
+        if !det.respond_immediately() && needs_strict_serializable_comparison {
             // Note down the difference between StrictSerializable and Serializable into a metric.
             if let Some(strict) = det.timestamp_context.timestamp() {
                 let (serializable_det, _tmp_read_holds) =
@@ -1428,13 +1794,13 @@ impl PeekClient {
                         isolation_level,
                         &constraint_based,
                         read_holds.clone(),
-                        upper,
+                        upper_for_strict.expect("cloned when needs_strict_serializable_comparison"),
                     )?;
                 if let Some(serializable) = serializable_det.timestamp_context.timestamp() {
                     session
                         .metrics()
                         .timestamp_difference_for_strict_serializable_ms(&[
-                            compute_instance.to_string().as_ref(),
+                            &self.cached_instance_id_strs[&compute_instance],
                             constraint_based.as_str(),
                         ])
                         .observe(f64::cast_lossy(u64::from(
@@ -1447,146 +1813,416 @@ impl PeekClient {
         Ok((det, read_holds))
     }
 
-    fn assert_read_holds_correct(
-        read_holds: &ReadHolds<Timestamp>,
-        execution: &Execution,
-        determination: &TimestampDetermination<Timestamp>,
-        target_cluster_id: ClusterId,
-    ) {
-        // Extract source_imports, index_imports, as_of, and execution_name based on Execution variant
-        let (source_imports, index_imports, as_of, execution_name): (
-            Vec<GlobalId>,
-            Vec<GlobalId>,
-            Timestamp,
-            &str,
-        ) = match execution {
-            Execution::Peek {
-                global_lir_plan, ..
-            } => match global_lir_plan.peek_plan() {
-                PeekPlan::FastPath(fast_path_plan) => {
-                    let (sources, indexes) = match fast_path_plan {
-                        FastPathPlan::Constant(..) => (vec![], vec![]),
-                        FastPathPlan::PeekExisting(_coll_id, idx_id, ..) => (vec![], vec![*idx_id]),
-                        FastPathPlan::PeekPersist(global_id, ..) => (vec![*global_id], vec![]),
-                    };
-                    (
-                        sources,
-                        indexes,
-                        determination.timestamp_context.timestamp_or_default(),
-                        "FastPath",
-                    )
+    /// Fast path for queries with a cached plan. Skips parsing, name resolution,
+    /// planning, optimization, RBAC, and cluster resolution. Only performs the
+    /// per-query work that must happen on every execution: timestamp determination,
+    /// read holds, and peek execution.
+    #[mz_ore::instrument(level = "debug")]
+    async fn try_frontend_peek_cached(
+        &mut self,
+        session: &mut Session,
+        catalog: Arc<Catalog>,
+        cached: Arc<PlanCacheEntry>,
+        statement_logging_id: Option<crate::statement_logging::StatementLoggingId>,
+    ) -> Result<Option<ExecuteResponse>, AdapterError> {
+        let cached_start = Instant::now();
+
+        // Borrow fields from the Arc'd cache entry instead of cloning the entire struct.
+        // Only clone the fields that are consumed (moved) downstream.
+        let target_cluster_id = cached.target_cluster_id;
+        let peek_plan = cached.peek_plan.clone();
+        let result_desc = cached.result_desc.clone();
+        let finishing = cached.finishing.clone();
+        // source_ids is only used as `depends_on` in RegisterFrontendPeek/PendingPeek,
+        // where it is stored but never read. Pass an empty set to avoid cloning.
+        let source_ids = std::collections::BTreeSet::new();
+
+        // Log cluster selection
+        if let Some(logging_id) = &statement_logging_id {
+            self.log_set_cluster(*logging_id, target_cluster_id);
+        }
+
+        // Log optimization finished (trivially, since we skipped it)
+        if let Some(logging_id) = &statement_logging_id {
+            self.log_lifecycle_event(*logging_id, StatementLifecycleEvent::OptimizationFinished);
+        }
+
+        let max_query_result_size = Some(session.vars().max_query_result_size());
+
+        // # Timestamp determination
+        //
+        // For the common case of a single-collection fast-path peek with
+        // Serializable isolation and QueryWhen::Immediately (no AS OF, not in
+        // a multi-statement transaction), we inline the timestamp determination
+        // to avoid the overhead of the general framework:
+        // - No Antichain allocations for least_valid_read() / upper join
+        // - No BTreeMap iteration in determine_timestamp_for_inner
+        // - No DataflowBuilder / ComputeInstanceSnapshot creation
+        // - No constraint_based config fetch or metrics observation
+
+        let in_immediate_multi_stmt_txn = session
+            .transaction()
+            .in_immediate_multi_stmt_txn(&cached.when);
+
+        // Fast path conditions: single compute collection, no storage,
+        // Serializable or StrictSerializable, QueryWhen::Immediately,
+        // not in a multi-statement transaction, timeline-dependent context.
+        let isolation_level = session.vars().transaction_isolation();
+        let is_serializable = isolation_level == &IsolationLevel::Serializable;
+        let is_strict_serializable = isolation_level == &IsolationLevel::StrictSerializable;
+        let can_use_inline_timestamp = !in_immediate_multi_stmt_txn
+            && cached.when == QueryWhen::Immediately
+            && (is_serializable || is_strict_serializable)
+            && cached.input_id_bundle.storage_ids.is_empty()
+            && cached.input_id_bundle.compute_ids.len() == 1
+            && matches!(
+                &cached.timeline_context,
+                TimelineContext::TimelineDependent(_) | TimelineContext::TimestampDependent
+            );
+
+        let (determination, target_read_hold) = if can_use_inline_timestamp
+            && session.get_transaction_timestamp_determination().is_none()
+        {
+            // Inline fast path: directly acquire read hold and compute timestamp
+            // without going through frontend_determine_timestamp.
+
+            // For StrictSerializable, we need the oracle timestamp.
+            // For Serializable, we skip the oracle and use the write frontier.
+            let oracle_read_ts = if is_strict_serializable {
+                let timeline = Coordinator::get_timeline(&cached.timeline_context);
+                match timeline {
+                    Some(timeline) => {
+                        let oracle = self.ensure_oracle(timeline).await?;
+                        // Fast path: read the shared atomic directly (no channel
+                        // round-trip). Falls back to the slow batched path if the
+                        // oracle hasn't been initialized yet.
+                        let ts = match oracle.peek_read_ts_fast() {
+                            Some(ts) => ts,
+                            None => oracle.read_ts().await,
+                        };
+                        Some(ts)
+                    }
+                    None => None,
                 }
-                PeekPlan::SlowPath(dataflow_plan) => {
-                    let as_of = dataflow_plan
-                        .desc
-                        .as_of
-                        .clone()
-                        .expect("dataflow has an as_of")
-                        .into_element();
-                    (
-                        dataflow_plan.desc.source_imports.keys().cloned().collect(),
-                        dataflow_plan.desc.index_imports.keys().cloned().collect(),
-                        as_of,
-                        "SlowPath",
+            } else {
+                None
+            };
+
+            let instance_id = target_cluster_id;
+            let collection_ids = cached
+                .single_compute_collection_ids
+                .as_ref()
+                .expect("single_compute_collection_ids must be set when compute_ids.len() == 1");
+
+            // Ensure compute client is available and get shared state for each collection.
+            self.ensure_compute_instance_client(instance_id)
+                .await
+                .map_err(|err| {
+                    AdapterError::concurrent_dependency_drop_from_collection_lookup_error(
+                        err.into(),
+                        instance_id,
                     )
+                })?;
+
+            // For the single-collection fast path, acquire read holds using
+            // a persistent cached hold to avoid mutex contention.
+            //
+            // `acquire_read_hold_direct` locks a `Mutex<MutableAntichain>` and
+            // triggers `rebuild()` on every call. At 64+ concurrent connections,
+            // this mutex becomes a serialization bottleneck (~13% of function time).
+            //
+            // Instead, we keep a persistent ReadHold per (instance, collection)
+            // on the PeekClient. For each query, we clone the cached hold:
+            // `ReadHold::clone()` sends +1 through an async mpsc channel (no mutex),
+            // and the corresponding drop sends -1 (also no mutex). The cached hold
+            // prevents compaction at the collection's since, so the clone's since
+            // is always valid.
+            let mut chosen_ts = Timestamp::minimum();
+            let mut target_read_hold = None;
+
+            for &id in collection_ids {
+                let key = (instance_id, id);
+                if !self.shared_collection_states.contains_key(&key) {
+                    let shared = self.compute_instances[&instance_id]
+                        .collection_shared_state(id)
+                        .await
+                        .map_err(|err| {
+                            AdapterError::concurrent_dependency_drop_from_collection_lookup_error(
+                                err,
+                                instance_id,
+                            )
+                        })?;
+                    self.shared_collection_states.insert(key, shared);
                 }
-            },
-            Execution::CopyToS3 {
-                global_lir_plan, ..
-            } => {
-                let df_desc = global_lir_plan.df_desc();
-                let as_of = df_desc
-                    .as_of
-                    .clone()
-                    .expect("dataflow has an as_of")
-                    .into_element();
-                (
-                    df_desc.source_imports.keys().cloned().collect(),
-                    df_desc.index_imports.keys().cloned().collect(),
-                    as_of,
-                    "CopyToS3",
-                )
+
+                // Ensure we have a cached persistent read hold for this collection.
+                // The persistent hold is acquired once (via the mutex) and kept alive
+                // across queries. Per-query holds are then cloned from it (no mutex).
+                if !self.cached_read_holds.contains_key(&key) {
+                    let shared = self
+                        .shared_collection_states
+                        .get(&key)
+                        .expect("just inserted");
+                    let hold =
+                        self.compute_instances[&instance_id].acquire_read_hold_direct(id, shared);
+                    self.cached_read_holds.insert(key, hold);
+                }
+
+                // Clone the cached hold — sends +1 via async channel, no mutex.
+                let read_hold = self.cached_read_holds[&key].clone();
+
+                // Use the cached hold's since as a lower bound for chosen_ts.
+                if let Some(since_ts) = read_hold.since().as_option() {
+                    chosen_ts = std::cmp::max(chosen_ts, *since_ts);
+                }
+
+                // For Serializable: also advance to upper - 1.
+                // For StrictSerializable: skip this (use oracle timestamp instead).
+                if is_serializable {
+                    let shared = self
+                        .shared_collection_states
+                        .get(&key)
+                        .expect("just inserted");
+                    let write_upper: Option<Timestamp> = shared
+                        .lock_write_frontier(|f: &mut Antichain<Timestamp>| f.as_option().copied());
+                    if let Some(upper_ts) = write_upper {
+                        let stepped_back = upper_ts.saturating_sub(1);
+                        chosen_ts = std::cmp::max(chosen_ts, stepped_back);
+                    } else {
+                        // Empty upper means the trace is complete.
+                        chosen_ts = Timestamp::MAX;
+                    }
+                }
+
+                target_read_hold = Some(read_hold);
             }
-            Execution::ExplainPlan { .. } | Execution::ExplainPushdown { .. } => {
-                // No read holds assertions needed for EXPLAIN variants
-                return;
+
+            // For StrictSerializable, advance to the oracle timestamp.
+            if let Some(oracle_ts) = &oracle_read_ts {
+                chosen_ts = std::cmp::max(chosen_ts, *oracle_ts);
+            }
+
+            // Build the TimestampContext directly.
+            let timestamp_context = match &cached.timeline_context {
+                TimelineContext::TimelineDependent(timeline) => {
+                    TimestampContext::TimelineTimestamp {
+                        timeline: timeline.clone(),
+                        chosen_ts,
+                        oracle_ts: oracle_read_ts,
+                    }
+                }
+                TimelineContext::TimestampDependent => TimestampContext::TimelineTimestamp {
+                    timeline: Timeline::EpochMilliseconds,
+                    chosen_ts,
+                    oracle_ts: oracle_read_ts,
+                },
+                TimelineContext::TimestampIndependent => TimestampContext::NoTimestamp,
+            };
+
+            let determination = TimestampDetermination {
+                timestamp_context,
+                since: Antichain::from_elem(chosen_ts),
+                upper: Antichain::from_elem(chosen_ts.step_forward()),
+                largest_not_in_advance_of_upper: chosen_ts,
+                oracle_read_ts,
+                session_oracle_read_ts: None,
+                real_time_recency_ts: None,
+                constraints: None,
+            };
+
+            (determination, target_read_hold)
+        } else {
+            // General path: handles multi-statement transactions, non-Serializable
+            // isolation levels, oracle timestamps, and other edge cases.
+            let isolation_level = session.vars().transaction_isolation().clone();
+            let timeline = Coordinator::get_timeline(&cached.timeline_context);
+            let needs_linearized_read_ts =
+                Coordinator::needs_linearized_read_ts(&isolation_level, &cached.when);
+
+            let oracle_read_ts = match timeline {
+                Some(timeline) if needs_linearized_read_ts => {
+                    let oracle = self.ensure_oracle(timeline).await?;
+                    let ts = oracle.read_ts().await;
+                    Some(ts)
+                }
+                Some(_) | None => None,
+            };
+            let real_time_recency_ts: Option<Timestamp> = None;
+
+            match session.get_transaction_timestamp_determination() {
+                Some(
+                    determination @ TimestampDetermination {
+                        timestamp_context: TimestampContext::TimelineTimestamp { .. },
+                        ..
+                    },
+                ) if in_immediate_multi_stmt_txn => {
+                    let txn_read_holds_opt = self
+                        .call_coordinator(|tx| Command::GetTransactionReadHoldsBundle {
+                            conn_id: session.conn_id().clone(),
+                            tx,
+                        })
+                        .await;
+
+                    if let Some(txn_read_holds) = txn_read_holds_opt {
+                        let mut read_holds = txn_read_holds.subset(&cached.input_id_bundle);
+                        // Extract the target read hold from the ReadHolds struct.
+                        let hold = extract_target_read_hold(
+                            &cached.peek_plan,
+                            target_cluster_id,
+                            &mut read_holds,
+                        );
+                        (determination, hold)
+                    } else {
+                        return Err(AdapterError::Internal(
+                            "Missing transaction read holds for multi-statement transaction"
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ => {
+                    let timedomain_bundle;
+                    let determine_bundle = if in_immediate_multi_stmt_txn {
+                        let compute_instance_snapshot =
+                            ComputeInstanceSnapshot::new_without_collections(target_cluster_id);
+                        let dataflow_builder =
+                            DataflowBuilder::new(catalog.state(), compute_instance_snapshot);
+                        timedomain_bundle = timedomain_for(
+                            &*catalog,
+                            &dataflow_builder,
+                            &source_ids,
+                            &cached.timeline_context,
+                            session.conn_id(),
+                            target_cluster_id,
+                        )?;
+                        &timedomain_bundle
+                    } else {
+                        &cached.input_id_bundle
+                    };
+                    let (determination, mut read_holds) = self
+                        .frontend_determine_timestamp(
+                            catalog.state(),
+                            session,
+                            determine_bundle,
+                            &cached.when,
+                            target_cluster_id,
+                            &cached.timeline_context,
+                            oracle_read_ts,
+                            real_time_recency_ts,
+                        )
+                        .await?;
+                    let hold = extract_target_read_hold(
+                        &cached.peek_plan,
+                        target_cluster_id,
+                        &mut read_holds,
+                    );
+                    (determination, hold)
+                }
             }
         };
 
-        // Assert that we have some read holds for all the imports of the dataflow.
-        for id in source_imports.iter() {
-            soft_assert_or_log!(
-                read_holds.storage_holds.contains_key(id),
-                "[{}] missing read hold for the source import {}",
-                execution_name,
-                id
-            );
-        }
-        for id in index_imports.iter() {
-            soft_assert_or_log!(
-                read_holds
-                    .compute_ids()
-                    .map(|(_instance, coll)| coll)
-                    .contains(id),
-                "[{}] missing read hold for the index import {}",
-                execution_name,
-                id,
-            );
+        // For implicit single-statement transactions (the common case for simple
+        // SELECT queries via the simple query protocol), skip recording transaction
+        // ops entirely. The ops are only needed for multi-statement transactions to
+        // ensure consistent timestamps across statements. For implicit single-statement
+        // transactions, the transaction is immediately committed locally via
+        // end_transaction_local() which just drops the ops without reading them.
+        // This avoids cloning the entire TimestampDetermination (including
+        // Antichain Vecs) on every query.
+        if !session.transaction().is_implicit()
+            || session.transaction().is_in_multi_statement_transaction()
+        {
+            let requires_linearization = crate::session::RequireLinearization::NotRequired;
+            let mut transaction_determination = determination.clone();
+            if cached.when.is_transactional() {
+                session.add_transaction_ops(TransactionOps::Peeks {
+                    determination: transaction_determination,
+                    cluster_id: target_cluster_id,
+                    requires_linearization,
+                })?;
+            } else if matches!(session.transaction(), &TransactionStatus::InTransaction(_)) {
+                transaction_determination.timestamp_context = TimestampContext::NoTimestamp;
+                session.add_transaction_ops(TransactionOps::Peeks {
+                    determination: transaction_determination,
+                    cluster_id: target_cluster_id,
+                    requires_linearization,
+                })?;
+            }
         }
 
-        // Also check the holds against the as_of.
-        for (id, h) in read_holds.storage_holds.iter() {
-            soft_assert_or_log!(
-                h.since().less_equal(&as_of),
-                "[{}] storage read hold at {:?} for collection {} is not enough for as_of {:?}, determination: {:?}",
-                execution_name,
-                h.since(),
-                id,
-                as_of,
-                determination
-            );
-        }
-        for ((instance, id), h) in read_holds.compute_holds.iter() {
-            soft_assert_eq_or_log!(
-                *instance,
-                target_cluster_id,
-                "[{}] the read hold on {} is on the wrong cluster",
-                execution_name,
-                id
-            );
-            soft_assert_or_log!(
-                h.since().less_equal(&as_of),
-                "[{}] compute read hold at {:?} for collection {} is not enough for as_of {:?}, determination: {:?}",
-                execution_name,
-                h.since(),
-                id,
-                as_of,
-                determination
-            );
-        }
+        // Execute the peek plan
+        let target_replica = None;
+        let max_result_size = catalog.system_config().max_result_size();
+
+        let watch_set = statement_logging_id.map(|logging_id| {
+            WatchSetCreation::new(
+                logging_id,
+                catalog.state(),
+                &cached.input_id_bundle,
+                determination.timestamp_context.timestamp_or_default(),
+            )
+        });
+
+        // Drop the Arc reference before consuming fields, since we've already
+        // cloned the consumed fields and switched to borrowing for the rest.
+        drop(cached);
+
+        let response = match peek_plan {
+            PeekPlan::FastPath(fast_path_plan) => {
+                if let Some(logging_id) = &statement_logging_id {
+                    if !matches!(fast_path_plan, FastPathPlan::Constant(..)) {
+                        self.log_set_timestamp(
+                            *logging_id,
+                            determination.timestamp_context.timestamp_or_default(),
+                        );
+                    }
+                }
+
+                let row_set_finishing_seconds =
+                    session.metrics().row_set_finishing_seconds().clone();
+
+                let (peek_stash_read_batch_size_bytes, peek_stash_read_memory_budget_bytes) =
+                    self.peek_stash_handles(catalog.system_config().dyncfgs());
+
+                self.implement_fast_path_peek_plan(
+                    fast_path_plan,
+                    determination.timestamp_context.timestamp_or_default(),
+                    finishing,
+                    target_cluster_id,
+                    target_replica,
+                    result_desc,
+                    max_result_size,
+                    max_query_result_size,
+                    row_set_finishing_seconds,
+                    target_read_hold,
+                    peek_stash_read_batch_size_bytes,
+                    peek_stash_read_memory_budget_bytes,
+                    session.conn_id().clone(),
+                    source_ids,
+                    watch_set,
+                )
+                .await?
+            }
+            PeekPlan::SlowPath(dataflow_plan) => {
+                self.call_coordinator(|tx| Command::ExecuteSlowPathPeek {
+                    dataflow_plan: Box::new(dataflow_plan),
+                    determination,
+                    finishing,
+                    compute_instance: target_cluster_id,
+                    target_replica,
+                    intermediate_result_type: result_desc.typ().clone(),
+                    source_ids,
+                    conn_id: session.conn_id().clone(),
+                    max_result_size,
+                    max_query_result_size,
+                    watch_set,
+                    tx,
+                })
+                .await?
+            }
+        };
+
+        self.peek_cached_histogram()
+            .observe(cached_start.elapsed().as_secs_f64());
+        Ok(Some(response))
     }
-}
-
-/// Enum for branching among various execution steps after optimization
-enum Execution {
-    Peek {
-        global_lir_plan: optimize::peek::GlobalLirPlan,
-        optimization_finished_at: EpochMillis,
-        plan_insights_optimizer_trace: Option<OptimizerTrace>,
-        insights_ctx: Option<Box<PlanInsightsContext>>,
-    },
-    CopyToS3 {
-        global_lir_plan: optimize::copy_to::GlobalLirPlan,
-        source_ids: BTreeSet<GlobalId>,
-    },
-    ExplainPlan {
-        df_meta: DataflowMetainfo,
-        explain_ctx: ExplainPlanContext,
-        optimizer: optimize::peek::Optimizer,
-        insights_ctx: Option<Box<PlanInsightsContext>>,
-    },
-    ExplainPushdown {
-        imports: BTreeMap<GlobalId, mz_expr::MapFilterProject>,
-        determination: TimestampDetermination<Timestamp>,
-    },
 }

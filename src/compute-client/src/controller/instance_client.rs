@@ -33,7 +33,8 @@ use tracing::debug_span;
 use uuid::Uuid;
 
 use crate::controller::error::CollectionLookupError;
-use crate::controller::instance::{Command, Instance, SharedCollectionState};
+pub use crate::controller::instance::SharedCollectionState;
+use crate::controller::instance::{Command, Instance};
 use crate::controller::{
     ComputeControllerResponse, ComputeControllerTimestamp, IntrospectionUpdates, ReplicaId,
     StorageCollections,
@@ -125,6 +126,34 @@ impl<T: ComputeControllerTimestamp> InstanceClient<T> {
         rx.await.map_err(|_| InstanceShutDown)
     }
 
+    /// Look up the [`SharedCollectionState`] for a compute collection.
+    ///
+    /// This is a synchronous round-trip to the instance task, but the returned
+    /// `SharedCollectionState` can be cached by callers for direct access to read
+    /// capabilities and write frontiers without further round-trips.
+    pub async fn collection_shared_state(
+        &self,
+        id: GlobalId,
+    ) -> Result<SharedCollectionState<T>, CollectionLookupError> {
+        let shared_state = self.call_sync(move |i| i.shared_collection_state(id)).await?;
+        shared_state.map_err(CollectionLookupError::from)
+    }
+
+    /// Acquires a `ReadHold` for the given collection using its cached shared state,
+    /// without going through the instance task.
+    pub fn acquire_read_hold_direct(
+        &self,
+        id: GlobalId,
+        shared: &SharedCollectionState<T>,
+    ) -> ReadHold<T> {
+        let since = shared.lock_read_capabilities(|caps| {
+            let since = caps.frontier().to_owned();
+            caps.update_iter(since.iter().map(|t| (t.clone(), 1)));
+            since
+        });
+        ReadHold::new(id, since, Arc::clone(&self.read_hold_tx))
+    }
+
     pub(super) fn spawn(
         id: ComputeInstanceId,
         build_info: &'static BuildInfo,
@@ -200,8 +229,10 @@ impl<T: ComputeControllerTimestamp> InstanceClient<T> {
 
     /// Issue a peek by calling into the instance task.
     ///
-    /// If this returns an error, then it didn't modify any `Instance` state.
-    pub async fn peek(
+    /// This is fire-and-forget: errors from `Instance::peek()` are sent through
+    /// `peek_response_tx` rather than returned, avoiding a synchronous round-trip.
+    /// Only returns an error if the instance has shut down.
+    pub fn peek(
         &self,
         peek_target: PeekTarget,
         literal_constraints: Option<Vec<Row>>,
@@ -214,8 +245,8 @@ impl<T: ComputeControllerTimestamp> InstanceClient<T> {
         target_replica: Option<ReplicaId>,
         peek_response_tx: oneshot::Sender<PeekResponse>,
     ) -> Result<(), PeekError> {
-        self.call_sync(move |i| {
-            i.peek(
+        self.call(move |i| {
+            if let Err(err) = i.peek(
                 peek_target,
                 literal_constraints,
                 uuid,
@@ -226,8 +257,12 @@ impl<T: ComputeControllerTimestamp> InstanceClient<T> {
                 target_read_hold,
                 target_replica,
                 peek_response_tx,
-            )
-        })
-        .await?
+            ) {
+                // On error, Instance::peek did not consume peek_response_tx, so
+                // the receiver gets RecvError and the caller handles it.
+                tracing::warn!("fire-and-forget peek failed: {err}");
+            }
+        })?;
+        Ok(())
     }
 }

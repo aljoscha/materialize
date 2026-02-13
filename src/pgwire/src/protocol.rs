@@ -207,7 +207,7 @@ where
                 // auth session, as Frontegg may return an email address with
                 // different casing than the user supplied via the pgwire
                 // username fN
-                Ok((mut auth_session, authenticated)) => {
+                Ok((mut auth_session, _authenticated)) => {
                     let session = adapter_client.new_session(
                         SessionConfig {
                             conn_id: conn.conn_id().clone(),
@@ -217,7 +217,6 @@ where
                             external_metadata_rx: Some(auth_session.external_metadata_rx()),
                             helm_chart_version,
                         },
-                        authenticated,
                     );
                     let expired = async move { auth_session.expired().await };
                     (session, expired.left_future())
@@ -245,7 +244,7 @@ where
 
             let auth_response = oidc.authenticate(&jwt, Some(&user)).await;
             match auth_response {
-                Ok((claims, authenticated)) => {
+                Ok((claims, _authenticated)) => {
                     let session = adapter_client.new_session(
                         SessionConfig {
                             conn_id: conn.conn_id().clone(),
@@ -255,7 +254,6 @@ where
                             external_metadata_rx: None,
                             helm_chart_version,
                         },
-                        authenticated,
                     );
                     // No invalidation of the auth session once authenticated,
                     // so auth session lasts indefinitely.
@@ -280,7 +278,7 @@ where
                     return conn.send(e).await;
                 }
             };
-            let authenticated = match adapter_client.authenticate(&user, &password).await {
+            let _authenticated = match adapter_client.authenticate(&user, &password).await {
                 Ok(resp) => resp,
                 Err(err) => {
                     warn!(?err, "pgwire connection failed authentication");
@@ -301,7 +299,6 @@ where
                     external_metadata_rx: None,
                     helm_chart_version,
                 },
-                authenticated,
             );
             // No frontegg check, so auth session lasts indefinitely.
             let auth_session = pending().right_future();
@@ -405,7 +402,7 @@ where
                 }
             };
 
-            let authenticated = match conn.recv().await? {
+            let _authenticated = match conn.recv().await? {
                 Some(FrontendMessage::RawAuthentication(data)) => {
                     match decode_sasl_response(Cursor::new(&data)).ok() {
                         Some(FrontendMessage::SASLResponse(response)) => {
@@ -432,7 +429,7 @@ where
                                 )
                                 .await
                             {
-                                Ok((proof_response, authenticated)) => {
+                                Ok(proof_response) => {
                                     conn.send(BackendMessage::AuthenticationSASLFinal(
                                         SASLServerFinalMessage {
                                             kind: SASLServerFinalMessageKinds::Verifier(
@@ -443,7 +440,7 @@ where
                                     ))
                                     .await?;
                                     conn.flush().await?;
-                                    authenticated
+                                    proof_response.auth_resp
                                 }
                                 Err(_) => {
                                     return conn
@@ -484,7 +481,6 @@ where
                     external_metadata_rx: None,
                     helm_chart_version,
                 },
-                authenticated,
             );
             // No frontegg check, so auth session lasts indefinitely.
             let auth_session = pending().right_future();
@@ -501,7 +497,6 @@ where
                     external_metadata_rx: None,
                     helm_chart_version,
                 },
-                Authenticated,
             );
             // No frontegg check, so auth session lasts indefinitely.
             let auth_session = pending().right_future();
@@ -1010,7 +1005,7 @@ where
         const EMPTY_PORTAL: &str = "";
         if let Err(e) = self
             .adapter_client
-            .declare(EMPTY_PORTAL.to_string(), stmt, sql)
+            .declare(EMPTY_PORTAL.to_string(), Arc::new(stmt), sql)
             .await
         {
             return self.error(e.into_response(Severity::Error)).await;

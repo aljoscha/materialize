@@ -29,7 +29,7 @@ use mz_ore::task;
 use mz_ore::tracing::OpenTelemetryContext;
 use mz_ore::{instrument, soft_panic_or_log};
 use mz_repr::role_id::RoleId;
-use mz_repr::{Diff, GlobalId, SqlScalarType, Timestamp};
+use mz_repr::{Datum, Diff, GlobalId, Row, SqlScalarType, Timestamp};
 use mz_sql::ast::{
     AlterConnectionAction, AlterConnectionStatement, AlterSinkAction, AlterSourceAction, AstInfo,
     ConstantVisitor, CopyRelation, CopyStatement, CreateSourceOptionName, Raw, Statement,
@@ -63,8 +63,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::command::{
-    CatalogSnapshot, Command, ExecuteResponse, SASLChallengeResponse, SASLVerifyProofResponse,
-    StartupResponse, SuperuserAttribute,
+    AuthResponse, CatalogSnapshot, Command, ExecuteResponse, SASLChallengeResponse,
+    SASLVerifyProofResponse, StartupResponse,
 };
 use crate::coord::appends::PendingWriteTxn;
 use crate::coord::peek::PendingPeek;
@@ -429,7 +429,6 @@ impl Coordinator {
                     depends_on,
                     is_fast_path,
                     watch_set,
-                    tx,
                 } => {
                     self.handle_register_frontend_peek(
                         uuid,
@@ -438,11 +437,10 @@ impl Coordinator {
                         depends_on,
                         is_fast_path,
                         watch_set,
-                        tx,
                     );
                 }
-                Command::UnregisterFrontendPeek { uuid, tx } => {
-                    self.handle_unregister_frontend_peek(uuid, tx);
+                Command::UnregisterFrontendPeek { uuid } => {
+                    self.handle_unregister_frontend_peek(uuid);
                 }
                 Command::ExplainTimestamp {
                     conn_id,
@@ -504,7 +502,14 @@ impl Coordinator {
             Ok(verifier) => {
                 // Success only if role exists, allows login, and a real password hash was used.
                 if login && real_hash.is_some() {
-                    let _ = tx.send(Ok(SASLVerifyProofResponse { verifier }));
+                    let role = role.expect("login implies role exists");
+                    let _ = tx.send(Ok(SASLVerifyProofResponse {
+                        verifier,
+                        auth_resp: AuthResponse {
+                            role_id: role.id,
+                            superuser: role.attributes.superuser.unwrap_or(false),
+                        },
+                    }));
                 } else {
                     let _ = tx.send(Err(make_auth_err(role_present, login)));
                 }
@@ -597,7 +602,7 @@ impl Coordinator {
     #[mz_ore::instrument(level = "debug")]
     async fn handle_authenticate_password(
         &self,
-        tx: oneshot::Sender<Result<(), AdapterError>>,
+        tx: oneshot::Sender<Result<AuthResponse, AdapterError>>,
         role_name: String,
         password: Option<Password>,
     ) {
@@ -620,11 +625,13 @@ impl Coordinator {
             if let Some(auth) = self.catalog().try_get_role_auth_by_id(&role.id) {
                 if let Some(hash) = &auth.password_hash {
                     let hash = hash.clone();
+                    let role_id = role.id;
+                    let superuser = role.attributes.superuser.unwrap_or(false);
                     task::spawn_blocking(
                         || "auth-check-hash",
                         move || {
                             let _ = match mz_auth::hash::scram256_verify(&password, &hash) {
-                                Ok(_) => tx.send(Ok(())),
+                                Ok(_) => tx.send(Ok(AuthResponse { role_id, superuser })),
                                 Err(_) => tx.send(Err(AdapterError::AuthenticationError(
                                     AuthenticationError::InvalidCredentials,
                                 ))),
@@ -660,7 +667,7 @@ impl Coordinator {
     ) {
         // Early return if successful, otherwise cleanup any possible state.
         match self.handle_startup_inner(&user, &conn_id, &client_ip).await {
-            Ok((role_id, superuser_attribute, session_defaults)) => {
+            Ok((role_id, session_defaults)) => {
                 let session_type = metrics::session_type_label_value(&user);
                 self.metrics
                     .active_sessions
@@ -725,6 +732,30 @@ impl Coordinator {
                     .statement_logging
                     .create_frontend(build_info_human_version);
 
+                let mock_peek_data = {
+                    let mut mock_data = BTreeMap::new();
+                    for table_entry in catalog.user_tables() {
+                        if table_entry.name().item == "t" {
+                            for &dep_id in table_entry.used_by() {
+                                let dep_entry = catalog.get_entry(&dep_id);
+                                if let CatalogItem::Index(index) = &dep_entry.item {
+                                    let row = Row::pack_slice(&[
+                                        Datum::String("hello"),
+                                        Datum::Int32(42),
+                                    ]);
+                                    mock_data.insert(index.global_id, vec![row]);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if mock_data.is_empty() {
+                        None
+                    } else {
+                        Some(mock_data)
+                    }
+                };
+
                 let resp = Ok(StartupResponse {
                     role_id,
                     write_notify: notify,
@@ -735,7 +766,7 @@ impl Coordinator {
                     optimizer_metrics: self.optimizer_metrics.clone(),
                     persist_client: self.persist_client.clone(),
                     statement_logging_frontend,
-                    superuser_attribute,
+                    mock_peek_data,
                 });
                 if tx.send(resp).is_err() {
                     // Failed to send to adapter, but everything is setup so we can terminate
@@ -762,7 +793,7 @@ impl Coordinator {
         user: &User,
         _conn_id: &ConnectionId,
         client_ip: &Option<IpAddr>,
-    ) -> Result<(RoleId, SuperuserAttribute, BTreeMap<String, OwnedVarInput>), AdapterError> {
+    ) -> Result<(RoleId, BTreeMap<String, OwnedVarInput>), AdapterError> {
         if self.catalog().try_get_role_by_name(&user.name).is_none() {
             // If the user has made it to this point, that means they have been fully authenticated.
             // This includes preventing any user, except a pre-defined set of system users, from
@@ -775,13 +806,11 @@ impl Coordinator {
             };
             self.sequence_create_role_for_startup(plan).await?;
         }
-        let role = self
+        let role_id = self
             .catalog()
             .try_get_role_by_name(&user.name)
-            .expect("created above");
-        let role_id = role.id;
-
-        let superuser_attribute = role.attributes.superuser;
+            .expect("created above")
+            .id;
 
         if role_id.is_user() && !ALLOW_USER_SESSIONS.get(self.catalog().system_config().dyncfgs()) {
             return Err(AdapterError::UserSessionsDisallowed);
@@ -868,11 +897,7 @@ impl Coordinator {
         // rather than eagerly on connection startup. This avoids expensive catalog_mut() calls
         // for the common case where connections never create temporary objects.
 
-        Ok((
-            role_id,
-            SuperuserAttribute(superuser_attribute),
-            session_defaults,
-        ))
+        Ok((role_id, session_defaults))
     }
 
     /// Handles an execute command.
@@ -1498,14 +1523,6 @@ impl Coordinator {
                 false
             }
 
-            // `ALTER MATERIALIZED VIEW ... APPLY REPLACEMENT` waits for the target MV to make
-            // enough progress for a clean cutover. If the target MV is stalled, it may block
-            // forever. Checks in sequencing ensure the operation fails if any of these happens
-            // concurrently:
-            //   * the target MV is dropped
-            //   * the replacement MV is dropped
-            Statement::AlterMaterializedViewApplyReplacement(_) => false,
-
             // Everything else must be serialized.
             _ => true,
         }
@@ -1910,7 +1927,7 @@ impl Coordinator {
     }
 
     /// Handle registration of a frontend peek, for statement logging and query cancellation
-    /// handling.
+    /// handling. Fire-and-forget: no response channel.
     fn handle_register_frontend_peek(
         &mut self,
         uuid: Uuid,
@@ -1919,17 +1936,14 @@ impl Coordinator {
         depends_on: BTreeSet<GlobalId>,
         is_fast_path: bool,
         watch_set: Option<WatchSetCreation>,
-        tx: oneshot::Sender<Result<(), AdapterError>>,
     ) {
         let statement_logging_id = watch_set.as_ref().map(|ws| ws.logging_id);
         if let Some(ws) = watch_set {
             if let Err(e) = self.install_peek_watch_sets(conn_id.clone(), ws) {
-                let _ = tx.send(Err(
-                    AdapterError::concurrent_dependency_drop_from_collection_lookup_error(
-                        e, cluster_id,
-                    ),
-                ));
-                return;
+                tracing::warn!(
+                    "failed to install peek watch sets for {uuid}: {e}, \
+                     proceeding without statement logging for this peek"
+                );
             }
         }
 
@@ -1953,18 +1967,16 @@ impl Coordinator {
             .entry(conn_id)
             .or_default()
             .insert(uuid, cluster_id);
-
-        let _ = tx.send(Ok(()));
     }
 
     /// Handle unregistration of a frontend peek that was registered but failed to issue.
     /// This is used for cleanup when `client.peek()` fails after `RegisterFrontendPeek` succeeds.
-    fn handle_unregister_frontend_peek(&mut self, uuid: Uuid, tx: oneshot::Sender<()>) {
+    /// Fire-and-forget: no response channel needed.
+    fn handle_unregister_frontend_peek(&mut self, uuid: Uuid) {
         // Remove from pending_peeks (this also removes from client_pending_peeks)
         if let Some(pending_peek) = self.remove_pending_peek(&uuid) {
             // Retire `ExecuteContextExtra`, because the frontend will log the peek's error result.
             let _ = pending_peek.ctx_extra.defuse();
         }
-        let _ = tx.send(());
     }
 }

@@ -113,7 +113,7 @@ use mz_compute_types::plan::Plan;
 use mz_controller::clusters::{
     ClusterConfig, ClusterEvent, ClusterStatus, ProcessId, ReplicaLocation,
 };
-use mz_controller::{ControllerConfig, Readiness};
+use mz_controller::{ControllerConfig, ControllerResponse, Readiness};
 use mz_controller_types::{ClusterId, ReplicaId, WatchSetId};
 use mz_expr::{MapFilterProject, MirRelationExpr, OptimizedMirRelationExpr, RowSetFinishing};
 use mz_license_keys::ValidatedLicenseKey;
@@ -161,6 +161,9 @@ use mz_storage_types::sinks::{S3SinkFormat, StorageSinkDesc};
 use mz_storage_types::sources::kafka::KAFKA_PROGRESS_DESC;
 use mz_storage_types::sources::{IngestionDescription, SourceExport, Timeline};
 use mz_timestamp_oracle::{TimestampOracleConfig, WriteTimestamp};
+use mz_timestamp_oracle::postgres_oracle::{
+    PostgresTimestampOracle, PostgresTimestampOracleConfig,
+};
 use mz_transform::dataflow::DataflowMetainfo;
 use opentelemetry::trace::TraceContextExt;
 use serde::Serialize;
@@ -237,6 +240,9 @@ pub enum Message {
     ControllerReady {
         controller: ControllerReadiness,
     },
+    /// A controller response that was already extracted from the controller
+    /// (e.g., for non-peek compute responses that need the full message pipeline).
+    ControllerResponse(ControllerResponse),
     PurifiedStatementReady(PurifiedStatementReady),
     CreateConnectionValidationReady(CreateConnectionValidationReady),
     AlterConnectionValidationReady(AlterConnectionValidationReady),
@@ -391,6 +397,16 @@ impl Message {
             Message::ControllerReady {
                 controller: ControllerReadiness::Internal,
             } => "controller_ready(internal)",
+            Message::ControllerResponse(response) => match response {
+                ControllerResponse::PeekNotification(..) => {
+                    "controller_response(peek_notification)"
+                }
+                ControllerResponse::SubscribeResponse(..) => "controller_response(subscribe)",
+                ControllerResponse::CopyToResponse(..) => "controller_response(copy_to)",
+                ControllerResponse::WatchSetFinished(..) => {
+                    "controller_response(watch_set_finished)"
+                }
+            },
             Message::PurifiedStatementReady(_) => "purified_statement_ready",
             Message::CreateConnectionValidationReady(_) => "create_connection_validation_ready",
             Message::TryDeferred { .. } => "try_deferred",
@@ -1749,6 +1765,10 @@ pub struct Coordinator {
     /// to be a pTVC, but for now this is sufficient.
     catalog: Arc<Catalog>,
 
+    /// Watch channel sender for broadcasting catalog updates to worker threads.
+    /// Workers can read the current catalog directly without a coordinator round-trip.
+    catalog_watch_tx: tokio::sync::watch::Sender<Arc<Catalog>>,
+
     /// A client for persist. Initially, this is only used for reading stashed
     /// peek responses out of batches.
     persist_client: PersistClient,
@@ -1862,9 +1882,10 @@ pub struct Coordinator {
     /// Limit for how many concurrent webhook requests we allow.
     webhook_concurrency_limit: WebhookConcurrencyLimiter,
 
-    /// Optional config for the timestamp oracle. This is _required_ when
-    /// a timestamp oracle backend is configured.
-    timestamp_oracle_config: Option<TimestampOracleConfig>,
+    /// Optional config for the Postgres-backed timestamp oracle. This is
+    /// _required_ when `postgres` is configured using the `timestamp_oracle`
+    /// system variable.
+    pg_timestamp_oracle_config: Option<PostgresTimestampOracleConfig>,
 
     /// Periodically asks cluster scheduling policies to make their decisions.
     check_cluster_scheduling_policies_interval: Interval,
@@ -3191,14 +3212,14 @@ impl Coordinator {
                                         force_non_monotonic,
                                     );
 
-                                    // MIR ⇒ MIR optimization (global)
                                     // We make sure to use the HIR SQL type (since MIR SQL types may not be coherent).
                                     let typ = infer_sql_type_for_catalog(
                                         &mv.raw_expr,
                                         &mv.optimized_expr.as_ref().clone(),
                                     );
-                                    let global_mir_plan = optimizer
-                                        .optimize((mv.optimized_expr.as_ref().clone(), typ))?;
+                                    // MIR ⇒ MIR optimization (global)
+                                    let global_mir_plan =
+                                        optimizer.optimize((mv.optimized_expr.as_ref().clone(), typ))?;
                                     let optimized_plan = global_mir_plan.df_desc().clone();
 
                                     // MIR ⇒ LIR lowering and LIR ⇒ LIR optimization (global)
@@ -3479,19 +3500,50 @@ impl Coordinator {
                     },
                     // See [`mz_controller::Controller::Controller::ready`] for notes
                     // on why this is cancel-safe.
-                    // Receive a single command.
+                    // Receive and process a single controller response.
                     () = self.controller.ready() => {
                         // NOTE: We don't get a `Readiness` back from `ready()`
                         // because the controller wants to keep it and it's not
                         // trivially `Clone` or `Copy`. Hence this accessor.
-                        let controller = match self.controller.get_readiness() {
-                            Readiness::Storage => ControllerReadiness::Storage,
-                            Readiness::Compute => ControllerReadiness::Compute,
-                            Readiness::Metrics(_) => ControllerReadiness::Metrics,
-                            Readiness::Internal(_) => ControllerReadiness::Internal,
-                            Readiness::NotReady => unreachable!("just signaled as ready"),
-                        };
-                        messages.push(Message::ControllerReady { controller });
+                        match self.controller.get_readiness() {
+                            Readiness::Compute => {
+                                // Handle compute responses (primarily PeekNotification)
+                                // directly in the serve loop, bypassing the message
+                                // pipeline's tracing spans, OTel context extraction,
+                                // mutex lock, and timing overhead. PeekNotifications
+                                // arrive at ~20K/s during peek workloads and
+                                // handle_peek_notification is a lightweight synchronous
+                                // BTreeMap removal + statement logging retirement.
+                                let storage_metadata = self.catalog.state().storage_metadata();
+                                if let Some(response) = self.controller
+                                    .process(&storage_metadata)
+                                    .expect("`process` never returns an error")
+                                {
+                                    match response {
+                                        ControllerResponse::PeekNotification(uuid, notification, otel_ctx) => {
+                                            self.handle_peek_notification(uuid, notification, otel_ctx);
+                                        }
+                                        other => {
+                                            // Non-peek compute responses (SubscribeResponse,
+                                            // CopyToResponse, FrontierUpper/WatchSetFinished)
+                                            // are infrequent — route through the normal
+                                            // message pipeline for full observability.
+                                            messages.push(Message::ControllerResponse(other));
+                                        }
+                                    }
+                                }
+                            }
+                            readiness => {
+                                let controller = match readiness {
+                                    Readiness::Storage => ControllerReadiness::Storage,
+                                    Readiness::Metrics(_) => ControllerReadiness::Metrics,
+                                    Readiness::Internal(_) => ControllerReadiness::Internal,
+                                    Readiness::NotReady => unreachable!("just signaled as ready"),
+                                    Readiness::Compute => unreachable!("handled above"),
+                                };
+                                messages.push(Message::ControllerReady { controller });
+                            }
+                        }
                     }
                     // See [`appends::GroupCommitWaiter`] for notes on why this is cancel safe.
                     // Receive a single command.
@@ -4158,11 +4210,10 @@ pub fn serve(
         let oracle_init_start = Instant::now();
         info!("startup: coordinator init: timestamp oracle init beginning");
 
-        let timestamp_oracle_config = timestamp_oracle_url
-            .map(|url| TimestampOracleConfig::from_url(&url, &metrics_registry))
-            .transpose()?;
+        let pg_timestamp_oracle_config = timestamp_oracle_url
+            .map(|pg_url| PostgresTimestampOracleConfig::new(&pg_url, &metrics_registry));
         let mut initial_timestamps =
-            get_initial_oracle_timestamps(&timestamp_oracle_config).await?;
+            get_initial_oracle_timestamps(&pg_timestamp_oracle_config).await?;
 
         // Insert an entry for the `EpochMilliseconds` timeline if one doesn't exist,
         // which will ensure that the timeline is initialized since it's required
@@ -4176,7 +4227,7 @@ pub fn serve(
                 &timeline,
                 initial_timestamp,
                 now.clone(),
-                timestamp_oracle_config.clone(),
+                pg_timestamp_oracle_config.clone().map(TimestampOracleConfig::Postgres),
                 &mut timestamp_oracles,
                 read_only_controllers,
             )
@@ -4338,14 +4389,12 @@ pub fn serve(
                 exclude_collections: new_builtin_collections.into_iter().collect(),
             });
 
-        if let Some(TimestampOracleConfig::Postgres(pg_config)) =
-            timestamp_oracle_config.as_ref()
-        {
+        if let Some(config) = pg_timestamp_oracle_config.as_ref() {
             // Apply settings from system vars as early as possible because some
             // of them are locked in right when an oracle is first opened!
             let pg_timestamp_oracle_params =
                 flags::timestamp_oracle_config(catalog.system_config());
-            pg_timestamp_oracle_params.apply(pg_config);
+            pg_timestamp_oracle_params.apply(config);
         }
 
         // Register a callback so whenever the MAX_CONNECTIONS or SUPERUSER_RESERVED_CONNECTIONS
@@ -4414,11 +4463,14 @@ pub fn serve(
                 }
 
                 let catalog = Arc::new(catalog);
+                let (catalog_watch_tx, catalog_watch_rx) =
+                    tokio::sync::watch::channel(Arc::clone(&catalog));
 
                 let caching_secrets_reader = CachingSecretsReader::new(secrets_controller.reader());
                 let mut coord = Coordinator {
                     controller,
                     catalog,
+                    catalog_watch_tx,
                     internal_cmd_tx,
                     group_commit_tx,
                     strict_serializable_reads_tx,
@@ -4450,7 +4502,7 @@ pub fn serve(
                     tracing_handle,
                     statement_logging: StatementLogging::new(coord_now.clone()),
                     webhook_concurrency_limit,
-                    timestamp_oracle_config,
+                    pg_timestamp_oracle_config,
                     check_cluster_scheduling_policies_interval: check_scheduling_policies_interval,
                     cluster_scheduling_decisions: BTreeMap::new(),
                     caught_up_check_interval: clusters_caught_up_check_interval,
@@ -4492,9 +4544,17 @@ pub fn serve(
                     Ok(())
                 });
                 let ok = bootstrap.is_ok();
+                if ok {
+                    // Broadcast the post-bootstrap catalog so workers see
+                    // the fully-initialized catalog, not the pre-bootstrap one.
+                    coord
+                        .catalog_watch_tx
+                        .send_replace(Arc::clone(&coord.catalog));
+                }
                 drop(span);
+                let bootstrap_result = bootstrap.map(|()| catalog_watch_rx);
                 bootstrap_tx
-                    .send(bootstrap)
+                    .send(bootstrap_result)
                     .expect("bootstrap_rx is not dropped until it receives this message");
                 if ok {
                     handle.block_on(coord.serve(
@@ -4510,7 +4570,7 @@ pub fn serve(
             .await
             .expect("bootstrap_tx always sends a message or panics/halts")
         {
-            Ok(()) => {
+            Ok(catalog_watch_rx) => {
                 info!(
                     "startup: coordinator init: coordinator thread start complete in {:?}",
                     coord_thread_start.elapsed()
@@ -4531,6 +4591,7 @@ pub fn serve(
                     now,
                     environment_id,
                     segment_client_clone,
+                    catalog_watch_rx,
                 );
                 Ok((handle, client))
             }
@@ -4554,25 +4615,27 @@ pub fn serve(
 // window (which is the only point where we should switch oracle
 // implementations).
 async fn get_initial_oracle_timestamps(
-    timestamp_oracle_config: &Option<TimestampOracleConfig>,
+    pg_timestamp_oracle_config: &Option<PostgresTimestampOracleConfig>,
 ) -> Result<BTreeMap<Timeline, Timestamp>, AdapterError> {
     let mut initial_timestamps = BTreeMap::new();
 
-    if let Some(config) = timestamp_oracle_config {
-        let oracle_timestamps = config.get_all_timelines().await?;
+    if let Some(pg_timestamp_oracle_config) = pg_timestamp_oracle_config {
+        let postgres_oracle_timestamps =
+            PostgresTimestampOracle::<NowFn>::get_all_timelines(pg_timestamp_oracle_config.clone())
+                .await?;
 
         let debug_msg = || {
-            oracle_timestamps
+            postgres_oracle_timestamps
                 .iter()
                 .map(|(timeline, ts)| format!("{:?} -> {}", timeline, ts))
                 .join(", ")
         };
         info!(
-            "current timestamps from the timestamp oracle: {}",
+            "current timestamps from the postgres-backed timestamp oracle: {}",
             debug_msg()
         );
 
-        for (timeline, ts) in oracle_timestamps {
+        for (timeline, ts) in postgres_oracle_timestamps {
             let entry = initial_timestamps
                 .entry(Timeline::from_str(&timeline).expect("could not parse timeline"));
 
@@ -4581,7 +4644,7 @@ async fn get_initial_oracle_timestamps(
                 .or_insert(ts);
         }
     } else {
-        info!("no timestamp oracle configured!");
+        info!("no postgres url for postgres-backed timestamp oracle configured!");
     };
 
     let debug_msg = || {
@@ -4823,6 +4886,9 @@ pub(crate) fn validate_ip_with_policy_rules(
     }
 }
 
+/// Infers the SQL relation type for the catalog by combining HIR and MIR type
+/// information. We use the HIR type as the base (since MIR types may not be
+/// coherent) and backport nullability and keys from the MIR type.
 pub(crate) fn infer_sql_type_for_catalog(
     hir_expr: &HirRelationExpr,
     mir_expr: &MirRelationExpr,

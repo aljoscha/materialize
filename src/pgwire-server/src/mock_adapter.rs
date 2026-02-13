@@ -22,7 +22,6 @@ use mz_adapter::catalog::Catalog;
 use mz_adapter::statement_logging::{StatementLoggingFrontend, ThrottlingState};
 use mz_adapter::{
     CatalogSnapshot, Client, Command, ExecuteResponse, Response, StartupResponse,
-    SuperuserAttribute,
 };
 use mz_build_info::{BuildInfo, build_info};
 use mz_ore::metrics::MetricsRegistry;
@@ -257,6 +256,8 @@ impl MockAdapterService {
         })
         .await;
         let catalog = Arc::new(catalog_extract.expect("missing catalog"));
+        let (catalog_watch_tx, catalog_watch_rx) = tokio::sync::watch::channel(Arc::clone(&catalog));
+        let _ = catalog_watch_tx; // keep alive
         let client = Client::new(
             &BUILD_INFO,
             cmd_tx,
@@ -264,6 +265,7 @@ impl MockAdapterService {
             SYSTEM_TIME.clone(),
             environment_id,
             None, // No segment client
+            catalog_watch_rx,
         );
 
         let storage_collections: Arc<
@@ -298,7 +300,6 @@ impl MockAdapterService {
                         let role_id = mz_repr::role_id::RoleId::Public;
                         let res = Ok(StartupResponse {
                             role_id,
-                            superuser_attribute: SuperuserAttribute(None),
                             write_notify: Box::pin(future::ready(())),
                             session_defaults: BTreeMap::default(),
                             catalog: Arc::clone(&catalog),
@@ -307,6 +308,7 @@ impl MockAdapterService {
                             optimizer_metrics: optimizer_metrics.clone(),
                             persist_client: persist_client.clone(),
                             statement_logging_frontend: statement_logging_frontend.clone(),
+                            mock_peek_data: None,
                         });
                         if let Err(err) = tx.send(res) {
                             tracing::error!("error starting session: {:?}", err);

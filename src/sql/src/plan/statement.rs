@@ -469,6 +469,17 @@ pub fn plan_copy_from(
     query::plan_copy_from_rows(pcx, catalog, target_id, target_name, columns, rows)
 }
 
+/// Plans and describes a SELECT statement in a single pass, avoiding the
+/// redundant `plan_root_query` call that happens when `describe` and `plan`
+/// are called separately.
+pub fn plan_and_describe_select(
+    scx: &StatementContext,
+    select: mz_sql_parser::ast::SelectStatement<super::super::names::Aug>,
+    params: &Params,
+) -> Result<(Plan, StatementDesc), PlanError> {
+    dml::plan_and_describe_select(scx, select, params)
+}
+
 /// Whether a SQL object type can be interpreted as matching the type of the given catalog item.
 /// For example, if `v` is a view, `DROP SOURCE v` should not work, since Source and View
 /// are non-matching types.

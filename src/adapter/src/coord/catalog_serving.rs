@@ -18,6 +18,8 @@
 //!
 //! [`mz_catalog_server`]: https://materialize.com/docs/sql/show-clusters/#mz_catalog_server-system-cluster
 
+use std::collections::BTreeSet;
+
 use mz_expr::CollectionPlan;
 use mz_repr::GlobalId;
 use mz_repr::namespaces::is_system_schema;
@@ -36,6 +38,18 @@ use mz_catalog::builtin::MZ_CATALOG_SERVER_CLUSTER;
 
 /// Checks whether or not we should automatically run a query on the `mz_catalog_server`
 /// cluster, as opposed to whatever the current default cluster is.
+/// Variant of [`auto_run_on_catalog_server`] that accepts pre-computed `source_ids` and
+/// `could_run_expensive_function` to avoid redundant `depends_on()` / tree traversals
+/// when the caller has already computed these.
+pub fn auto_run_on_catalog_server_with_source_ids(
+    catalog: &ConnCatalog<'_>,
+    session: &Session,
+    source_ids: &BTreeSet<GlobalId>,
+    could_run_expensive_function: bool,
+) -> TargetCluster {
+    auto_run_on_catalog_server_inner(catalog, session, source_ids, could_run_expensive_function)
+}
+
 pub fn auto_run_on_catalog_server<'a, 's, 'p>(
     catalog: &'a ConnCatalog<'a>,
     session: &'s Session,
@@ -147,6 +161,15 @@ pub fn auto_run_on_catalog_server<'a, 's, 'p>(
         | Plan::SideEffectingFunc(_) => return TargetCluster::Active,
     };
 
+    auto_run_on_catalog_server_inner(catalog, session, &depends_on, could_run_expensive_function)
+}
+
+fn auto_run_on_catalog_server_inner(
+    catalog: &ConnCatalog<'_>,
+    session: &Session,
+    depends_on: &BTreeSet<GlobalId>,
+    could_run_expensive_function: bool,
+) -> TargetCluster {
     // Bail if the user has disabled it via the SessionVar.
     if !session.vars().auto_route_catalog_queries() {
         return TargetCluster::Active;
@@ -159,8 +182,8 @@ pub fn auto_run_on_catalog_server<'a, 's, 'p>(
 
     // These dependencies are just existing dataflows that are referenced in the plan.
     let mut depends_on = depends_on
-        .into_iter()
-        .map(|gid| catalog.resolve_item_id(&gid))
+        .iter()
+        .map(|gid| catalog.resolve_item_id(gid))
         .peekable();
     let has_dependencies = depends_on.peek().is_some();
 

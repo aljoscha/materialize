@@ -229,14 +229,68 @@ pub fn describe(
     param_types: &[Option<SqlScalarType>],
     session: &Session,
 ) -> Result<StatementDesc, AdapterError> {
+    let (desc, _resolved_stmt, _resolved_ids) =
+        describe_and_resolve(catalog, stmt, param_types, session)?;
+    Ok(desc)
+}
+
+/// Like [`describe`], but also returns the resolved statement and resolved IDs
+/// so callers can reuse them (e.g., to skip redundant name resolution during execution).
+pub fn describe_and_resolve(
+    catalog: &Catalog,
+    stmt: Statement<Raw>,
+    param_types: &[Option<SqlScalarType>],
+    session: &Session,
+) -> Result<
+    (
+        StatementDesc,
+        mz_sql::ast::Statement<mz_sql::names::Aug>,
+        mz_sql::names::ResolvedIds,
+    ),
+    AdapterError,
+> {
     let catalog = &catalog.for_session(session);
-    let (stmt, _) = mz_sql::names::resolve(catalog, stmt)?;
-    Ok(mz_sql::plan::describe(
-        session.pcx(),
-        catalog,
-        stmt,
-        param_types,
-    )?)
+    let (stmt, resolved_ids) = mz_sql::names::resolve(catalog, stmt)?;
+    let desc = mz_sql::plan::describe(session.pcx(), catalog, stmt.clone(), param_types)?;
+    Ok((desc, stmt, resolved_ids))
+}
+
+/// Like [`describe_and_resolve`], but also plans the statement. For SELECT
+/// statements, this avoids a redundant call to `plan_root_query` that would
+/// otherwise happen when `describe` and `plan` are called separately.
+pub fn resolve_plan_and_describe(
+    catalog: &Catalog,
+    stmt: Statement<Raw>,
+    session: &Session,
+) -> Result<
+    (
+        StatementDesc,
+        mz_sql::plan::Plan,
+        mz_sql::names::ResolvedIds,
+    ),
+    AdapterError,
+> {
+    let conn_catalog = &catalog.for_session(session);
+    let (resolved_stmt, resolved_ids) = mz_sql::names::resolve(conn_catalog, stmt)?;
+    let params = mz_sql::plan::Params::empty();
+    // For SELECT statements, use the combined plan+describe path to avoid
+    // calling plan_root_query twice.
+    if let mz_sql::ast::Statement::Select(select_stmt) = resolved_stmt {
+        let scx = mz_sql::plan::StatementContext::new(Some(session.pcx()), conn_catalog);
+        let (plan, desc) = mz_sql::plan::plan_and_describe_select(&scx, select_stmt, &params)?;
+        Ok((desc, plan, resolved_ids))
+    } else {
+        // Non-SELECT: use the standard describe + plan path.
+        let desc = mz_sql::plan::describe(session.pcx(), conn_catalog, resolved_stmt.clone(), &[])?;
+        let plan = mz_sql::plan::plan(
+            Some(session.pcx()),
+            conn_catalog,
+            resolved_stmt,
+            &params,
+            &resolved_ids,
+        )?;
+        Ok((desc, plan, resolved_ids))
+    }
 }
 
 pub trait ResultExt<T> {

@@ -10,6 +10,8 @@
 //! Various utility methods used by the [`Coordinator`]. Ideally these are all
 //! put in more meaningfully named modules.
 
+use std::sync::Arc;
+
 use itertools::Itertools;
 use mz_adapter_types::connection::ConnectionId;
 use mz_ore::now::EpochMillis;

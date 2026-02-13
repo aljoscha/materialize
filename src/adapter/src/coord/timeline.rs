@@ -194,7 +194,7 @@ impl Coordinator {
             timeline,
             Timestamp::minimum(),
             self.catalog().config().now.clone(),
-            self.timestamp_oracle_config.clone(),
+            self.pg_timestamp_oracle_config.clone().map(TimestampOracleConfig::Postgres),
             &mut self.global_timelines,
             self.read_only_controllers,
         )

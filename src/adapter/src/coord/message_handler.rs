@@ -74,6 +74,12 @@ impl Coordinator {
                     self.message_controller(m).boxed_local().await
                 }
             }
+            Message::ControllerResponse(response) => {
+                // Pre-extracted controller response (e.g., non-peek compute
+                // responses that were extracted in the serve loop but need
+                // the full message pipeline for observability).
+                self.message_controller(response).boxed_local().await
+            }
             Message::PurifiedStatementReady(ready) => {
                 self.message_purified_statement_ready(ready)
                     .boxed_local()

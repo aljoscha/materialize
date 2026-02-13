@@ -212,6 +212,25 @@ pub fn plan_select(
     Ok(Plan::Select(plan))
 }
 
+/// Plans and describes a SELECT statement in a single pass, avoiding the
+/// redundant `plan_root_query` call that happens when `describe_select` and
+/// `plan_select` are called separately.
+pub fn plan_and_describe_select(
+    scx: &StatementContext,
+    select: SelectStatement<Aug>,
+    params: &Params,
+) -> Result<(Plan, StatementDesc), PlanError> {
+    if let Some(f) = side_effecting_func::plan_select_if_side_effecting(scx, &select, params)? {
+        let desc = side_effecting_func::describe_select_if_side_effecting(scx, &select)?
+            .map(|d| StatementDesc::new(Some(d)))
+            .unwrap_or_else(|| StatementDesc::new(None));
+        return Ok((Plan::SideEffectingFunc(f), desc));
+    }
+
+    let (plan, desc) = plan_select_inner(scx, select, params, None)?;
+    Ok((Plan::Select(plan), StatementDesc::new(Some(desc))))
+}
+
 fn plan_select_inner(
     scx: &StatementContext,
     select: SelectStatement<Aug>,
@@ -1244,7 +1263,7 @@ GROUP BY om.global_id"#));
                     order_by.extend([
                         "max_operator_memory_ratio DESC",
                         "max_operator_records_ratio DESC",
-                        "om.worker_memory DESC",
+                        "worker_memory DESC",
                         "worker_records DESC",
                     ]);
 
@@ -1283,7 +1302,7 @@ GROUP BY pomt.global_id
                         "pg_size_pretty(omt.total_memory) AS total_memory",
                         "omt.total_records AS total_records",
                     ]);
-                    order_by.extend(["omt.total_memory DESC", "total_records DESC"]);
+                    order_by.extend(["total_memory DESC", "total_records DESC"]);
                 }
             }
             ExplainAnalyzeComputationProperty::Cpu => {

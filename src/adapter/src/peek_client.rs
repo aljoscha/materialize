@@ -7,38 +7,70 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use differential_dataflow::consolidation::consolidate;
 use mz_compute_client::controller::InstanceClient;
 use mz_compute_client::controller::error::{CollectionLookupError, InstanceMissing};
+use mz_compute_client::controller::instance_client::SharedCollectionState;
 use mz_compute_client::protocol::command::PeekTarget;
 use mz_compute_types::ComputeInstanceId;
+use mz_expr::RowSetFinishing;
 use mz_expr::row::RowCollection;
 use mz_ore::cast::CastFrom;
 use mz_persist_client::PersistClient;
+use mz_repr::SqlRelationType;
 use mz_repr::Timestamp;
 use mz_repr::global_id::TransientIdGen;
-use mz_repr::{RelationDesc, Row};
+use mz_repr::{GlobalId, RelationDesc, Row};
+use mz_sql::ast::{Raw, Statement};
 use mz_sql::optimizer_metrics::OptimizerMetrics;
+use mz_sql::plan::{QueryWhen, StatementDesc};
+use mz_storage_types::read_holds::ReadHold;
 use mz_storage_types::sources::Timeline;
 use mz_timestamp_oracle::TimestampOracle;
+use mz_transform::dataflow::DataflowMetainfo;
 use prometheus::Histogram;
+use prometheus::core::{AtomicU64, GenericCounter};
 use timely::progress::Antichain;
+use timely::progress::Timestamp as TimelyTimestamp;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::catalog::Catalog;
+
+/// Generate a UUID using a thread-local fast (non-cryptographic) RNG.
+///
+/// `Uuid::new_v4()` reads from `/dev/urandom` on every call, which is a syscall.
+/// For peek UUIDs we only need uniqueness (not cryptographic randomness), so we
+/// seed a fast PRNG once from the OS and reuse it for all subsequent UUIDs on
+/// this thread.
+fn fast_new_uuid_v4() -> Uuid {
+    use rand::RngCore;
+    thread_local! {
+        static RNG: std::cell::RefCell<rand::rngs::SmallRng> = std::cell::RefCell::new(
+            <rand::rngs::SmallRng as rand::SeedableRng>::from_os_rng()
+        );
+    }
+    RNG.with(|rng| {
+        let mut bytes = [0u8; 16];
+        rng.borrow_mut().fill_bytes(&mut bytes);
+        uuid::Builder::from_random_bytes(bytes).into_uuid()
+    })
+}
+
 use crate::command::{CatalogSnapshot, Command};
 use crate::coord::Coordinator;
-use crate::coord::peek::FastPathPlan;
+use crate::coord::peek::{FastPathPlan, PeekPlan, PeekResponseUnary};
 use crate::statement_logging::WatchSetCreation;
 use crate::statement_logging::{
     FrontendStatementLoggingEvent, PreparedStatementEvent, StatementLoggingFrontend,
     StatementLoggingId,
 };
-use crate::{AdapterError, Client, CollectionIdBundle, ReadHolds, statement_logging};
+use crate::{
+    AdapterError, Client, CollectionIdBundle, ReadHolds, TimelineContext, statement_logging,
+};
 
 /// Storage collections trait alias we need to consult for since/frontiers.
 pub type StorageCollectionsHandle = Arc<
@@ -46,6 +78,55 @@ pub type StorageCollectionsHandle = Arc<
         + Send
         + Sync,
 >;
+
+/// Cached result of planning and optimization for a query, keyed by SQL text.
+/// This allows us to skip parsing, name resolution, planning, and optimization
+/// for repeated queries.
+#[derive(Clone, Debug)]
+pub struct PlanCacheEntry {
+    /// The statement description (for portal setup in declare).
+    pub desc: StatementDesc,
+    /// The optimized peek plan (FastPath or SlowPath).
+    pub peek_plan: PeekPlan,
+    /// Dataflow metadata from optimization.
+    pub df_meta: DataflowMetainfo,
+    /// The result type from optimization.
+    pub typ: SqlRelationType,
+    /// Pre-computed source IDs (from depends_on).
+    pub source_ids: BTreeSet<GlobalId>,
+    /// The finishing instructions (ORDER BY, LIMIT, OFFSET, PROJECT).
+    pub finishing: RowSetFinishing,
+    /// When to execute the query.
+    pub when: QueryWhen,
+    /// Pre-computed collection ID bundle (for timestamp determination).
+    pub input_id_bundle: CollectionIdBundle,
+    /// Pre-computed timeline context.
+    pub timeline_context: TimelineContext,
+    /// The target cluster ID for execution.
+    pub target_cluster_id: ComputeInstanceId,
+    /// The parsed SQL statement, cached to skip SQL parsing on cache hit.
+    /// Stored as Arc to avoid deep-cloning the AST on every cache lookup.
+    pub parsed_stmt: Arc<Statement<Raw>>,
+    /// Pre-built result description for the peek command. Cached to avoid
+    /// per-query `format!("peek_{i}")` column name construction and
+    /// `RelationDesc::new()` BTreeMap building. Wrapped in `Arc` to avoid
+    /// per-query deep clones of the `BTreeMap<ColumnIndex, ColumnMetadata>`
+    /// (which scales ~5.6x worse at 64 connections due to allocator contention).
+    pub result_desc: Arc<RelationDesc>,
+    /// Pre-extracted compute collection IDs for the single-compute-instance
+    /// fast path. When `input_id_bundle.compute_ids` has exactly one entry,
+    /// this stores the collection IDs directly, avoiding a per-query
+    /// `BTreeMap::first_key_value()` traversal that scales poorly under
+    /// concurrency (8x overhead at 64 connections due to CPU cache pressure).
+    pub single_compute_collection_ids: Option<Vec<GlobalId>>,
+    /// Pre-wrapped `RelationDesc` from `desc.relation_desc` for the pgwire
+    /// response encoding. Stored as `Arc` to avoid deep-cloning the
+    /// `BTreeMap<ColumnIndex, ColumnMetadata>` on every cached peek.
+    /// This is the table's RelationDesc (with actual column names), used for
+    /// RowDescription encoding, distinct from `result_desc` (which has
+    /// auto-generated "peek_0", "peek_1" names for the compute command).
+    pub relation_desc_for_response: Option<Arc<RelationDesc>>,
+}
 
 /// Clients needed for peek sequencing in the Adapter Frontend.
 #[derive(Debug)]
@@ -55,7 +136,7 @@ pub struct PeekClient {
     /// Note that these are never cleaned up. In theory, this could lead to a very slow memory leak
     /// if a long-running user session keeps peeking on clusters that are being created and dropped
     /// in a hot loop. Hopefully this won't occur any time soon.
-    compute_instances: BTreeMap<ComputeInstanceId, InstanceClient<Timestamp>>,
+    pub(crate) compute_instances: BTreeMap<ComputeInstanceId, InstanceClient<Timestamp>>,
     /// Handle to storage collections for reading frontiers and policies.
     pub storage_collections: StorageCollectionsHandle,
     /// A generator for transient `GlobalId`s, shared with Coordinator.
@@ -66,6 +147,46 @@ pub struct PeekClient {
     persist_client: PersistClient,
     /// Statement logging state for frontend peek sequencing.
     pub statement_logging_frontend: StatementLoggingFrontend,
+    /// Optional mock data for peek testing. When set, PeekExisting queries
+    /// on these GlobalIds return mock rows, bypassing the compute layer.
+    mock_peek_data: Option<BTreeMap<GlobalId, Vec<Row>>>,
+    /// Plan cache: maps SQL text to cached planning + optimization results.
+    /// Allows skipping parse/resolve/plan/optimize for repeated queries.
+    /// Wrapped in `Arc` so cache lookups only do an atomic refcount increment
+    /// instead of deep-cloning the entire entry.
+    pub plan_cache: HashMap<Arc<str>, Arc<PlanCacheEntry>>,
+    /// Cached shared collection state for compute collections, allowing direct
+    /// mutex-based access to read capabilities and write frontiers without going
+    /// through the compute instance task via `call_sync`.
+    pub(crate) shared_collection_states:
+        BTreeMap<(ComputeInstanceId, GlobalId), SharedCollectionState<Timestamp>>,
+    /// Cached string representation of compute instance IDs, to avoid per-query
+    /// `to_string()` String allocations in metric label construction.
+    pub(crate) cached_instance_id_strs: BTreeMap<ComputeInstanceId, String>,
+    /// Cached dyncfg handles for peek stash configuration. Avoids per-query
+    /// BTreeMap<String> lookups in `Config::get()`. Lazily initialized.
+    cached_peek_stash_handles: Option<(
+        mz_dyncfg::ConfigValHandle<usize>,
+        mz_dyncfg::ConfigValHandle<usize>,
+    )>,
+    /// Cached Histogram handle for `frontend_peek_seconds` with the
+    /// "try_frontend_peek_cached" label. Avoids per-query `with_label_values`
+    /// HashMap lookup.
+    cached_peek_cached_histogram: Option<Histogram>,
+    /// Cached Histogram handle for `frontend_peek_seconds` with the
+    /// "try_frontend_peek" label. Used in `try_cached_peek_direct`.
+    cached_peek_outer_histogram: Option<Histogram>,
+    /// Cached `query_total` counter keyed by `(session_type, statement_type)`.
+    /// Avoids per-query `with_label_values` HashMap lookup.
+    cached_query_total: Option<(&'static str, &'static str, GenericCounter<AtomicU64>)>,
+    /// Persistent read holds for compute collections, keyed by (instance, id).
+    /// These prevent compaction at the collection's since frontier and allow
+    /// per-query read holds to be acquired via `ReadHold::clone()` (which sends
+    /// +1 through an async channel) instead of `acquire_read_hold_direct()`
+    /// (which locks a contended mutex and triggers `MutableAntichain::rebuild()`).
+    /// At 64+ concurrent connections, this eliminates the mutex serialization
+    /// bottleneck in the read hold acquisition path.
+    pub(crate) cached_read_holds: BTreeMap<(ComputeInstanceId, GlobalId), ReadHold<Timestamp>>,
 }
 
 impl PeekClient {
@@ -77,6 +198,7 @@ impl PeekClient {
         optimizer_metrics: OptimizerMetrics,
         persist_client: PersistClient,
         statement_logging_frontend: StatementLoggingFrontend,
+        mock_peek_data: Option<BTreeMap<GlobalId, Vec<Row>>>,
     ) -> Self {
         Self {
             coordinator_client,
@@ -87,13 +209,95 @@ impl PeekClient {
             statement_logging_frontend,
             oracles: Default::default(), // lazily populated
             persist_client,
+            mock_peek_data,
+            plan_cache: Default::default(),
+            shared_collection_states: Default::default(),
+            cached_instance_id_strs: Default::default(),
+            cached_peek_stash_handles: None,
+            cached_peek_cached_histogram: None,
+            cached_peek_outer_histogram: None,
+            cached_query_total: None,
+            cached_read_holds: Default::default(),
         }
     }
 
+    pub(crate) fn metrics(&self) -> &crate::metrics::Metrics {
+        self.coordinator_client.metrics()
+    }
+
+    /// Get the cached string representation of a compute instance ID.
+    /// Avoids per-query `to_string()` String allocations for metric labels.
+    pub fn instance_id_str(&mut self, instance_id: ComputeInstanceId) -> &str {
+        self.cached_instance_id_strs
+            .entry(instance_id)
+            .or_insert_with(|| instance_id.to_string())
+    }
+
+    /// Get cached dyncfg handles for peek stash configuration.
+    /// Amortizes the BTreeMap<String> name lookup to a one-time cost;
+    /// subsequent calls just do an atomic load.
+    pub fn peek_stash_handles(&mut self, dyncfgs: &mz_dyncfg::ConfigSet) -> (usize, usize) {
+        let handles = self.cached_peek_stash_handles.get_or_insert_with(|| {
+            (
+                mz_compute_types::dyncfgs::PEEK_RESPONSE_STASH_READ_BATCH_SIZE_BYTES
+                    .handle(dyncfgs),
+                mz_compute_types::dyncfgs::PEEK_RESPONSE_STASH_READ_MEMORY_BUDGET_BYTES
+                    .handle(dyncfgs),
+            )
+        });
+        (handles.0.get(), handles.1.get())
+    }
+
+    /// Get the cached Histogram handle for `frontend_peek_seconds` with the
+    /// "try_frontend_peek_cached" label.
+    pub fn peek_cached_histogram(&mut self) -> &Histogram {
+        self.cached_peek_cached_histogram.get_or_insert_with(|| {
+            self.coordinator_client
+                .metrics()
+                .frontend_peek_seconds
+                .with_label_values(&["try_frontend_peek_cached"])
+        })
+    }
+
+    /// Get the cached Histogram handle for `frontend_peek_seconds` with the
+    /// "try_frontend_peek" label. Used in `try_cached_peek_direct`.
+    pub fn peek_outer_histogram(&mut self) -> &Histogram {
+        self.cached_peek_outer_histogram.get_or_insert_with(|| {
+            self.coordinator_client
+                .metrics()
+                .frontend_peek_seconds
+                .with_label_values(&["try_frontend_peek"])
+        })
+    }
+
+    /// Get the cached `query_total` counter for the given label pair.
+    /// If the labels changed (different user type or statement type),
+    /// the cache is invalidated and a new counter is resolved.
+    pub fn query_total_counter(
+        &mut self,
+        session_type: &'static str,
+        statement_type: &'static str,
+    ) -> &GenericCounter<AtomicU64> {
+        if let Some((st, stmt, _)) = &self.cached_query_total {
+            if *st == session_type && *stmt == statement_type {
+                return &self.cached_query_total.as_ref().unwrap().2;
+            }
+        }
+        let counter = self
+            .coordinator_client
+            .metrics()
+            .query_total
+            .with_label_values(&[session_type, statement_type]);
+        self.cached_query_total = Some((session_type, statement_type, counter));
+        &self.cached_query_total.as_ref().unwrap().2
+    }
+
+    /// Ensures a compute instance client is cached. After calling this, access
+    /// the client via `self.compute_instances[&compute_instance]`.
     pub async fn ensure_compute_instance_client(
         &mut self,
         compute_instance: ComputeInstanceId,
-    ) -> Result<InstanceClient<Timestamp>, InstanceMissing> {
+    ) -> Result<(), InstanceMissing> {
         if !self.compute_instances.contains_key(&compute_instance) {
             let client = self
                 .call_coordinator(|tx| Command::GetComputeInstanceClient {
@@ -103,11 +307,7 @@ impl PeekClient {
                 .await?;
             self.compute_instances.insert(compute_instance, client);
         }
-        Ok(self
-            .compute_instances
-            .get(&compute_instance)
-            .expect("ensured above")
-            .clone())
+        Ok(())
     }
 
     pub async fn ensure_oracle(
@@ -190,23 +390,60 @@ impl PeekClient {
         }
 
         for (&instance_id, collection_ids) in &id_bundle.compute_ids {
-            let client = self.ensure_compute_instance_client(instance_id).await?;
+            // Check if ALL collection_ids for this instance are mocked.
+            let all_mocked = self.mock_peek_data.as_ref().is_some_and(|mock_data| {
+                collection_ids.iter().all(|id| mock_data.contains_key(id))
+            });
 
-            for (id, read_hold, write_frontier) in client
-                .acquire_read_holds_and_collection_write_frontiers(
-                    collection_ids.iter().copied().collect(),
-                )
-                .await?
-            {
-                let prev = read_holds
-                    .compute_holds
-                    .insert((instance_id, id), read_hold);
-                assert!(
-                    prev.is_none(),
-                    "duplicate compute ID in id_bundle {id_bundle:?}"
-                );
+            if all_mocked {
+                // Create no-op read holds for mocked collections.
+                let no_op_tx: mz_storage_types::read_holds::ChangeTx<Timestamp> =
+                    Arc::new(|_id, _changes| Ok(()));
+                for &id in collection_ids {
+                    let hold = ReadHold::new(
+                        id,
+                        Antichain::from_elem(TimelyTimestamp::minimum()),
+                        no_op_tx.clone(),
+                    );
+                    let prev = read_holds.compute_holds.insert((instance_id, id), hold);
+                    assert!(
+                        prev.is_none(),
+                        "duplicate compute ID in id_bundle {id_bundle:?}"
+                    );
+                }
+                upper.extend(Antichain::from_elem(1.into()));
+            } else {
+                self.ensure_compute_instance_client(instance_id).await?;
 
-                upper.extend(write_frontier);
+                for &id in collection_ids {
+                    let key = (instance_id, id);
+                    // Lazily fetch and cache the SharedCollectionState on first access.
+                    if !self.shared_collection_states.contains_key(&key) {
+                        let shared = self.compute_instances[&instance_id]
+                            .collection_shared_state(id)
+                            .await?;
+                        self.shared_collection_states.insert(key, shared);
+                    }
+                    let shared = self
+                        .shared_collection_states
+                        .get(&key)
+                        .expect("just inserted");
+
+                    let read_hold =
+                        self.compute_instances[&instance_id].acquire_read_hold_direct(id, shared);
+                    let write_frontier =
+                        shared.lock_write_frontier(|f: &mut Antichain<Timestamp>| f.clone());
+
+                    let prev = read_holds
+                        .compute_holds
+                        .insert((instance_id, id), read_hold);
+                    assert!(
+                        prev.is_none(),
+                        "duplicate compute ID in id_bundle {id_bundle:?}"
+                    );
+
+                    upper.extend(write_frontier);
+                }
             }
         }
 
@@ -228,11 +465,11 @@ impl PeekClient {
         finishing: mz_expr::RowSetFinishing,
         compute_instance: ComputeInstanceId,
         target_replica: Option<mz_cluster_client::ReplicaId>,
-        intermediate_result_type: mz_repr::SqlRelationType,
+        result_desc: Arc<RelationDesc>,
         max_result_size: u64,
         max_returned_query_size: Option<u64>,
         row_set_finishing_seconds: Histogram,
-        input_read_holds: ReadHolds<Timestamp>,
+        target_read_hold: Option<ReadHold<Timestamp>>,
         peek_stash_read_batch_size_bytes: usize,
         peek_stash_read_memory_budget_bytes: usize,
         conn_id: mz_adapter_types::connection::ConnectionId,
@@ -293,14 +530,43 @@ impl PeekClient {
             };
         }
 
+        // If this is a PeekExisting on a mocked index, return mock rows via the
+        // streaming path so that metrics (e.g. mz_time_to_first_row_seconds) are
+        // recorded with the correct instance_id and strategy labels.
+        if let FastPathPlan::PeekExisting(_coll_id, idx_id, _, _) = &fast_path {
+            if let Some(mock_rows) = self.mock_peek_data.as_ref().and_then(|m| m.get(idx_id)) {
+                let results: Vec<_> = mock_rows
+                    .iter()
+                    .map(|row| (row.clone(), std::num::NonZeroUsize::new(1).unwrap()))
+                    .collect();
+                let row_collection = RowCollection::new(results, &finishing.order_by);
+                return match finishing.finish(
+                    row_collection,
+                    max_result_size,
+                    max_returned_query_size,
+                    &row_set_finishing_seconds,
+                ) {
+                    Ok((rows, _bytes)) => {
+                        let row_iter = Box::new(mz_repr::IntoRowIterator::into_row_iter(rows));
+                        let stream = futures::stream::once(futures::future::ready(
+                            PeekResponseUnary::Rows(row_iter),
+                        ));
+                        Ok(crate::ExecuteResponse::SendingRowsStreaming {
+                            rows: Box::pin(stream),
+                            instance_id: compute_instance,
+                            strategy: statement_logging::StatementExecutionStrategy::FastPath,
+                        })
+                    }
+                    Err(e) => Err(AdapterError::ResultSize(e)),
+                };
+            }
+        }
+
         let (peek_target, target_read_hold, literal_constraints, mfp, strategy) = match fast_path {
             FastPathPlan::PeekExisting(_coll_id, idx_id, literal_constraints, mfp) => {
                 let peek_target = PeekTarget::Index { id: idx_id };
-                let target_read_hold = input_read_holds
-                    .compute_holds
-                    .get(&(compute_instance, idx_id))
-                    .expect("missing compute read hold on PeekExisting peek target")
-                    .clone();
+                let target_read_hold =
+                    target_read_hold.expect("missing read hold for PeekExisting peek target");
                 let strategy = statement_logging::StatementExecutionStrategy::FastPath;
                 (
                     peek_target,
@@ -321,11 +587,8 @@ impl PeekClient {
                     id: coll_id,
                     metadata,
                 };
-                let target_read_hold = input_read_holds
-                    .storage_holds
-                    .get(&coll_id)
-                    .expect("missing storage read hold on PeekPersist peek target")
-                    .clone();
+                let target_read_hold =
+                    target_read_hold.expect("missing read hold for PeekPersist peek target");
                 let strategy = statement_logging::StatementExecutionStrategy::PersistFastPath;
                 (
                     peek_target,
@@ -342,60 +605,56 @@ impl PeekClient {
         };
 
         let (rows_tx, rows_rx) = oneshot::channel();
-        let uuid = Uuid::new_v4();
+        let uuid = fast_new_uuid_v4();
 
-        // At this stage we don't know column names for the result because we
-        // only know the peek's result type as a bare SqlRelationType.
-        let cols = (0..intermediate_result_type.arity()).map(|i| format!("peek_{i}"));
-        let result_desc = RelationDesc::new(intermediate_result_type.clone(), cols);
+        // result_desc is now passed in pre-built (cached in PlanCacheEntry or built by caller).
 
-        let client = self
-            .ensure_compute_instance_client(compute_instance)
+        self.ensure_compute_instance_client(compute_instance)
             .await
             .map_err(AdapterError::concurrent_dependency_drop_from_instance_missing)?;
 
-        // Register coordinator tracking of this peek. This has to complete before issuing the peek.
+        // Register coordinator tracking of this peek (fire-and-forget).
+        // The coordinator will process this asynchronously. There is a benign race where compute
+        // might respond before the coordinator stores the registration, in which case the
+        // peek notification handler will silently ignore the response (it already handles
+        // missing peeks for cancellation).
         //
         // Warning: If we fail to actually issue the peek after this point, then we need to
         // unregister it to avoid an orphaned registration.
-        self.call_coordinator(|tx| Command::RegisterFrontendPeek {
+        self.coordinator_client.send(Command::RegisterFrontendPeek {
             uuid,
             conn_id: conn_id.clone(),
             cluster_id: compute_instance,
             depends_on,
             is_fast_path: true,
             watch_set,
-            tx,
-        })
-        .await?;
+        });
 
         let finishing_for_instance = finishing.clone();
-        let peek_result = client
-            .peek(
-                peek_target,
-                literal_constraints,
-                uuid,
-                timestamp,
-                result_desc,
-                finishing_for_instance,
-                mfp,
-                target_read_hold,
-                target_replica,
-                rows_tx,
-            )
-            .await;
+        // Unwrap Arc<RelationDesc> to owned. For the PeekExisting fast path
+        // (cached queries), this clone is unavoidable because the Peek command
+        // is serialized and sent to the compute worker. However, for Constant
+        // fast-path peeks (handled above), the Arc avoids the clone entirely.
+        let result_desc_owned = Arc::unwrap_or_clone(result_desc);
+        let peek_result = self.compute_instances[&compute_instance].peek(
+            peek_target,
+            literal_constraints,
+            uuid,
+            timestamp,
+            result_desc_owned,
+            finishing_for_instance,
+            mfp,
+            target_read_hold,
+            target_replica,
+            rows_tx,
+        );
 
         if let Err(err) = peek_result {
-            // Clean up the registered peek since the peek failed to issue.
+            // Clean up the registered peek since the peek failed to issue (fire-and-forget).
             // The frontend will handle statement logging for the error.
-            self.call_coordinator(|tx| Command::UnregisterFrontendPeek { uuid, tx })
-                .await;
-            return Err(
-                AdapterError::concurrent_dependency_drop_from_instance_peek_error(
-                    err,
-                    compute_instance,
-                ),
-            );
+            self.coordinator_client
+                .send(Command::UnregisterFrontendPeek { uuid });
+            return Err(AdapterError::internal("frontend peek error", err));
         }
 
         let peek_response_stream = Coordinator::create_peek_response_stream(

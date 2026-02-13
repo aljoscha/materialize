@@ -528,212 +528,271 @@ impl Coordinator {
             }
         }
 
+        // Fast path: for simple SELECT queries (bare Get(GlobalId) or trivial constants),
+        // the optimization pipeline is essentially instant (a few map lookups) thanks to
+        // our fast paths in optimize_mir_local and the global optimizer. Run it inline
+        // on the coordinator thread to avoid the spawn_blocking round-trip through the
+        // serve loop, which adds ~1-2ms of latency per query.
+        let use_inline = matches!(&explain_ctx, ExplainContext::None)
+            && optimizer.is_left()
+            && matches!(
+                &plan.source,
+                mz_sql::plan::HirRelationExpr::Get {
+                    id: mz_expr::Id::Global(_),
+                    ..
+                } | mz_sql::plan::HirRelationExpr::Constant { .. }
+            );
+
+        if use_inline {
+            let stage = Self::run_peek_optimizer(
+                plan,
+                optimizer,
+                explain_ctx,
+                timestamp_context,
+                session,
+                stats,
+                now,
+                catalog,
+                compute_instances,
+                validity,
+                max_query_result_size,
+                id_bundle,
+                target_replica,
+                source_ids,
+                determination,
+            )?;
+            return Ok(StageResult::Immediate(stage));
+        }
+
         let span = Span::current();
         Ok(StageResult::Handle(mz_ore::task::spawn_blocking(
             || "optimize peek",
             move || {
                 span.in_scope(|| {
-                    let pipeline = || -> Result<
-                        Either<
-                            optimize::peek::GlobalLirPlan,
-                            optimize::copy_to::GlobalLirPlan,
-                        >,
-                        AdapterError,
-                    > {
-                        let _dispatch_guard = explain_ctx.dispatch_guard();
-
-                        let raw_expr = plan.source.clone();
-
-                        match optimizer.as_mut() {
-                            // Optimize SELECT statement.
-                            Either::Left(optimizer) => {
-                                // HIR ⇒ MIR lowering and MIR optimization (local)
-                                let local_mir_plan =
-                                    optimizer.catch_unwind_optimize(raw_expr)?;
-                                // Attach resolved context required to continue the pipeline.
-                                let local_mir_plan = local_mir_plan.resolve(
-                                    timestamp_context.clone(),
-                                    &session,
-                                    stats,
-                                );
-                                // MIR optimization (global), MIR ⇒ LIR lowering, and LIR optimization (global)
-                                let global_lir_plan =
-                                    optimizer.catch_unwind_optimize(local_mir_plan)?;
-
-                                Ok(Either::Left(global_lir_plan))
-                            }
-                            // Optimize COPY TO statement.
-                            Either::Right(optimizer) => {
-                                // HIR ⇒ MIR lowering and MIR optimization (local)
-                                let local_mir_plan =
-                                    optimizer.catch_unwind_optimize(raw_expr)?;
-                                // Attach resolved context required to continue the pipeline.
-                                let local_mir_plan = local_mir_plan.resolve(
-                                    timestamp_context.clone(),
-                                    &session,
-                                    stats,
-                                );
-                                // MIR optimization (global), MIR ⇒ LIR lowering, and LIR optimization (global)
-                                let global_lir_plan =
-                                    optimizer.catch_unwind_optimize(local_mir_plan)?;
-
-                                Ok(Either::Right(global_lir_plan))
-                            }
-                        }
-                    };
-
-                    let pipeline_result = pipeline();
-                    let optimization_finished_at = now();
-
-                    let stage = match pipeline_result {
-                        Ok(Either::Left(global_lir_plan)) => {
-                            let optimizer = optimizer.unwrap_left();
-                            // Enable fast path cluster calculation for slow path plans.
-                            let needs_plan_insights = explain_ctx.needs_plan_insights();
-                            // Disable anything that uses the optimizer if we only want the notice and
-                            // plan optimization took longer than the threshold. This is to prevent a
-                            // situation where optimizing takes a while and there a lots of clusters,
-                            // which would delay peek execution by the product of those.
-                            let opt_limit =
-                                PLAN_INSIGHTS_NOTICE_FAST_PATH_CLUSTERS_OPTIMIZE_DURATION
-                                    .get(catalog.system_config().dyncfgs());
-                            let target_instance =
-                                catalog.get_cluster(optimizer.cluster_id()).name.clone();
-                            let enable_re_optimize =
-                                !(matches!(explain_ctx, ExplainContext::PlanInsightsNotice(_))
-                                    && optimizer.duration() > opt_limit);
-                            let insights_ctx = needs_plan_insights
-                                .then(|| PlanInsightsContext {
-                                    stmt: plan
-                                        .select
-                                        .as_deref()
-                                        .map(Clone::clone)
-                                        .map(Statement::Select),
-                                    raw_expr: plan.source.clone(),
-                                    catalog,
-                                    compute_instances,
-                                    target_instance,
-                                    metrics: optimizer.metrics().clone(),
-                                    finishing: optimizer.finishing().clone(),
-                                    optimizer_config: optimizer.config().clone(),
-                                    session,
-                                    timestamp_context,
-                                    view_id: optimizer.select_id(),
-                                    index_id: optimizer.index_id(),
-                                    enable_re_optimize,
-                                })
-                                .map(Box::new);
-                            match explain_ctx {
-                                ExplainContext::Plan(explain_ctx) => {
-                                    let (_, df_meta, _) = global_lir_plan.unapply();
-                                    PeekStage::ExplainPlan(PeekStageExplainPlan {
-                                        validity,
-                                        optimizer,
-                                        df_meta,
-                                        explain_ctx,
-                                        insights_ctx,
-                                    })
-                                }
-                                ExplainContext::PlanInsightsNotice(optimizer_trace) => {
-                                    PeekStage::Finish(PeekStageFinish {
-                                        validity,
-                                        plan,
-                                        max_query_result_size,
-                                        id_bundle,
-                                        target_replica,
-                                        source_ids,
-                                        determination,
-                                        cluster_id: optimizer.cluster_id(),
-                                        finishing: optimizer.finishing().clone(),
-                                        plan_insights_optimizer_trace: Some(optimizer_trace),
-                                        global_lir_plan,
-                                        optimization_finished_at,
-                                        insights_ctx,
-                                    })
-                                }
-                                ExplainContext::None => PeekStage::Finish(PeekStageFinish {
-                                    validity,
-                                    plan,
-                                    max_query_result_size,
-                                    id_bundle,
-                                    target_replica,
-                                    source_ids,
-                                    determination,
-                                    cluster_id: optimizer.cluster_id(),
-                                    finishing: optimizer.finishing().clone(),
-                                    plan_insights_optimizer_trace: None,
-                                    global_lir_plan,
-                                    optimization_finished_at,
-                                    insights_ctx,
-                                }),
-                                ExplainContext::Pushdown => {
-                                    let (plan, _, _) = global_lir_plan.unapply();
-                                    let imports = match plan {
-                                        PeekPlan::SlowPath(plan) => plan
-                                            .desc
-                                            .source_imports
-                                            .into_iter()
-                                            .filter_map(|(id, import)| {
-                                                import.desc.arguments.operators.map(|mfp| (id, mfp))
-                                            })
-                                            .collect(),
-                                        PeekPlan::FastPath(_) => BTreeMap::default(),
-                                    };
-                                    PeekStage::ExplainPushdown(PeekStageExplainPushdown {
-                                        validity,
-                                        determination,
-                                        imports,
-                                    })
-                                }
-                            }
-                        }
-                        Ok(Either::Right(global_lir_plan)) => {
-                            let optimizer = optimizer.unwrap_right();
-                            PeekStage::CopyToPreflight(PeekStageCopyTo {
-                                validity,
-                                optimizer,
-                                global_lir_plan,
-                                optimization_finished_at,
-                                source_ids,
-                            })
-                        }
-                        // Internal optimizer errors are handled differently
-                        // depending on the caller.
-                        Err(err) => {
-                            let Some(optimizer) = optimizer.left() else {
-                                // In `COPY TO` contexts, immediately retire the
-                                // execution with the error.
-                                return Err(err);
-                            };
-                            let ExplainContext::Plan(explain_ctx) = explain_ctx else {
-                                // In `sequence_~` contexts, immediately retire the
-                                // execution with the error.
-                                return Err(err);
-                            };
-
-                            if explain_ctx.broken {
-                                // In `EXPLAIN BROKEN` contexts, just log the error
-                                // and move to the next stage with default
-                                // parameters.
-                                tracing::error!("error while handling EXPLAIN statement: {}", err);
-                                PeekStage::ExplainPlan(PeekStageExplainPlan {
-                                    validity,
-                                    optimizer,
-                                    df_meta: Default::default(),
-                                    explain_ctx,
-                                    insights_ctx: None,
-                                })
-                            } else {
-                                // In regular `EXPLAIN` contexts, immediately retire
-                                // the execution with the error.
-                                return Err(err);
-                            }
-                        }
-                    };
-                    Ok(Box::new(stage))
+                    Self::run_peek_optimizer(
+                        plan,
+                        optimizer,
+                        explain_ctx,
+                        timestamp_context,
+                        session,
+                        stats,
+                        now,
+                        catalog,
+                        compute_instances,
+                        validity,
+                        max_query_result_size,
+                        id_bundle,
+                        target_replica,
+                        source_ids,
+                        determination,
+                    )
                 })
             },
         )))
+    }
+
+    /// Run the peek optimizer pipeline and construct the next stage.
+    /// Extracted to allow calling either inline (fast path) or via spawn_blocking.
+    fn run_peek_optimizer(
+        plan: plan::SelectPlan,
+        mut optimizer: Either<optimize::peek::Optimizer, optimize::copy_to::Optimizer>,
+        explain_ctx: ExplainContext,
+        timestamp_context: TimestampContext<Timestamp>,
+        session: crate::session::SessionMeta,
+        stats: Box<dyn mz_transform::StatisticsOracle>,
+        now: mz_ore::now::NowFn,
+        catalog: Arc<crate::catalog::Catalog>,
+        compute_instances: BTreeMap<String, crate::coord::ComputeInstanceSnapshot>,
+        validity: PlanValidity,
+        max_query_result_size: Option<u64>,
+        id_bundle: CollectionIdBundle,
+        target_replica: Option<mz_cluster_client::ReplicaId>,
+        source_ids: BTreeSet<GlobalId>,
+        determination: TimestampDetermination<Timestamp>,
+    ) -> Result<Box<PeekStage>, AdapterError> {
+        let pipeline = || -> Result<
+            Either<optimize::peek::GlobalLirPlan, optimize::copy_to::GlobalLirPlan>,
+            AdapterError,
+        > {
+            let _dispatch_guard = explain_ctx.dispatch_guard();
+
+            let raw_expr = plan.source.clone();
+
+            match optimizer.as_mut() {
+                // Optimize SELECT statement.
+                Either::Left(optimizer) => {
+                    // HIR ⇒ MIR lowering and MIR optimization (local)
+                    let local_mir_plan = optimizer.catch_unwind_optimize(raw_expr)?;
+                    // Attach resolved context required to continue the pipeline.
+                    let local_mir_plan =
+                        local_mir_plan.resolve(timestamp_context.clone(), &session, stats);
+                    // MIR optimization (global), MIR ⇒ LIR lowering, and LIR optimization (global)
+                    let global_lir_plan = optimizer.catch_unwind_optimize(local_mir_plan)?;
+
+                    Ok(Either::Left(global_lir_plan))
+                }
+                // Optimize COPY TO statement.
+                Either::Right(optimizer) => {
+                    // HIR ⇒ MIR lowering and MIR optimization (local)
+                    let local_mir_plan = optimizer.catch_unwind_optimize(raw_expr)?;
+                    // Attach resolved context required to continue the pipeline.
+                    let local_mir_plan =
+                        local_mir_plan.resolve(timestamp_context.clone(), &session, stats);
+                    // MIR optimization (global), MIR ⇒ LIR lowering, and LIR optimization (global)
+                    let global_lir_plan = optimizer.catch_unwind_optimize(local_mir_plan)?;
+
+                    Ok(Either::Right(global_lir_plan))
+                }
+            }
+        };
+
+        let pipeline_result = pipeline();
+        let optimization_finished_at = now();
+
+        let stage = match pipeline_result {
+            Ok(Either::Left(global_lir_plan)) => {
+                let optimizer = optimizer.unwrap_left();
+                // Enable fast path cluster calculation for slow path plans.
+                let needs_plan_insights = explain_ctx.needs_plan_insights();
+                // Disable anything that uses the optimizer if we only want the notice and
+                // plan optimization took longer than the threshold. This is to prevent a
+                // situation where optimizing takes a while and there a lots of clusters,
+                // which would delay peek execution by the product of those.
+                let opt_limit = PLAN_INSIGHTS_NOTICE_FAST_PATH_CLUSTERS_OPTIMIZE_DURATION
+                    .get(catalog.system_config().dyncfgs());
+                let target_instance = catalog.get_cluster(optimizer.cluster_id()).name.clone();
+                let enable_re_optimize =
+                    !(matches!(explain_ctx, ExplainContext::PlanInsightsNotice(_))
+                        && optimizer.duration() > opt_limit);
+                let insights_ctx = needs_plan_insights
+                    .then(|| PlanInsightsContext {
+                        stmt: plan
+                            .select
+                            .as_deref()
+                            .map(Clone::clone)
+                            .map(Statement::Select),
+                        raw_expr: plan.source.clone(),
+                        catalog,
+                        compute_instances,
+                        target_instance,
+                        metrics: optimizer.metrics().clone(),
+                        finishing: optimizer.finishing().clone(),
+                        optimizer_config: optimizer.config().clone(),
+                        session,
+                        timestamp_context,
+                        view_id: optimizer.select_id(),
+                        index_id: optimizer.index_id(),
+                        enable_re_optimize,
+                    })
+                    .map(Box::new);
+                match explain_ctx {
+                    ExplainContext::Plan(explain_ctx) => {
+                        let (_, df_meta, _) = global_lir_plan.unapply();
+                        PeekStage::ExplainPlan(PeekStageExplainPlan {
+                            validity,
+                            optimizer,
+                            df_meta,
+                            explain_ctx,
+                            insights_ctx,
+                        })
+                    }
+                    ExplainContext::PlanInsightsNotice(optimizer_trace) => {
+                        PeekStage::Finish(PeekStageFinish {
+                            validity,
+                            plan,
+                            max_query_result_size,
+                            id_bundle,
+                            target_replica,
+                            source_ids,
+                            determination,
+                            cluster_id: optimizer.cluster_id(),
+                            finishing: optimizer.finishing().clone(),
+                            plan_insights_optimizer_trace: Some(optimizer_trace),
+                            global_lir_plan,
+                            optimization_finished_at,
+                            insights_ctx,
+                        })
+                    }
+                    ExplainContext::None => PeekStage::Finish(PeekStageFinish {
+                        validity,
+                        plan,
+                        max_query_result_size,
+                        id_bundle,
+                        target_replica,
+                        source_ids,
+                        determination,
+                        cluster_id: optimizer.cluster_id(),
+                        finishing: optimizer.finishing().clone(),
+                        plan_insights_optimizer_trace: None,
+                        global_lir_plan,
+                        optimization_finished_at,
+                        insights_ctx,
+                    }),
+                    ExplainContext::Pushdown => {
+                        let (plan, _, _) = global_lir_plan.unapply();
+                        let imports = match plan {
+                            PeekPlan::SlowPath(plan) => plan
+                                .desc
+                                .source_imports
+                                .into_iter()
+                                .filter_map(|(id, source_import)| {
+                                    source_import.desc.arguments.operators.map(|mfp| (id, mfp))
+                                })
+                                .collect(),
+                            PeekPlan::FastPath(_) => BTreeMap::default(),
+                        };
+                        PeekStage::ExplainPushdown(PeekStageExplainPushdown {
+                            validity,
+                            determination,
+                            imports,
+                        })
+                    }
+                }
+            }
+            Ok(Either::Right(global_lir_plan)) => {
+                let optimizer = optimizer.unwrap_right();
+                PeekStage::CopyToPreflight(PeekStageCopyTo {
+                    validity,
+                    optimizer,
+                    global_lir_plan,
+                    optimization_finished_at,
+                    source_ids,
+                })
+            }
+            // Internal optimizer errors are handled differently
+            // depending on the caller.
+            Err(err) => {
+                let Some(optimizer) = optimizer.left() else {
+                    // In `COPY TO` contexts, immediately retire the
+                    // execution with the error.
+                    return Err(err);
+                };
+                let ExplainContext::Plan(explain_ctx) = explain_ctx else {
+                    // In `sequence_~` contexts, immediately retire the
+                    // execution with the error.
+                    return Err(err);
+                };
+
+                if explain_ctx.broken {
+                    // In `EXPLAIN BROKEN` contexts, just log the error
+                    // and move to the next stage with default
+                    // parameters.
+                    tracing::error!("error while handling EXPLAIN statement: {}", err);
+                    PeekStage::ExplainPlan(PeekStageExplainPlan {
+                        validity,
+                        optimizer,
+                        df_meta: Default::default(),
+                        explain_ctx,
+                        insights_ctx: None,
+                    })
+                } else {
+                    // In regular `EXPLAIN` contexts, immediately retire
+                    // the execution with the error.
+                    return Err(err);
+                }
+            }
+        };
+        Ok(Box::new(stage))
     }
 
     #[instrument]

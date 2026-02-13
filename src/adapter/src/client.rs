@@ -18,10 +18,9 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use chrono::{DateTime, Utc};
 use derivative::Derivative;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use itertools::Itertools;
 use mz_adapter_types::connection::{ConnectionId, ConnectionIdType};
-use mz_auth::Authenticated;
 use mz_auth::password::Password;
 use mz_build_info::BuildInfo;
 use mz_compute_types::ComputeInstanceId;
@@ -34,10 +33,10 @@ use mz_ore::result::ResultExt;
 use mz_ore::task::AbortOnDropHandle;
 use mz_ore::thread::JoinOnDropHandle;
 use mz_ore::tracing::OpenTelemetryContext;
-use mz_repr::user::InternalUserMetadata;
-use mz_repr::{CatalogItemId, ColumnIndex, Row, SqlScalarType};
+use mz_repr::{CatalogItemId, ColumnIndex, RelationDesc, Row, SqlScalarType};
 use mz_sql::ast::{Raw, Statement};
 use mz_sql::catalog::{EnvironmentId, SessionCatalog};
+use mz_sql::plan::Params;
 use mz_sql::session::hint::ApplicationNameHint;
 use mz_sql::session::metadata::SessionMetadata;
 use mz_sql::session::user::SUPPORT_USER;
@@ -53,8 +52,8 @@ use uuid::Uuid;
 
 use crate::catalog::Catalog;
 use crate::command::{
-    CatalogDump, CatalogSnapshot, Command, ExecuteResponse, Response, SASLChallengeResponse,
-    SASLVerifyProofResponse, SuperuserAttribute,
+    AuthResponse, CatalogDump, CatalogSnapshot, Command, ExecuteResponse, Response,
+    SASLChallengeResponse, SASLVerifyProofResponse,
 };
 use crate::coord::{Coordinator, ExecuteContextGuard};
 use crate::error::AdapterError;
@@ -62,7 +61,8 @@ use crate::metrics::Metrics;
 use crate::optimize::dataflows::{EvalTime, ExprPrepOneShot};
 use crate::optimize::{self, Optimize};
 use crate::session::{
-    EndTransactionAction, PreparedStatement, Session, SessionConfig, StateRevision, TransactionId,
+    EndTransactionAction, LifecycleTimestamps, PreparedStatement, Session, SessionConfig,
+    StateRevision, TransactionId,
 };
 use crate::statement_logging::{StatementEndedExecutionReason, StatementExecutionStrategy};
 use crate::telemetry::{self, EventDetails, SegmentClientExt, StatementFailureType};
@@ -112,6 +112,9 @@ pub struct Client {
     metrics: Metrics,
     environment_id: EnvironmentId,
     segment_client: Option<mz_segment::Client>,
+    /// Watch channel receiver for reading the current catalog snapshot directly
+    /// without a coordinator round-trip.
+    catalog_watch_rx: tokio::sync::watch::Receiver<Arc<Catalog>>,
 }
 
 impl Client {
@@ -122,6 +125,7 @@ impl Client {
         now: NowFn,
         environment_id: EnvironmentId,
         segment_client: Option<mz_segment::Client>,
+        catalog_watch_rx: tokio::sync::watch::Receiver<Arc<Catalog>>,
     ) -> Client {
         // Connection ids are 32 bits and have 3 parts.
         // 1. MSB bit is always 0 because these are interpreted as an i32, and it is possible some
@@ -139,6 +143,7 @@ impl Client {
             metrics,
             environment_id,
             segment_client,
+            catalog_watch_rx,
         }
     }
 
@@ -150,30 +155,27 @@ impl Client {
     /// Creates a new session associated with this client for the given user.
     ///
     /// It is the caller's responsibility to have authenticated the user.
-    /// We pass in an Authenticated marker as a guardrail to ensure the
-    /// user has authenticated with an authenticator before creating a session.
-    pub fn new_session(&self, config: SessionConfig, _authenticated: Authenticated) -> Session {
+    pub fn new_session(&self, config: SessionConfig) -> Session {
         // We use the system clock to determine when a session connected to Materialize. This is not
         // intended to be 100% accurate and correct, so we don't burden the timestamp oracle with
         // generating a more correct timestamp.
         Session::new(self.build_info, config, self.metrics().session_metrics())
     }
 
-    /// Verifies the provided user's password against the
-    /// stored credentials in the catalog.
+    /// Preforms an authentication check for the given user.
     pub async fn authenticate(
         &self,
         user: &String,
         password: &Password,
-    ) -> Result<Authenticated, AdapterError> {
+    ) -> Result<AuthResponse, AdapterError> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::AuthenticatePassword {
             role_name: user.to_string(),
             password: Some(password.clone()),
             tx,
         });
-        rx.await.expect("sender dropped")?;
-        Ok(Authenticated)
+        let response = rx.await.expect("sender dropped")?;
+        Ok(response)
     }
 
     pub async fn generate_sasl_challenge(
@@ -197,7 +199,7 @@ impl Client {
         proof: &String,
         nonce: &String,
         mock_hash: &String,
-    ) -> Result<(SASLVerifyProofResponse, Authenticated), AdapterError> {
+    ) -> Result<SASLVerifyProofResponse, AdapterError> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::AuthenticateVerifySASLProof {
             role_name: user.to_string(),
@@ -207,7 +209,7 @@ impl Client {
             tx,
         });
         let response = rx.await.expect("sender dropped")?;
-        Ok((response, Authenticated))
+        Ok(response)
     }
 
     /// Upgrades this client to a session client.
@@ -270,7 +272,7 @@ impl Client {
             optimizer_metrics,
             persist_client,
             statement_logging_frontend,
-            superuser_attribute,
+            mock_peek_data,
         } = response;
 
         let peek_client = PeekClient::new(
@@ -280,6 +282,7 @@ impl Client {
             optimizer_metrics,
             persist_client,
             statement_logging_frontend,
+            mock_peek_data,
         );
 
         let mut client = SessionClient {
@@ -290,16 +293,14 @@ impl Client {
             segment_client: self.segment_client.clone(),
             peek_client,
             enable_frontend_peek_sequencing: false, // initialized below, once we have a ConnCatalog
+            declare_catalog: None,
+            declare_resolved_ids: None,
+            declare_plan: None,
+            declare_sql: None,
+            declare_desc: None,
         };
 
         let session = client.session();
-
-        // Apply the superuser attribute to the session's user if
-        // it exists.
-        if let SuperuserAttribute(Some(superuser)) = superuser_attribute {
-            session.apply_internal_user_metadata(InternalUserMetadata { superuser });
-        }
-
         session.initialize_role_metadata(role_id);
         let vars_mut = session.vars_mut();
         for (name, val) in session_defaults {
@@ -451,17 +452,14 @@ Issue a SQL query to get started. Need help?
     ) -> Result<Pin<Box<dyn Stream<Item = PeekResponseUnary> + Send>>, anyhow::Error> {
         // Connect to the coordinator.
         let conn_id = self.new_conn_id()?;
-        let session = self.new_session(
-            SessionConfig {
-                conn_id,
-                uuid: Uuid::new_v4(),
-                user: SUPPORT_USER.name.clone(),
-                client_ip: None,
-                external_metadata_rx: None,
-                helm_chart_version: None,
-            },
-            Authenticated,
-        );
+        let session = self.new_session(SessionConfig {
+            conn_id,
+            uuid: Uuid::new_v4(),
+            user: SUPPORT_USER.name.clone(),
+            client_ip: None,
+            external_metadata_rx: None,
+            helm_chart_version: None,
+        });
         let mut session_client = self.startup(session).await?;
 
         // Parse the SQL statement.
@@ -474,7 +472,7 @@ Issue a SQL query to get started. Need help?
         const EMPTY_PORTAL: &str = "";
         session_client.start_transaction(Some(1))?;
         session_client
-            .declare(EMPTY_PORTAL.into(), stmt, sql.to_string())
+            .declare(EMPTY_PORTAL.into(), Arc::new(stmt), sql.to_string())
             .await?;
 
         match session_client
@@ -569,6 +567,20 @@ pub struct SessionClient {
     // check the actual feature flag value at every peek (without a Coordinator call) once we'll
     // always have a catalog snapshot at hand.
     pub enable_frontend_peek_sequencing: bool,
+    /// Catalog snapshot from the most recent `declare()` call, to be reused by
+    /// `try_frontend_peek()` so we avoid a redundant round-trip through the
+    /// adapter command channel.
+    declare_catalog: Option<Arc<Catalog>>,
+    /// Resolved IDs from the most recent `declare()` call, to be reused by
+    /// `try_frontend_peek_inner()` for RBAC checking.
+    declare_resolved_ids: Option<mz_sql::names::ResolvedIds>,
+    /// Cached plan from the most recent `declare()` call, to be reused by
+    /// `try_frontend_peek_inner()` so we skip redundant planning.
+    declare_plan: Option<mz_sql::plan::Plan>,
+    /// The SQL text from the most recent `declare()` call, used as the plan cache key.
+    declare_sql: Option<Arc<str>>,
+    /// The statement description from the most recent `declare()` call, for plan cache population.
+    declare_desc: Option<mz_sql::plan::StatementDesc>,
 }
 
 impl SessionClient {
@@ -679,17 +691,41 @@ impl SessionClient {
     pub async fn declare(
         &mut self,
         name: String,
-        stmt: Statement<Raw>,
+        stmt: Arc<Statement<Raw>>,
         sql: String,
     ) -> Result<(), AdapterError> {
-        let catalog = self.catalog_snapshot("declare").await;
-        let param_types = vec![];
-        let desc =
-            Coordinator::describe(&catalog, self.session(), Some(stmt.clone()), param_types)?;
+        let catalog = self.catalog_snapshot_local();
+
+        // Check the plan cache first: if we've seen this exact SQL before,
+        // reuse the cached desc and skip resolve+plan entirely.
+        let sql_key: Arc<str> = Arc::from(sql.as_str());
+        let desc = if let Some(cached) = self.peek_client.plan_cache.get(&sql_key) {
+            // Plan cache hit: skip resolve+plan, reuse cached desc.
+            // The plan and resolved_ids are not needed because try_frontend_peek_inner
+            // will hit the plan cache fast path and skip RBAC/planning entirely.
+            self.declare_catalog = Some(Arc::clone(&catalog));
+            self.declare_resolved_ids = None;
+            self.declare_plan = None;
+            self.declare_sql = Some(sql_key);
+            self.declare_desc = None; // Not needed for cache population (already populated)
+            cached.desc.clone()
+        } else {
+            // Plan cache miss: do full resolve+plan+describe.
+            let (desc, plan, resolved_ids) =
+                crate::util::resolve_plan_and_describe(&catalog, (*stmt).clone(), self.session())?;
+            // Save catalog, resolved IDs, and plan for reuse by try_frontend_peek(),
+            // avoiding redundant round-trips, name resolution, and planning.
+            self.declare_catalog = Some(Arc::clone(&catalog));
+            self.declare_resolved_ids = Some(resolved_ids);
+            self.declare_plan = Some(plan);
+            self.declare_sql = Some(sql_key);
+            self.declare_desc = Some(desc.clone());
+            desc
+        };
         let params = vec![];
         let result_formats = vec![mz_pgwire_common::Format::Text; desc.arity()];
         let now = self.now();
-        let logging = self.session().mint_logging(sql, Some(&stmt), now);
+        let logging = self.session().mint_logging(sql, Some(&*stmt), now);
         let state_revision = StateRevision {
             catalog_revision: catalog.transient_revision(),
             session_state_revision: self.session().state_revision(),
@@ -697,7 +733,7 @@ impl SessionClient {
         self.session().set_portal(
             name,
             desc,
-            Some(stmt),
+            Some((*stmt).clone()),
             logging,
             params,
             result_formats,
@@ -802,6 +838,17 @@ impl SessionClient {
         res
     }
 
+    /// Lightweight commit for implicit read-only transactions that were fully
+    /// handled on the frontend (e.g., frontend peek). Skips the adapter
+    /// round-trip through the MPSC command channel, which would otherwise just
+    /// echo back the session without doing meaningful work.
+    pub fn end_transaction_local(&mut self) -> Result<ExecuteResponse, AdapterError> {
+        let _ = self.session().clear_transaction();
+        Ok(ExecuteResponse::TransactionCommitted {
+            params: BTreeMap::new(),
+        })
+    }
+
     /// Fails a transaction.
     pub fn fail_transaction(&mut self) {
         let session = self.session.take().expect("session invariant violated");
@@ -809,7 +856,7 @@ impl SessionClient {
         self.session = Some(session);
     }
 
-    /// Fetches the catalog.
+    /// Fetches the catalog via a coordinator round-trip.
     #[instrument(level = "debug")]
     pub async fn catalog_snapshot(&self, context: &str) -> Arc<Catalog> {
         let start = std::time::Instant::now();
@@ -822,6 +869,14 @@ impl SessionClient {
             .with_label_values(&[context])
             .observe(start.elapsed().as_secs_f64());
         catalog
+    }
+
+    /// Reads the current catalog directly from the watch channel without a
+    /// coordinator round-trip. The snapshot may be slightly stale (it reflects
+    /// the catalog as of the last committed catalog transaction), which is
+    /// acceptable for read-only operations like `declare()`.
+    fn catalog_snapshot_local(&self) -> Arc<Catalog> {
+        self.inner().catalog_watch_rx.borrow().clone()
     }
 
     /// Dumps the catalog to a JSON string.
@@ -1102,14 +1157,15 @@ impl SessionClient {
     }
 
     pub fn add_idle_in_transaction_session_timeout(&mut self) {
-        let session = self.session();
-        let timeout_dur = session.vars().idle_in_transaction_session_timeout();
-        if !timeout_dur.is_zero() {
-            let timeout_dur = timeout_dur.clone();
-            if let Some(txn) = session.transaction().inner() {
+        let session = self.session.as_ref().expect("session invariant violated");
+        // Check if we're in a transaction first (cheap) before doing the
+        // variable lookup (expensive HashMap with case-insensitive keys).
+        if let Some(txn) = session.transaction().inner() {
+            let timeout_dur = session.vars().idle_in_transaction_session_timeout();
+            if !timeout_dur.is_zero() {
                 let txn_id = txn.id.clone();
                 let timeout = TimeoutType::IdleInTransactionSession(txn_id);
-                self.timeouts.add_timeout(timeout, timeout_dur);
+                self.timeouts.add_timeout(timeout, timeout_dur.clone());
             }
         }
     }
@@ -1143,6 +1199,61 @@ impl SessionClient {
         &mut self.peek_client
     }
 
+    /// Returns the cached parsed statement for the given SQL, if it exists in the plan cache.
+    /// Used by the pgwire layer to skip SQL parsing on plan cache hits.
+    pub fn get_cached_parsed_stmt(&self, sql: &str) -> Option<Arc<Statement<Raw>>> {
+        self.peek_client
+            .plan_cache
+            .get(sql as &str)
+            .map(|entry| Arc::clone(&entry.parsed_stmt))
+    }
+
+    /// Fast path for plan-cached queries that bypasses declare/set_portal/remove_portal.
+    ///
+    /// When the plan cache already has this SQL, we can skip the expensive `declare()` path
+    /// (which clones StatementDesc, inserts into BTreeMap portal, mints logging, etc.) and
+    /// go directly to the cached peek execution.
+    ///
+    /// Returns `Ok(Some((response, relation_desc)))` if handled, `Ok(None)` to fall back.
+    pub async fn try_cached_peek_direct(
+        &mut self,
+        sql: &str,
+        stmt: &Arc<Statement<Raw>>,
+        lifecycle_timestamps: LifecycleTimestamps,
+    ) -> Result<Option<(ExecuteResponse, Option<Arc<RelationDesc>>)>, AdapterError> {
+        if !self.enable_frontend_peek_sequencing {
+            return Ok(None);
+        }
+        let sql_key: Arc<str> = Arc::from(sql);
+        let cached = match self.peek_client.plan_cache.get(&sql_key) {
+            Some(cached) => Arc::clone(&cached),
+            None => return Ok(None),
+        };
+        // Use Arc::clone instead of deep-cloning the RelationDesc.
+        // The desc is only used by reference downstream (RowDescription encoding,
+        // values_from_row), so Arc refcount increment is sufficient.
+        let relation_desc = cached.relation_desc_for_response.clone();
+        let catalog = self.catalog_snapshot_local();
+        let now = self.now();
+        let session = self.session.as_mut().expect("SessionClient invariant");
+        let logging = session.mint_logging(sql.to_string(), Some(&**stmt), now);
+        let response = self
+            .peek_client
+            .try_cached_peek_direct(
+                session,
+                catalog,
+                cached,
+                &Params::empty(),
+                &logging,
+                lifecycle_timestamps,
+            )
+            .await?;
+        match response {
+            Some(resp) => Ok(Some((resp, relation_desc))),
+            None => Ok(None),
+        }
+    }
+
     /// Attempt to sequence a peek from the session task.
     ///
     /// Returns `Ok(Some(response))` if we handled the peek, or `Ok(None)` to fall back to the
@@ -1157,8 +1268,22 @@ impl SessionClient {
     ) -> Result<Option<ExecuteResponse>, AdapterError> {
         if self.enable_frontend_peek_sequencing {
             let session = self.session.as_mut().expect("SessionClient invariant");
+            let declare_catalog = self.declare_catalog.take();
+            let declare_resolved_ids = self.declare_resolved_ids.take();
+            let declare_plan = self.declare_plan.take();
+            let declare_sql = self.declare_sql.take();
+            let declare_desc = self.declare_desc.take();
             self.peek_client
-                .try_frontend_peek(portal_name, session, outer_ctx_extra)
+                .try_frontend_peek(
+                    portal_name,
+                    session,
+                    outer_ctx_extra,
+                    declare_catalog,
+                    declare_resolved_ids,
+                    declare_plan,
+                    declare_sql,
+                    declare_desc,
+                )
                 .await
         } else {
             Ok(None)
@@ -1306,7 +1431,7 @@ impl RecordFirstRowStream {
         }
     }
 
-    fn histogram(
+    pub fn histogram(
         client: &SessionClient,
         instance_id: Option<ComputeInstanceId>,
         strategy: Option<StatementExecutionStrategy>,
@@ -1345,8 +1470,7 @@ impl RecordFirstRowStream {
             .observe(execute_started.elapsed().as_secs_f64());
     }
 
-    pub async fn recv(&mut self) -> Option<PeekResponseUnary> {
-        let msg = self.rows.next().await;
+    fn observe_message(&mut self, msg: &Option<PeekResponseUnary>) {
         if !self.saw_rows && matches!(msg, Some(PeekResponseUnary::Rows(_))) {
             self.saw_rows = true;
             self.time_to_first_row_seconds
@@ -1356,6 +1480,21 @@ impl RecordFirstRowStream {
         if msg.is_none() {
             self.no_more_rows = true;
         }
+    }
+
+    /// Poll the stream once without waiting.
+    ///
+    /// Returns `None` if the stream is pending, and `Some(msg)` if an item or
+    /// end-of-stream was immediately available.
+    pub fn try_recv(&mut self) -> Option<Option<PeekResponseUnary>> {
+        let msg = self.rows.next().now_or_never()?;
+        self.observe_message(&msg);
+        Some(msg)
+    }
+
+    pub async fn recv(&mut self) -> Option<PeekResponseUnary> {
+        let msg = self.rows.next().await;
+        self.observe_message(&msg);
         msg
     }
 }

@@ -59,6 +59,7 @@ use crate::coord::timestamp_selection::TimestampDetermination;
 use crate::optimize::OptimizerError;
 use crate::statement_logging::WatchSetCreation;
 use crate::statement_logging::{StatementEndedExecutionReason, StatementExecutionStrategy};
+use crate::util::ResultExt;
 use crate::{AdapterError, ExecuteContextGuard, ExecuteResponse};
 
 /// A peek is a request to read data from a maintained arrangement.
@@ -850,7 +851,7 @@ impl crate::coord::Coordinator {
                 target_replica,
                 rows_tx,
             )
-            .map_err(AdapterError::concurrent_dependency_drop_from_peek_error)?;
+            .unwrap_or_terminate("cannot fail to peek");
 
         let duration_histogram = self.metrics.row_set_finishing_seconds();
 
@@ -1422,13 +1423,7 @@ mod tests {
         let ctx_gen = || {
             let indent = Indent::default();
             let annotations = BTreeMap::new();
-            PlanRenderingContext::<FastPathPlan>::new(
-                indent,
-                &humanizer,
-                annotations,
-                &config,
-                BTreeSet::default(),
-            )
+            PlanRenderingContext::<FastPathPlan>::new(indent, &humanizer, annotations, &config)
         };
 
         let constant_err_exp = "Error \"division by zero\"\n";

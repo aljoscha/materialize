@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use mz_build_info::BuildInfo;
 use mz_cluster_client::WallclockLagFn;
-use mz_compute_types::dataflows::{BuildDesc, DataflowDescription};
+use mz_compute_types::ComputeInstanceId;
+use mz_compute_types::dataflows::{BuildDesc, DataflowDescription, SourceImport};
 use mz_compute_types::plan::render_plan::RenderPlan;
 use mz_compute_types::sinks::{
     ComputeSinkConnection, ComputeSinkDesc, ContinualTaskConnection, MaterializedViewSinkConnection,
@@ -44,13 +45,15 @@ use thiserror::Error;
 use timely::PartialOrder;
 use timely::progress::frontier::MutableAntichain;
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::{mpsc, oneshot};
+use tracing::debug_span;
 use uuid::Uuid;
 
 use crate::controller::error::{
     CollectionLookupError, CollectionMissing, ERROR_TARGET_REPLICA_FAILED, HydrationCheckBadTarget,
 };
-use crate::controller::instance_client::PeekError;
+use crate::controller::instance_client::{InstanceShutDown, PeekError};
 use crate::controller::replica::{ReplicaClient, ReplicaConfig};
 use crate::controller::{
     ComputeControllerResponse, ComputeControllerTimestamp, IntrospectionUpdates, PeekNotification,
@@ -116,6 +119,210 @@ impl From<CollectionMissing> for ReadPolicyError {
 
 /// A command sent to an [`Instance`] task.
 pub(super) type Command<T> = Box<dyn FnOnce(&mut Instance<T>) + Send>;
+
+/// A client for an `Instance` task.
+#[derive(Clone, derivative::Derivative)]
+#[derivative(Debug)]
+pub struct Client<T: ComputeControllerTimestamp> {
+    /// A sender for commands for the instance.
+    command_tx: mpsc::UnboundedSender<Command<T>>,
+    /// A sender for read hold changes for collections installed on the instance.
+    #[derivative(Debug = "ignore")]
+    read_hold_tx: read_holds::ChangeTx<T>,
+}
+
+impl<T: ComputeControllerTimestamp> Client<T> {
+    pub(super) fn read_hold_tx(&self) -> read_holds::ChangeTx<T> {
+        Arc::clone(&self.read_hold_tx)
+    }
+
+    /// Call a method to be run on the instance task, by sending a message to the instance.
+    /// Does not wait for a response message.
+    pub(super) fn call<F>(&self, f: F) -> Result<(), InstanceShutDown>
+    where
+        F: FnOnce(&mut Instance<T>) + Send + 'static,
+    {
+        let otel_ctx = OpenTelemetryContext::obtain();
+        self.command_tx
+            .send(Box::new(move |instance| {
+                let _span = debug_span!("instance::call").entered();
+                otel_ctx.attach_as_parent();
+
+                f(instance)
+            }))
+            .map_err(|_send_error| InstanceShutDown)
+    }
+
+    /// Call a method to be run on the instance task, by sending a message to the instance and
+    /// waiting for a response message.
+    pub(super) async fn call_sync<F, R>(&self, f: F) -> Result<R, InstanceShutDown>
+    where
+        F: FnOnce(&mut Instance<T>) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        let otel_ctx = OpenTelemetryContext::obtain();
+        self.command_tx
+            .send(Box::new(move |instance| {
+                let _span = debug_span!("instance::call_sync").entered();
+                otel_ctx.attach_as_parent();
+                let result = f(instance);
+                let _ = tx.send(result);
+            }))
+            .map_err(|_send_error| InstanceShutDown)?;
+
+        rx.await.map_err(|_| InstanceShutDown)
+    }
+
+    /// Look up the [`SharedCollectionState`] for a compute collection.
+    ///
+    /// This is a synchronous round-trip to the instance task, but the returned
+    /// `SharedCollectionState` can be cached by callers for direct access to read
+    /// capabilities and write frontiers without further round-trips.
+    pub async fn collection_shared_state(
+        &self,
+        id: GlobalId,
+    ) -> Result<SharedCollectionState<T>, CollectionLookupError> {
+        self.call_sync(move |i| {
+            let collection = i.collection(id)?;
+            Ok(collection.shared.clone())
+        })
+        .await?
+    }
+
+    /// Acquires a `ReadHold` for the given collection using its cached shared state,
+    /// without going through the instance task.
+    pub fn acquire_read_hold_direct(
+        &self,
+        id: GlobalId,
+        shared: &SharedCollectionState<T>,
+    ) -> ReadHold<T> {
+        let since = shared.lock_read_capabilities(|caps| {
+            let since = caps.frontier().to_owned();
+            caps.update_iter(since.iter().map(|t| (t.clone(), 1)));
+            since
+        });
+        ReadHold::new(id, since, Arc::clone(&self.read_hold_tx))
+    }
+}
+
+impl<T> Client<T>
+where
+    T: ComputeControllerTimestamp,
+{
+    pub(super) fn spawn(
+        id: ComputeInstanceId,
+        build_info: &'static BuildInfo,
+        storage: StorageCollections<T>,
+        peek_stash_persist_location: PersistLocation,
+        arranged_logs: Vec<(LogVariant, GlobalId, SharedCollectionState<T>)>,
+        metrics: InstanceMetrics,
+        now: NowFn,
+        wallclock_lag: WallclockLagFn<T>,
+        dyncfg: Arc<ConfigSet>,
+        response_tx: mpsc::UnboundedSender<ComputeControllerResponse<T>>,
+        introspection_tx: mpsc::UnboundedSender<IntrospectionUpdates>,
+        read_only: bool,
+    ) -> Self {
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+
+        let read_hold_tx: read_holds::ChangeTx<_> = {
+            let command_tx = command_tx.clone();
+            Arc::new(move |id, change: ChangeBatch<_>| {
+                let cmd: Command<_> = {
+                    let change = change.clone();
+                    Box::new(move |i| i.apply_read_hold_change(id, change.clone()))
+                };
+                command_tx.send(cmd).map_err(|_| SendError((id, change)))
+            })
+        };
+
+        mz_ore::task::spawn(
+            || format!("compute-instance-{id}"),
+            Instance::new(
+                build_info,
+                storage,
+                peek_stash_persist_location,
+                arranged_logs,
+                metrics,
+                now,
+                wallclock_lag,
+                dyncfg,
+                command_rx,
+                response_tx,
+                Arc::clone(&read_hold_tx),
+                introspection_tx,
+                read_only,
+            )
+            .run(),
+        );
+
+        Self {
+            command_tx,
+            read_hold_tx,
+        }
+    }
+
+    /// Acquires a `ReadHold` and collection write frontier for each of the identified compute
+    /// collections.
+    pub async fn acquire_read_holds_and_collection_write_frontiers(
+        &self,
+        ids: Vec<GlobalId>,
+    ) -> Result<Vec<(GlobalId, ReadHold<T>, Antichain<T>)>, CollectionLookupError> {
+        self.call_sync(move |i| {
+            let mut result = Vec::new();
+            for id in ids.into_iter() {
+                result.push((
+                    id,
+                    i.acquire_read_hold(id)?,
+                    i.collection_write_frontier(id)?,
+                ));
+            }
+            Ok(result)
+        })
+        .await?
+    }
+
+    /// Issue a peek by calling into the instance task.
+    ///
+    /// This is fire-and-forget: errors from `Instance::peek()` are sent through
+    /// `peek_response_tx` rather than returned, avoiding a synchronous round-trip.
+    /// Only returns an error if the instance has shut down.
+    pub fn peek(
+        &self,
+        peek_target: PeekTarget,
+        literal_constraints: Option<Vec<Row>>,
+        uuid: Uuid,
+        timestamp: T,
+        result_desc: RelationDesc,
+        finishing: RowSetFinishing,
+        map_filter_project: mz_expr::SafeMfpPlan,
+        target_read_hold: ReadHold<T>,
+        target_replica: Option<ReplicaId>,
+        peek_response_tx: oneshot::Sender<PeekResponse>,
+    ) -> Result<(), PeekError> {
+        self.call(move |i| {
+            if let Err(err) = i.peek(
+                peek_target,
+                literal_constraints,
+                uuid,
+                timestamp,
+                result_desc,
+                finishing,
+                map_filter_project,
+                target_read_hold,
+                target_replica,
+                peek_response_tx,
+            ) {
+                // On error, Instance::peek did not consume peek_response_tx,
+                // so it gets dropped here. The receiver will get RecvError,
+                // which create_peek_response_stream handles gracefully.
+                tracing::warn!("fire-and-forget peek failed: {err}");
+            }
+        })?;
+        Ok(())
+    }
+}
 
 /// A response from a replica, composed of a replica ID, the replica's current epoch, and the
 /// compute response itself.
@@ -221,6 +428,14 @@ impl<T: ComputeControllerTimestamp> Instance<T> {
         self.collections.get(&id).ok_or(CollectionMissing(id))
     }
 
+    pub(super) fn shared_collection_state(
+        &self,
+        id: GlobalId,
+    ) -> Result<SharedCollectionState<T>, CollectionMissing> {
+        let collection = self.collection(id)?;
+        Ok(collection.shared.clone())
+    }
+
     /// Acquire a mutable handle to the collection state associated with `id`.
     fn collection_mut(
         &mut self,
@@ -295,7 +510,12 @@ impl<T: ComputeControllerTimestamp> Instance<T> {
         }
 
         if let Some(previous) = self.collections.insert(id, state) {
-            panic!("attempt to add a collection with existing ID {id} (previous={previous:?}");
+            if !previous.dropped {
+                panic!("attempt to add a collection with existing ID {id} (previous={previous:?}");
+            }
+            // Allow replacing a dropped collection — this can happen when a transient
+            // dataflow ID is reused after the previous dataflow was dropped but the
+            // Instance task hasn't fully cleaned up the entry yet.
         }
 
         // Add per-replica collection state.
@@ -1315,7 +1535,7 @@ where
         // Here we augment all imported sources and all exported sinks with the appropriate
         // storage metadata needed by the compute instance.
         let mut source_imports = BTreeMap::new();
-        for (id, import) in dataflow.source_imports {
+        for (id, source_import) in dataflow.source_imports {
             let frontiers = self
                 .storage_collections
                 .collection_frontiers(id)
@@ -1328,15 +1548,15 @@ where
 
             let desc = SourceInstanceDesc {
                 storage_metadata: collection_metadata.clone(),
-                arguments: import.desc.arguments,
-                typ: import.desc.typ.clone(),
+                arguments: source_import.desc.arguments,
+                typ: source_import.desc.typ.clone(),
             };
             source_imports.insert(
                 id,
-                mz_compute_types::dataflows::SourceImport {
+                SourceImport {
                     desc,
-                    monotonic: import.monotonic,
-                    with_snapshot: import.with_snapshot,
+                    monotonic: source_import.monotonic,
+                    with_snapshot: source_import.with_snapshot,
                     upper: frontiers.write_frontier,
                 },
             );
@@ -2481,7 +2701,7 @@ impl<T: ComputeControllerTimestamp> CollectionState<T> {
 /// collection's creation in the [`Instance`]. This is to allow compute clients to query frontiers
 /// and take new read holds immediately, without having to wait for the [`Instance`] to update.
 #[derive(Clone, Debug)]
-pub(super) struct SharedCollectionState<T> {
+pub struct SharedCollectionState<T> {
     /// Accumulation of read capabilities for the collection.
     ///
     /// This accumulation contains the capabilities held by all [`ReadHold`]s given out for the
@@ -2918,9 +3138,10 @@ impl<T: ComputeControllerTimestamp> ReplicaState<T> {
             state.wallclock_lag_max = None;
         }
 
-        if let Some(previous) = self.collections.insert(id, state) {
-            panic!("attempt to add a collection with existing ID {id} (previous={previous:?}");
-        }
+        // Allow replacing a collection whose predecessor was already dropped.
+        // This can happen when the Instance task hasn't fully cleaned up a
+        // dropped collection before a new dataflow reuses the same transient ID.
+        let _previous = self.collections.insert(id, state);
     }
 
     /// Remove state for a collection.

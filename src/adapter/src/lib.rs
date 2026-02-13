@@ -39,7 +39,7 @@ macro_rules! coord_bail {
 }
 
 mod active_compute_sink;
-mod command;
+pub mod command;
 mod coord;
 mod error;
 mod explain;
@@ -60,12 +60,11 @@ pub mod statement_logging;
 pub mod telemetry;
 pub mod webhook;
 
-pub use crate::peek_client::PeekClient;
+pub use crate::peek_client::{PeekClient, PlanCacheEntry};
 
 pub use crate::client::{Client, Handle, SessionClient};
 pub use crate::command::{
     CatalogSnapshot, Command, ExecuteResponse, ExecuteResponseKind, Response, StartupResponse,
-    SuperuserAttribute,
 };
 pub use crate::coord::ExecuteContext;
 pub use crate::coord::ExecuteContextExtra;
