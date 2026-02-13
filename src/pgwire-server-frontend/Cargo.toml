@@ -1,0 +1,42 @@
+[package]
+name = "mz-pgwire-server-frontend"
+description = "Minimal pgwire/SQL server for testing frontend peek sequencing performance"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0.100"
+async-trait = "0.1.89"
+futures = "0.3.31"
+mz-adapter = { path = "../adapter" }
+mz-authenticator = { path = "../authenticator" }
+mz-build-info = { path = "../build-info" }
+mz-catalog = { path = "../catalog" }
+mz-controller-types = { path = "../controller-types" }
+mz-expr = { path = "../expr" }
+mz-ore = { path = "../ore", features = ["async", "metrics", "stack", "tracing"] }
+mz-persist-client = { path = "../persist-client" }
+mz-persist-types = { path = "../persist-types" }
+mz-pgwire = { path = "../pgwire" }
+mz-pgwire-common = { path = "../pgwire-common" }
+mz-repr = { path = "../repr" }
+mz-server-core = { path = "../server-core" }
+mz-sql = { path = "../sql" }
+mz-storage-client = { path = "../storage-client" }
+mz-storage-types = { path = "../storage-types" }
+mz-timestamp-oracle = { path = "../timestamp-oracle" }
+rand = "0.9.2"
+rand_chacha = "0.9.0"
+serde_json = "1.0.148"
+timely = "0.26.1"
+tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms", "background_threads"] }
+
+[lints]
+workspace = true

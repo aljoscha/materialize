@@ -63,7 +63,10 @@ pub mod webhook;
 pub use crate::peek_client::PeekClient;
 
 pub use crate::client::{Client, Handle, SessionClient};
-pub use crate::command::{ExecuteResponse, ExecuteResponseKind, StartupResponse};
+pub use crate::command::{
+    CatalogSnapshot, Command, ExecuteResponse, ExecuteResponseKind, Response, StartupResponse,
+    SuperuserAttribute,
+};
 pub use crate::coord::ExecuteContext;
 pub use crate::coord::ExecuteContextExtra;
 pub use crate::coord::ExecuteContextGuard;
@@ -77,7 +80,7 @@ pub use crate::coord::timestamp_selection::{
 pub use crate::coord::{Config, load_remote_system_parameters, serve};
 pub use crate::error::AdapterError;
 pub use crate::notice::AdapterNotice;
-pub use crate::util::{ResultExt, verify_datum_desc};
+pub use crate::util::{ResultExt, index_sql, verify_datum_desc};
 pub use crate::webhook::{
     AppendWebhookError, AppendWebhookResponse, AppendWebhookValidator, WebhookAppenderCache,
 };

@@ -115,7 +115,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub(crate) fn new(
+    pub fn new(
         build_info: &'static BuildInfo,
         cmd_tx: mpsc::UnboundedSender<(OpenTelemetryContext, Command)>,
         metrics: Metrics,

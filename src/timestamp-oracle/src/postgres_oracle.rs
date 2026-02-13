@@ -154,7 +154,7 @@ impl PostgresTimestampOracleConfig {
     }
 
     /// Returns the metrics associated with this config.
-    pub(crate) fn metrics(&self) -> &Arc<Metrics> {
+    pub fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
     }
 }

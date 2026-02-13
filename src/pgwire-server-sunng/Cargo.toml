@@ -1,0 +1,18 @@
+[package]
+name = "mz-pgwire-server-sunng"
+description = "Minimal pgwire server using the sunng87/pgwire crate for benchmarking"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "0.1.89"
+futures = "0.3.31"
+pgwire = { version = "0.37.3", default-features = false, features = ["server-api-aws-lc-rs"] }
+tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
+
+[lints]
+workspace = true
