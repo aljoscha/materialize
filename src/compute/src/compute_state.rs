@@ -370,8 +370,6 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
     pub fn handle_compute_command(&mut self, cmd: ComputeCommand) {
         use ComputeCommand::*;
 
-        self.compute_state.command_history.push(cmd.clone());
-
         // Record the command duration, per worker and command kind.
         let timer = self
             .compute_state
@@ -379,6 +377,15 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
             .handle_command_duration_seconds
             .for_command(&cmd)
             .start_timer();
+
+        // For Peek commands, defer the command_history push. If the peek is
+        // immediately fulfilled (the common case for fast-path index peeks),
+        // we skip the expensive Peek struct clone entirely. Only peeks that
+        // end up pending are pushed to command_history (in process_peek /
+        // handle_peek for persist peeks).
+        if !matches!(&cmd, Peek(_)) {
+            self.compute_state.command_history.push(cmd.clone());
+        }
 
         match cmd {
             Hello { .. } => panic!("Hello must be captured before"),
@@ -576,14 +583,45 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
 
     #[mz_ore::instrument(level = "debug")]
     fn handle_peek(&mut self, peek: Peek) {
+        // Fast path for index peeks: try to fulfill immediately by borrowing
+        // the trace from TraceManager, avoiding the expensive TraceBundle clone
+        // (~14% of work-0 CPU). Only if the peek is not immediately ready do
+        // we fall back to cloning and creating a PendingPeek.
+        if let PeekTarget::Index { id } = &peek.target {
+            let id = *id;
+            if let Some(response) = self.try_peek_immediate(&peek, &id) {
+                // Peek was immediately fulfilled without cloning the TraceBundle.
+                // Skip ComputeEvent logging for immediately-fulfilled peeks:
+                // - In mz_active_peeks, install (+1) and retire (-1) cancel out
+                //   within the same timely step, so users would never see them.
+                // - In mz_peek_durations_histogram, duration is 0 ns (same step),
+                //   so these entries carry no useful information.
+                // - The columnar logging overhead (event serialization + demux
+                //   dataflow processing) is significant (~7.6% of work-0 CPU
+                //   for direct logging, plus a share of demux processing).
+
+                self.send_compute_response(ComputeResponse::PeekResponse(
+                    peek.uuid,
+                    response,
+                    OpenTelemetryContext::obtain(),
+                ));
+                return;
+            }
+        }
+
         let pending = match &peek.target {
             PeekTarget::Index { id } => {
-                // Acquire a copy of the trace suitable for fulfilling the peek.
+                // Peek was not immediately fulfilled — clone the trace for pending storage.
                 let trace_bundle = self.compute_state.traces.get(id).unwrap().clone();
                 PendingPeek::index(peek, trace_bundle)
             }
             PeekTarget::Persist { metadata, .. } => {
                 let metadata = metadata.clone();
+                // Persist peeks are always async (pending) so push to
+                // command_history eagerly before consuming the peek.
+                self.compute_state
+                    .command_history
+                    .push(ComputeCommand::Peek(Box::new(peek.clone())));
                 PendingPeek::persist(
                     peek,
                     Arc::clone(&self.compute_state.persist_clients),
@@ -600,6 +638,90 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
         }
 
         self.process_peek(&mut Antichain::new(), pending);
+    }
+
+    /// Try to fulfill an index peek immediately by borrowing the trace from
+    /// TraceManager, avoiding the expensive TraceBundle clone. Returns `Some(response)`
+    /// if the peek was fulfilled, `None` if the trace is not yet ready.
+    fn try_peek_immediate(&mut self, peek: &Peek, id: &GlobalId) -> Option<PeekResponse> {
+        let trace_bundle = self.compute_state.traces.get_mut(id)?;
+
+        // Check if the trace upper has advanced past our timestamp (data is ready).
+        let mut upper = Antichain::new();
+        trace_bundle.oks_mut().read_upper(&mut upper);
+        if upper.less_equal(&peek.timestamp) {
+            return None;
+        }
+        trace_bundle.errs_mut().read_upper(&mut upper);
+        if upper.less_equal(&peek.timestamp) {
+            return None;
+        }
+
+        // Check that compaction hasn't advanced past our read timestamp.
+        let read_frontier = trace_bundle.compaction_frontier();
+        if !read_frontier.less_equal(&peek.timestamp) {
+            let error = format!(
+                "Arrangement compaction frontier ({:?}) is beyond the time of the attempted read ({})",
+                read_frontier.elements(),
+                peek.timestamp,
+            );
+            return Some(PeekResponse::Error(error));
+        }
+
+        // Data is ready — collect it directly from the borrowed trace.
+        // This is the same logic as IndexPeek::collect_finished_data but
+        // operates on the borrowed TraceBundle instead of a cloned one.
+
+        // Check for errors first.
+        {
+            let (mut cursor, storage) = trace_bundle.errs_mut().cursor();
+            while cursor.key_valid(&storage) {
+                let mut copies = Diff::ZERO;
+                cursor.map_times(&storage, |time, diff| {
+                    if time.less_equal(&peek.timestamp) {
+                        copies += diff;
+                    }
+                });
+                if copies.is_negative() {
+                    let error = cursor.key(&storage);
+                    tracing::error!(
+                        target = %peek.target.id(), diff = %copies, %error,
+                        "index peek encountered negative multiplicities in error trace",
+                    );
+                    return Some(PeekResponse::Error(format!(
+                        "Invalid data in source errors, \
+                        saw retractions ({}) for row that does not exist: {}",
+                        -copies, error,
+                    )));
+                }
+                if copies.is_positive() {
+                    return Some(PeekResponse::Error(cursor.key(&storage).to_string()));
+                }
+                cursor.step_key(&storage);
+            }
+        }
+
+        // Collect ok data. For the immediate path, we don't support peek stash
+        // (which requires owning the trace for background upload). If the result
+        // would need stashing, we return None to fall through to the clone path.
+        match IndexPeek::collect_ok_finished_data(
+            peek,
+            trace_bundle.oks_mut(),
+            self.compute_state.max_result_size,
+            false, // peek_stash_eligible = false for immediate path
+            0,     // peek_stash_threshold_bytes = 0 (irrelevant)
+        ) {
+            PeekStatus::Ready(response) => Some(response),
+            PeekStatus::NotReady => {
+                // Should not happen — we already checked upper. But be safe.
+                None
+            }
+            PeekStatus::UsePeekStash => {
+                // Result too large for inline response — fall through to clone path
+                // which supports stashing.
+                None
+            }
+        }
     }
 
     fn handle_cancel_peek(&mut self, uuid: Uuid) {
@@ -820,8 +942,6 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
     fn process_peek(&mut self, upper: &mut Antichain<Timestamp>, mut peek: PendingPeek) {
         let response = match &mut peek {
             PendingPeek::Index(peek) => {
-                let start = Instant::now();
-
                 let peek_stash_eligible = peek
                     .peek
                     .finishing
@@ -842,45 +962,12 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
                 let peek_stash_threshold_bytes =
                     PEEK_RESPONSE_STASH_THRESHOLD_BYTES.get(&self.compute_state.worker_config);
 
-                let metrics = IndexPeekMetrics {
-                    seek_fulfillment_seconds: &self
-                        .compute_state
-                        .metrics
-                        .index_peek_seek_fulfillment_seconds,
-                    frontier_check_seconds: &self
-                        .compute_state
-                        .metrics
-                        .index_peek_frontier_check_seconds,
-                    error_scan_seconds: &self.compute_state.metrics.index_peek_error_scan_seconds,
-                    cursor_setup_seconds: &self
-                        .compute_state
-                        .metrics
-                        .index_peek_cursor_setup_seconds,
-                    row_iteration_seconds: &self
-                        .compute_state
-                        .metrics
-                        .index_peek_row_iteration_seconds,
-                    result_sort_seconds: &self.compute_state.metrics.index_peek_result_sort_seconds,
-                    row_collection_seconds: &self
-                        .compute_state
-                        .metrics
-                        .index_peek_row_collection_seconds,
-                };
-
-                let status = peek.seek_fulfillment(
+                match peek.seek_fulfillment(
                     upper,
                     self.compute_state.max_result_size,
                     peek_stash_enabled && peek_stash_eligible,
                     peek_stash_threshold_bytes,
-                    &metrics,
-                );
-
-                self.compute_state
-                    .metrics
-                    .index_peek_total_seconds
-                    .observe(start.elapsed().as_secs_f64());
-
-                match status {
+                ) {
                     PeekStatus::Ready(result) => Some(result),
                     PeekStatus::NotReady => None,
                     PeekStatus::UsePeekStash => {
@@ -901,6 +988,11 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
                             peek_stash_batch_max_runs,
                         );
 
+                        // Peek is becoming pending via stash — record in
+                        // command_history for replica recovery.
+                        self.compute_state
+                            .command_history
+                            .push(ComputeCommand::Peek(Box::new(peek.peek.clone())));
                         self.compute_state
                             .pending_peeks
                             .insert(peek.peek.uuid, PendingPeek::Stash(stash_task));
@@ -938,6 +1030,12 @@ impl<'a, A: Allocate + 'static> ActiveComputeState<'a, A> {
             let _span = span!(parent: peek.span(), Level::DEBUG, "process_peek_response").entered();
             self.send_peek_response(peek, response)
         } else {
+            // Peek is not immediately fulfilled — it will remain pending.
+            // Record it in command_history for replica recovery (deferred from
+            // handle_compute_command to avoid cloning immediately-fulfilled peeks).
+            self.compute_state
+                .command_history
+                .push(ComputeCommand::Peek(Box::new(peek.peek().clone())));
             let uuid = peek.peek().uuid;
             self.compute_state.pending_peeks.insert(uuid, peek);
         }
@@ -1375,20 +1473,6 @@ pub struct IndexPeek {
     span: tracing::Span,
 }
 
-/// Histogram metrics for index peek phases.
-///
-/// This struct bundles references to the various histogram metrics used to
-/// instrument the index peek processing pipeline.
-pub(crate) struct IndexPeekMetrics<'a> {
-    pub seek_fulfillment_seconds: &'a prometheus::Histogram,
-    pub frontier_check_seconds: &'a prometheus::Histogram,
-    pub error_scan_seconds: &'a prometheus::Histogram,
-    pub cursor_setup_seconds: &'a prometheus::Histogram,
-    pub row_iteration_seconds: &'a prometheus::Histogram,
-    pub result_sort_seconds: &'a prometheus::Histogram,
-    pub row_collection_seconds: &'a prometheus::Histogram,
-}
-
 impl IndexPeek {
     /// Attempts to fulfill the peek and reports success.
     ///
@@ -1408,10 +1492,7 @@ impl IndexPeek {
         max_result_size: u64,
         peek_stash_eligible: bool,
         peek_stash_threshold_bytes: usize,
-        metrics: &IndexPeekMetrics<'_>,
     ) -> PeekStatus {
-        let method_start = Instant::now();
-
         self.trace_bundle.oks_mut().read_upper(upper);
         if upper.less_equal(&self.peek.timestamp) {
             return PeekStatus::NotReady;
@@ -1431,22 +1512,11 @@ impl IndexPeek {
             return PeekStatus::Ready(PeekResponse::Error(error));
         }
 
-        metrics
-            .frontier_check_seconds
-            .observe(method_start.elapsed().as_secs_f64());
-
-        let result = self.collect_finished_data(
+        self.collect_finished_data(
             max_result_size,
             peek_stash_eligible,
             peek_stash_threshold_bytes,
-            metrics,
-        );
-
-        metrics
-            .seek_fulfillment_seconds
-            .observe(method_start.elapsed().as_secs_f64());
-
-        result
+        )
     }
 
     /// Collects data for a known-complete peek from the ok stream.
@@ -1455,10 +1525,7 @@ impl IndexPeek {
         max_result_size: u64,
         peek_stash_eligible: bool,
         peek_stash_threshold_bytes: usize,
-        metrics: &IndexPeekMetrics<'_>,
     ) -> PeekStatus {
-        let error_scan_start = Instant::now();
-
         // Check if there exist any errors and, if so, return whatever one we
         // find first.
         let (mut cursor, storage) = self.trace_bundle.errs_mut().cursor();
@@ -1487,17 +1554,12 @@ impl IndexPeek {
             cursor.step_key(&storage);
         }
 
-        metrics
-            .error_scan_seconds
-            .observe(error_scan_start.elapsed().as_secs_f64());
-
         Self::collect_ok_finished_data(
             &self.peek,
             self.trace_bundle.oks_mut(),
             max_result_size,
             peek_stash_eligible,
             peek_stash_threshold_bytes,
-            metrics,
         )
     }
 
@@ -1508,7 +1570,6 @@ impl IndexPeek {
         max_result_size: u64,
         peek_stash_eligible: bool,
         peek_stash_threshold_bytes: usize,
-        metrics: &IndexPeekMetrics<'_>,
     ) -> PeekStatus
     where
         for<'a> Tr: TraceReader<
@@ -1522,9 +1583,6 @@ impl IndexPeek {
         let max_result_size = usize::cast_from(max_result_size);
         let count_byte_size = size_of::<NonZeroUsize>();
 
-        // Cursor setup timing
-        let cursor_setup_start = Instant::now();
-
         // We clone `literal_constraints` here because we don't want to move the constraints
         // out of the peek struct, and don't want to modify in-place.
         let mut peek_iterator = peek_result_iterator::PeekResultIterator::new(
@@ -1534,10 +1592,6 @@ impl IndexPeek {
             peek.literal_constraints.clone().as_deref_mut(),
             oks_handle,
         );
-
-        metrics
-            .cursor_setup_seconds
-            .observe(cursor_setup_start.elapsed().as_secs_f64());
 
         // Accumulated `Vec<(row, count)>` results that we are likely to return.
         let mut results = Vec::new();
@@ -1552,10 +1606,6 @@ impl IndexPeek {
 
         let mut l_datum_vec = DatumVec::new();
         let mut r_datum_vec = DatumVec::new();
-
-        // Row iteration timing
-        let row_iteration_start = Instant::now();
-        let mut sort_time_accum = Duration::ZERO;
 
         while let Some(row) = peek_iterator.next() {
             let row = match row {
@@ -1589,18 +1639,10 @@ impl IndexPeek {
                 if results.len() >= 2 * max_results {
                     if peek.finishing.order_by.is_empty() {
                         results.truncate(max_results);
-                        metrics
-                            .row_iteration_seconds
-                            .observe(row_iteration_start.elapsed().as_secs_f64());
-                        metrics
-                            .result_sort_seconds
-                            .observe(sort_time_accum.as_secs_f64());
-                        let row_collection_start = Instant::now();
-                        let collection = RowCollection::new(results, &peek.finishing.order_by);
-                        metrics
-                            .row_collection_seconds
-                            .observe(row_collection_start.elapsed().as_secs_f64());
-                        return PeekStatus::Ready(PeekResponse::Rows(collection));
+                        return PeekStatus::Ready(PeekResponse::Rows(RowCollection::new(
+                            results,
+                            &peek.finishing.order_by,
+                        )));
                     } else {
                         // We can sort `results` and then truncate to `max_results`.
                         // This has an effect similar to a priority queue, without
@@ -1610,7 +1652,6 @@ impl IndexPeek {
                         // it will require a re-pivot of the code to branch on this
                         // inner test (as we prefer not to maintain `Vec<Datum>`
                         // in the other case).
-                        let sort_start = Instant::now();
                         results.sort_by(|left, right| {
                             let left_datums = l_datum_vec.borrow_with(&left.0);
                             let right_datums = r_datum_vec.borrow_with(&right.0);
@@ -1621,7 +1662,6 @@ impl IndexPeek {
                                 || left.0.cmp(&right.0),
                             )
                         });
-                        sort_time_accum += sort_start.elapsed();
                         let dropped = results.drain(max_results..);
                         let dropped_size =
                             dropped.into_iter().fold(0, |acc: usize, (row, _count)| {
@@ -1633,19 +1673,10 @@ impl IndexPeek {
             }
         }
 
-        metrics
-            .row_iteration_seconds
-            .observe(row_iteration_start.elapsed().as_secs_f64());
-        metrics
-            .result_sort_seconds
-            .observe(sort_time_accum.as_secs_f64());
-
-        let row_collection_start = Instant::now();
-        let collection = RowCollection::new(results, &peek.finishing.order_by);
-        metrics
-            .row_collection_seconds
-            .observe(row_collection_start.elapsed().as_secs_f64());
-        PeekStatus::Ready(PeekResponse::Rows(collection))
+        PeekStatus::Ready(PeekResponse::Rows(RowCollection::new(
+            results,
+            &peek.finishing.order_by,
+        )))
     }
 }
 
