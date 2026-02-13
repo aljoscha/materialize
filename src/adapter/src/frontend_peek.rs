@@ -1897,20 +1897,11 @@ impl PeekClient {
                 match timeline {
                     Some(timeline) => {
                         let oracle = self.ensure_oracle(timeline).await?;
-                        // Fast path: read the shared atomic directly (no channel
-                        // round-trip). Falls back to the slow batched path if the
-                        // oracle hasn't been initialized yet.
-                        let ts = match oracle.peek_read_ts_fast() {
-                            Some(ts) => ts,
-                            None => {
-                                let read_ts_start = Instant::now();
-                                let ts = oracle.read_ts().await;
-                                self.metrics()
-                                    .frontend_peek_read_ts_seconds
-                                    .observe(read_ts_start.elapsed().as_secs_f64());
-                                ts
-                            }
-                        };
+                        let read_ts_start = Instant::now();
+                        let ts = oracle.read_ts().await;
+                        self.metrics()
+                            .frontend_peek_read_ts_seconds
+                            .observe(read_ts_start.elapsed().as_secs_f64());
                         Some(ts)
                     }
                     None => None,

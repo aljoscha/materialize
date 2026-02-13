@@ -65,20 +65,6 @@ pub trait TimestampOracle<T>: std::fmt::Debug {
     /// All subsequent values of `self.read_ts()` will be greater or equal to
     /// `write_ts`.
     async fn apply_write(&self, lower_bound: T);
-
-    /// Returns a recent read timestamp without blocking, if supported.
-    ///
-    /// Unlike `read_ts()`, this does not guarantee strict linearizability:
-    /// the returned timestamp may be from a recently completed batch rather
-    /// than reflecting an in-flight write. However, the value is always
-    /// monotonically non-decreasing and is updated before `apply_write`
-    /// returns, so any read starting after a write completes will see at
-    /// least that write's timestamp.
-    ///
-    /// Returns `None` if the oracle does not support fast reads (default).
-    fn peek_read_ts_fast(&self) -> Option<T> {
-        None
-    }
 }
 
 /// A [`NowFn`] that is generic over the timestamp.

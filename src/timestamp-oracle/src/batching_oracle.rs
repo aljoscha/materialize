@@ -10,7 +10,6 @@
 //! A timestamp oracle that wraps a `TimestampOracle` and batches calls
 //! to it.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,21 +35,6 @@ use crate::{TimestampOracle, WriteTimestamp};
 pub struct BatchingTimestampOracle<T> {
     inner: Arc<dyn TimestampOracle<T> + Send + Sync>,
     command_tx: UnboundedSender<Command<T>>,
-    /// Shared atomic read timestamp, updated after each batch and after each
-    /// `apply_write`. Allows callers to read the latest timestamp without a
-    /// channel round-trip, at the cost of not being strictly linearizable
-    /// (the value may be from the most recently completed batch rather than
-    /// reflecting an in-flight `apply_write`).
-    ///
-    /// This is safe because:
-    /// - The value is monotonically non-decreasing (updated via `fetch_max`)
-    /// - It is updated by `apply_write` before the write is considered complete,
-    ///   so any read that starts after a write completes will see at least that
-    ///   write's timestamp
-    /// - Using a slightly older timestamp means the read observes an earlier
-    ///   consistent snapshot, which is valid for StrictSerializable (the read
-    ///   can be linearized at the moment the atomic was last written)
-    shared_read_ts: Arc<AtomicU64>,
 }
 
 /// A command on the internal batching command stream.
@@ -71,10 +55,8 @@ where
     /// Crates a [`BatchingTimestampOracle`] that uses the given inner oracle.
     pub fn new(metrics: Arc<Metrics>, oracle: Arc<dyn TimestampOracle<T> + Send + Sync>) -> Self {
         let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
-        let shared_read_ts = Arc::new(AtomicU64::new(0));
 
         let task_oracle = Arc::clone(&oracle);
-        let task_shared_read_ts = Arc::clone(&shared_read_ts);
 
         mz_ore::task::spawn(|| "BatchingTimestampOracle Worker Task", async move {
             let read_ts_metrics = &metrics.batching.read_ts;
@@ -93,8 +75,6 @@ where
                 read_ts_metrics.batches_count.inc();
 
                 let ts = task_oracle.read_ts().await;
-                // Update shared atomic so direct readers see the latest value.
-                task_shared_read_ts.fetch_max(ts.into(), Ordering::Release);
                 for cmd in pending_cmds {
                     match cmd {
                         Command::ReadTs(response_tx) => {
@@ -112,7 +92,6 @@ where
         Self {
             inner: oracle,
             command_tx,
-            shared_read_ts,
         }
     }
 }
@@ -137,31 +116,12 @@ where
             "worker task cannot stop while we still have senders for the command/request channel",
         );
 
-        let ts = rx
-            .await
-            .expect("worker task cannot stop while there are outstanding commands/requests");
-        // Update shared atomic so direct readers see the latest value.
-        self.shared_read_ts
-            .fetch_max(ts.into(), Ordering::Release);
-        ts
+        rx.await
+            .expect("worker task cannot stop while there are outstanding commands/requests")
     }
 
     async fn apply_write(&self, write_ts: T) {
-        // Update the shared atomic BEFORE the inner apply_write, so that any
-        // subsequent direct reader sees at least this write's timestamp.
-        self.shared_read_ts
-            .fetch_max(write_ts.into(), Ordering::Release);
         self.inner.apply_write(write_ts).await
-    }
-
-    fn peek_read_ts_fast(&self) -> Option<T> {
-        let val = self.shared_read_ts.load(Ordering::Acquire);
-        if val == 0 {
-            // Not yet initialized — fall back to the slow path.
-            None
-        } else {
-            Some(T::from(val))
-        }
     }
 }
 
