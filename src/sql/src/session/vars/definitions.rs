@@ -1443,6 +1443,13 @@ pub static ENABLE_CONSOLIDATE_AFTER_UNION_NEGATE: VarDefinition = VarDefinition:
     true,
 );
 
+pub static ENABLE_REDUCE_REDUCTION: VarDefinition = VarDefinition::new(
+    "enable_reduce_reduction",
+    value!(bool; true),
+    "split complex reductions in to simpler ones and a join (Materialize).",
+    true,
+);
+
 pub static MIN_TIMESTAMP_INTERVAL: VarDefinition = VarDefinition::new(
     "min_timestamp_interval",
     value!(Duration; Duration::from_millis(1000)),
@@ -1965,12 +1972,6 @@ feature_flags!(
         enable_for_item_parsing: true,
     },
     {
-        name: enable_notices_for_equals_null,
-        desc: "emitting notices for `= NULL` and `<> NULL` comparisons (doesn't affect EXPLAIN)",
-        default: true,
-        enable_for_item_parsing: true,
-    },
-    {
         name: enable_alter_swap,
         desc: "the ALTER SWAP feature for objects",
         default: true,
@@ -2220,13 +2221,13 @@ feature_flags!(
     {
         name: enable_frontend_peek_sequencing, // currently, changes only take effect for new sessions
         desc: "Enables the new peek sequencing code, which does most of its work in the Adapter Frontend instead of the Coordinator main task.",
-        default: true,
+        default: false,
         enable_for_item_parsing: false,
     },
     {
         name: enable_replacement_materialized_views,
         desc: "Whether to enable replacement materialized views.",
-        default: true,
+        default: false,
         enable_for_item_parsing: true,
     },
     {
@@ -2239,25 +2240,6 @@ feature_flags!(
 
 impl From<&super::SystemVars> for OptimizerFeatures {
     fn from(vars: &super::SystemVars) -> Self {
-        Self {
-            enable_guard_subquery_tablefunc: vars.enable_guard_subquery_tablefunc(),
-            enable_consolidate_after_union_negate: vars.enable_consolidate_after_union_negate(),
-            enable_eager_delta_joins: vars.enable_eager_delta_joins(),
-            enable_new_outer_join_lowering: vars.enable_new_outer_join_lowering(),
-            enable_reduce_mfp_fusion: vars.enable_reduce_mfp_fusion(),
-            enable_variadic_left_join_lowering: vars.enable_variadic_left_join_lowering(),
-            enable_letrec_fixpoint_analysis: vars.enable_letrec_fixpoint_analysis(),
-            enable_cardinality_estimates: vars.enable_cardinality_estimates(),
-            persist_fast_path_limit: vars.persist_fast_path_limit(),
-            reoptimize_imported_views: false,
-            enable_join_prioritize_arranged: vars.enable_join_prioritize_arranged(),
-            enable_projection_pushdown_after_relation_cse: vars
-                .enable_projection_pushdown_after_relation_cse(),
-            enable_less_reduce_in_eqprop: vars.enable_less_reduce_in_eqprop(),
-            enable_dequadratic_eqprop_map: vars.enable_dequadratic_eqprop_map(),
-            enable_eq_classes_withholding_errors: vars.enable_eq_classes_withholding_errors(),
-            enable_fast_path_plan_insights: vars.enable_fast_path_plan_insights(),
-            enable_cast_elimination: vars.enable_cast_elimination(),
-        }
+        vars.optimizer_features().clone()
     }
 }

@@ -365,7 +365,7 @@ impl Coordinator {
                         .system_config()
                         .is_storage_config_var(name);
                     update_pg_timestamp_oracle_config |=
-                        vars::is_timestamp_oracle_config_var(name);
+                        vars::is_pg_timestamp_oracle_config_var(name);
                     update_metrics_retention |= name == vars::METRICS_RETENTION.name();
                     update_secrets_caching_config |= vars::is_secrets_caching_var(name);
                     update_cluster_scheduling_config |= vars::is_cluster_scheduling_var(name);

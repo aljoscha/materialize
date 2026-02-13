@@ -65,7 +65,7 @@
 
 use std::borrow::Cow;
 use std::clone::Clone;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
@@ -75,17 +75,14 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use derivative::Derivative;
-use im::OrdMap;
 use mz_build_info::BuildInfo;
 use mz_dyncfg::{ConfigSet, ConfigType, ConfigUpdates, ConfigVal};
-use mz_persist_client::cfg::{
-    CRDB_CONNECT_TIMEOUT, CRDB_KEEPALIVES_IDLE, CRDB_KEEPALIVES_INTERVAL, CRDB_KEEPALIVES_RETRIES,
-    CRDB_TCP_USER_TIMEOUT,
-};
+use mz_persist_client::cfg::{CRDB_CONNECT_TIMEOUT, CRDB_TCP_USER_TIMEOUT};
 use mz_repr::adt::numeric::Numeric;
 use mz_repr::adt::timestamp::CheckedTimestamp;
 use mz_repr::bytes::ByteSize;
-use mz_repr::user::{ExternalUserMetadata, InternalUserMetadata};
+use mz_repr::optimize::OptimizerFeatures;
+use mz_repr::user::ExternalUserMetadata;
 use mz_tracing::{CloneableEnvFilter, SerializableDirective};
 use serde::Serialize;
 use thiserror::Error;
@@ -387,11 +384,27 @@ impl MzVersion {
 #[derive(Debug, Clone)]
 pub struct SessionVars {
     /// The set of all session variables.
-    vars: OrdMap<&'static UncasedStr, SessionVar>,
+    vars: HashMap<&'static UncasedStr, SessionVar>,
     /// Inputs to computed variables.
     mz_version: MzVersion,
     /// Information about the user associated with this Session.
     user: User,
+    /// Cached value of `unsafe_new_transaction_wall_time`. This is checked on
+    /// every implicit transaction start but is almost always `None` (it's a
+    /// test/debug variable). Caching avoids a HashMap lookup with
+    /// case-insensitive string hashing on every query.
+    cached_unsafe_new_transaction_wall_time: Option<CheckedTimestamp<DateTime<Utc>>>,
+    /// Cached value of `transaction_isolation`. This is checked multiple times
+    /// per query (in determine_timestamp, try_frontend_peek, etc.) but rarely
+    /// changes. Caching avoids repeated HashMap lookups with case-insensitive
+    /// string hashing.
+    cached_transaction_isolation: IsolationLevel,
+    /// Cached value of `emit_trace_id_notice`. Checked once per query in the
+    /// frontend peek path but almost never changes.
+    cached_emit_trace_id_notice: bool,
+    /// Cached value of `max_query_result_size`. Checked once per query in
+    /// send_rows but rarely changes.
+    cached_max_query_result_size: u64,
 }
 
 impl SessionVars {
@@ -426,11 +439,17 @@ impl SessionVars {
         .map(|var| (var.name, SessionVar::new(var.clone())))
         .collect();
 
-        SessionVars {
+        let mut s = SessionVars {
             vars,
             mz_version: MzVersion::new(build_info, helm_chart_version),
             user,
-        }
+            cached_unsafe_new_transaction_wall_time: None,
+            cached_transaction_isolation: IsolationLevel::StrictSerializable,
+            cached_emit_trace_id_notice: false,
+            cached_max_query_result_size: ByteSize::gb(1).as_bytes(),
+        };
+        s.refresh_cached_vars();
+        s
     }
 
     fn expect_value<V: Value>(&self, var: &VarDefinition) -> &V {
@@ -440,6 +459,18 @@ impl SessionVars {
             .expect("provided var should be in state");
         let val = var.value_dyn();
         val.as_any().downcast_ref::<V>().expect("success")
+    }
+
+    /// Refreshes all cached session variable values.
+    /// Must be called after any var mutation.
+    fn refresh_cached_vars(&mut self) {
+        self.cached_unsafe_new_transaction_wall_time =
+            *self.expect_value(&UNSAFE_NEW_TRANSACTION_WALL_TIME);
+        self.cached_transaction_isolation = *self.expect_value(&TRANSACTION_ISOLATION);
+        self.cached_emit_trace_id_notice = *self.expect_value(&EMIT_TRACE_ID_NOTICE);
+        self.cached_max_query_result_size = self
+            .expect_value::<ByteSize>(&MAX_QUERY_RESULT_SIZE)
+            .as_bytes();
     }
 
     /// Returns an iterator over the configuration parameters and their current
@@ -498,9 +529,8 @@ impl SessionVars {
 
     /// Resets all variables to their default value.
     pub fn reset_all(&mut self) {
-        let names: Vec<_> = self.vars.keys().copied().collect();
-        for name in names {
-            self.vars[name].reset(false);
+        for var in self.vars.values_mut() {
+            var.reset(false);
         }
     }
 
@@ -577,7 +607,9 @@ impl SessionVars {
                 v.set(input, local)
             })
             .transpose()?
-            .ok_or_else(|| VarError::UnknownParameter(name.to_string()))
+            .ok_or_else(|| VarError::UnknownParameter(name.to_string()))?;
+        self.refresh_cached_vars();
+        Ok(())
     }
 
     /// Sets the default value for the parameter named `name` to the value
@@ -593,7 +625,9 @@ impl SessionVars {
             // Note: visibility is checked when persisting a role default.
             .map(|v| v.set_default(input))
             .transpose()?
-            .ok_or_else(|| VarError::UnknownParameter(name.to_string()))
+            .ok_or_else(|| VarError::UnknownParameter(name.to_string()))?;
+        self.refresh_cached_vars();
+        Ok(())
     }
 
     /// Sets the configuration parameter named `name` to its default value.
@@ -628,7 +662,9 @@ impl SessionVars {
                 Ok(())
             })
             .transpose()?
-            .ok_or_else(|| VarError::UnknownParameter(name.to_string()))
+            .ok_or_else(|| VarError::UnknownParameter(name.to_string()))?;
+        self.refresh_cached_vars();
+        Ok(())
     }
 
     /// Returns an error if the variable corresponding to `name` is read only.
@@ -672,6 +708,7 @@ impl SessionVars {
             }
         }
         self.vars.extend(updates);
+        self.refresh_cached_vars();
         changed
     }
 
@@ -784,9 +821,9 @@ impl SessionVars {
     }
 
     /// Returns the value of the `transaction_isolation` configuration
-    /// parameter.
+    /// parameter. Uses a cached value to avoid HashMap lookups.
     pub fn transaction_isolation(&self) -> &IsolationLevel {
-        self.expect_value(&TRANSACTION_ISOLATION)
+        &self.cached_transaction_isolation
     }
 
     /// Returns the value of `real_time_recency` configuration parameter.
@@ -809,9 +846,9 @@ impl SessionVars {
         *self.expect_value(&EMIT_TIMESTAMP_NOTICE)
     }
 
-    /// Returns the value of `emit_trace_id_notice` configuration parameter.
+    /// Returns the value of `emit_trace_id_notice`. Uses a cached value.
     pub fn emit_trace_id_notice(&self) -> bool {
-        *self.expect_value(&EMIT_TRACE_ID_NOTICE)
+        self.cached_emit_trace_id_notice
     }
 
     /// Returns the value of `auto_route_catalog_queries` configuration parameter.
@@ -839,15 +876,9 @@ impl SessionVars {
         &self.user
     }
 
-    /// Returns the value of the `max_query_result_size` configuration parameter.
+    /// Returns the value of `max_query_result_size`. Uses a cached value.
     pub fn max_query_result_size(&self) -> u64 {
-        self.expect_value::<ByteSize>(&MAX_QUERY_RESULT_SIZE)
-            .as_bytes()
-    }
-
-    /// Sets the internal metadata associated with the user.
-    pub fn set_internal_user_metadata(&mut self, metadata: InternalUserMetadata) {
-        self.user.internal_metadata = Some(metadata);
+        self.cached_max_query_result_size
     }
 
     /// Sets the external metadata associated with the user.
@@ -865,6 +896,7 @@ impl SessionVars {
     }
 
     pub fn set_local_transaction_isolation(&mut self, transaction_isolation: IsolationLevel) {
+        self.cached_transaction_isolation = transaction_isolation;
         let var = self
             .vars
             .get_mut(UncasedStr::new(TRANSACTION_ISOLATION.name()))
@@ -883,7 +915,7 @@ impl SessionVars {
     }
 
     pub fn unsafe_new_transaction_wall_time(&self) -> Option<CheckedTimestamp<DateTime<Utc>>> {
-        *self.expect_value(&UNSAFE_NEW_TRANSACTION_WALL_TIME)
+        self.cached_unsafe_new_transaction_wall_time
     }
 
     /// Returns the value of the `welcome_message` configuration parameter.
@@ -1070,6 +1102,18 @@ pub struct SystemVars {
     /// the controllers. This is so we can explicitly control and reason about when changes to config
     /// values are propagated to the rest of the system.
     dyncfgs: ConfigSet,
+
+    /// Cached [`OptimizerFeatures`] derived from the current system vars.
+    /// Eagerly recomputed on every `set`/`reset`/`set_default` to avoid
+    /// repeated BTreeMap lookups with case-insensitive string comparisons.
+    optimizer_features: OptimizerFeatures,
+
+    /// Cached value of `max_result_size` to avoid per-query BTreeMap lookup
+    /// with case-insensitive string comparison.
+    cached_max_result_size: u64,
+    /// Cached value of `statement_logging_max_sample_rate` to avoid per-query
+    /// BTreeMap lookup with case-insensitive string comparison.
+    cached_statement_logging_max_sample_rate: Numeric,
 }
 
 impl Default for SystemVars {
@@ -1164,6 +1208,7 @@ impl SystemVars {
             &ENABLE_STORAGE_SHARD_FINALIZATION,
             &ENABLE_CONSOLIDATE_AFTER_UNION_NEGATE,
             &ENABLE_DEFAULT_CONNECTION_VALIDATION,
+            &ENABLE_REDUCE_REDUCTION,
             &MIN_TIMESTAMP_INTERVAL,
             &MAX_TIMESTAMP_INTERVAL,
             &LOGGING_FILTER,
@@ -1253,18 +1298,60 @@ impl SystemVars {
             .map(|var| (var.name, SystemVar::new(var)))
             .collect();
 
-        let vars = SystemVars {
+        let mut vars = SystemVars {
             vars,
             callbacks: BTreeMap::new(),
             allow_unsafe: false,
             dyncfgs,
+            optimizer_features: OptimizerFeatures::default(),
+            cached_max_result_size: 0,
+            cached_statement_logging_max_sample_rate: Numeric::default(),
         };
+        vars.refresh_cached_system_values();
 
         vars
     }
 
     pub fn dyncfgs(&self) -> &ConfigSet {
         &self.dyncfgs
+    }
+
+    /// Returns the cached [`OptimizerFeatures`].
+    pub fn optimizer_features(&self) -> &OptimizerFeatures {
+        &self.optimizer_features
+    }
+
+    /// Recomputes the cached [`OptimizerFeatures`] from the current var values.
+    fn compute_optimizer_features(&self) -> OptimizerFeatures {
+        OptimizerFeatures {
+            enable_guard_subquery_tablefunc: self.enable_guard_subquery_tablefunc(),
+            enable_consolidate_after_union_negate: self.enable_consolidate_after_union_negate(),
+            enable_eager_delta_joins: self.enable_eager_delta_joins(),
+            enable_new_outer_join_lowering: self.enable_new_outer_join_lowering(),
+            enable_reduce_mfp_fusion: self.enable_reduce_mfp_fusion(),
+            enable_variadic_left_join_lowering: self.enable_variadic_left_join_lowering(),
+            enable_letrec_fixpoint_analysis: self.enable_letrec_fixpoint_analysis(),
+            enable_cardinality_estimates: self.enable_cardinality_estimates(),
+            persist_fast_path_limit: self.persist_fast_path_limit(),
+            reoptimize_imported_views: false,
+            enable_join_prioritize_arranged: self.enable_join_prioritize_arranged(),
+            enable_projection_pushdown_after_relation_cse: self
+                .enable_projection_pushdown_after_relation_cse(),
+            enable_less_reduce_in_eqprop: self.enable_less_reduce_in_eqprop(),
+            enable_dequadratic_eqprop_map: self.enable_dequadratic_eqprop_map(),
+            enable_eq_classes_withholding_errors: self.enable_eq_classes_withholding_errors(),
+            enable_fast_path_plan_insights: self.enable_fast_path_plan_insights(),
+            enable_cast_elimination: self.enable_cast_elimination(),
+        }
+    }
+
+    /// Refreshes all cached values. Must be called after any
+    /// var mutation (`set`, `reset`, `set_default`).
+    fn refresh_cached_system_values(&mut self) {
+        self.optimizer_features = self.compute_optimizer_features();
+        self.cached_max_result_size = self.expect_value::<ByteSize>(&MAX_RESULT_SIZE).as_bytes();
+        self.cached_statement_logging_max_sample_rate =
+            *self.expect_value(&STATEMENT_LOGGING_MAX_SAMPLE_RATE);
     }
 
     pub fn set_unsafe(mut self, allow_unsafe: bool) -> Self {
@@ -1298,14 +1385,6 @@ impl SystemVars {
             .as_any()
             .downcast_ref()
             .expect("provided var type should matched stored var")
-    }
-
-    /// Reset all the values to their defaults (preserving
-    /// defaults from `VarMut::set_default).
-    pub fn reset_all(&mut self) {
-        for (_, var) in &mut self.vars {
-            var.reset();
-        }
     }
 
     /// Returns an iterator over the configuration parameters and their current
@@ -1414,6 +1493,7 @@ impl SystemVars {
             .get_mut(UncasedStr::new(name))
             .ok_or_else(|| VarError::UnknownParameter(name.into()))
             .and_then(|v| v.set(input))?;
+        self.refresh_cached_system_values();
         self.notify_callbacks(name);
         Ok(result)
     }
@@ -1458,6 +1538,7 @@ impl SystemVars {
             .get_mut(UncasedStr::new(name))
             .ok_or_else(|| VarError::UnknownParameter(name.into()))
             .and_then(|v| v.set_default(input))?;
+        self.refresh_cached_system_values();
         self.notify_callbacks(name);
         Ok(result)
     }
@@ -1485,6 +1566,7 @@ impl SystemVars {
             .get_mut(UncasedStr::new(name))
             .ok_or_else(|| VarError::UnknownParameter(name.into()))
             .map(|v| v.reset())?;
+        self.refresh_cached_system_values();
         self.notify_callbacks(name);
         Ok(result)
     }
@@ -1637,7 +1719,7 @@ impl SystemVars {
 
     /// Returns the value of the `max_result_size` configuration parameter.
     pub fn max_result_size(&self) -> u64 {
-        self.expect_value::<ByteSize>(&MAX_RESULT_SIZE).as_bytes()
+        self.cached_max_result_size
     }
 
     /// Returns the value of the `max_copy_from_size` configuration parameter.
@@ -1854,27 +1936,6 @@ impl SystemVars {
         ))
     }
 
-    /// Returns the `crdb_keepalives_idle` configuration parameter.
-    pub fn crdb_keepalives_idle(&self) -> Duration {
-        *self.expect_config_value(UncasedStr::new(
-            mz_persist_client::cfg::CRDB_KEEPALIVES_IDLE.name(),
-        ))
-    }
-
-    /// Returns the `crdb_keepalives_interval` configuration parameter.
-    pub fn crdb_keepalives_interval(&self) -> Duration {
-        *self.expect_config_value(UncasedStr::new(
-            mz_persist_client::cfg::CRDB_KEEPALIVES_INTERVAL.name(),
-        ))
-    }
-
-    /// Returns the `crdb_keepalives_retries` configuration parameter.
-    pub fn crdb_keepalives_retries(&self) -> u32 {
-        *self.expect_config_value(UncasedStr::new(
-            mz_persist_client::cfg::CRDB_KEEPALIVES_RETRIES.name(),
-        ))
-    }
-
     /// Returns the `storage_dataflow_max_inflight_bytes` configuration parameter.
     pub fn storage_dataflow_max_inflight_bytes(&self) -> Option<usize> {
         *self.expect_value(&STORAGE_DATAFLOW_MAX_INFLIGHT_BYTES)
@@ -2001,6 +2062,10 @@ impl SystemVars {
 
     pub fn enable_consolidate_after_union_negate(&self) -> bool {
         *self.expect_value(&ENABLE_CONSOLIDATE_AFTER_UNION_NEGATE)
+    }
+
+    pub fn enable_reduce_reduction(&self) -> bool {
+        *self.expect_value(&ENABLE_REDUCE_REDUCTION)
     }
 
     /// Returns the `enable_default_connection_validation` configuration parameter.
@@ -2133,7 +2198,7 @@ impl SystemVars {
 
     /// Returns the `statement_logging_max_sample_rate` configuration parameter.
     pub fn statement_logging_max_sample_rate(&self) -> Numeric {
-        *self.expect_value(&STATEMENT_LOGGING_MAX_SAMPLE_RATE)
+        self.cached_statement_logging_max_sample_rate
     }
 
     /// Returns the `statement_logging_default_sample_rate` configuration parameter.
@@ -2283,18 +2348,15 @@ fn is_upsert_rocksdb_config_var(name: &str) -> bool {
         || name == upsert_rocksdb::UPSERT_ROCKSDB_SHRINK_ALLOCATED_BUFFERS_BY_RATIO.name()
 }
 
-/// Returns whether the named variable is a (Postgres/CRDB) timestamp oracle
+/// Returns whether the named variable is a Postgres/CRDB timestamp oracle
 /// configuration parameter.
-pub fn is_timestamp_oracle_config_var(name: &str) -> bool {
+pub fn is_pg_timestamp_oracle_config_var(name: &str) -> bool {
     name == PG_TIMESTAMP_ORACLE_CONNECTION_POOL_MAX_SIZE.name()
         || name == PG_TIMESTAMP_ORACLE_CONNECTION_POOL_MAX_WAIT.name()
         || name == PG_TIMESTAMP_ORACLE_CONNECTION_POOL_TTL.name()
         || name == PG_TIMESTAMP_ORACLE_CONNECTION_POOL_TTL_STAGGER.name()
         || name == CRDB_CONNECT_TIMEOUT.name()
         || name == CRDB_TCP_USER_TIMEOUT.name()
-        || name == CRDB_KEEPALIVES_IDLE.name()
-        || name == CRDB_KEEPALIVES_INTERVAL.name()
-        || name == CRDB_KEEPALIVES_RETRIES.name()
 }
 
 /// Returns whether the named variable is a cluster scheduling config
