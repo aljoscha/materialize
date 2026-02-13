@@ -2361,11 +2361,8 @@ pub fn non_nullable_columns(predicates: &[MirScalarExpr]) -> BTreeSet<usize> {
 }
 
 impl CollectionPlan for MirRelationExpr {
-    /// Collects the global collections that this MIR expression directly depends on, i.e., that it
-    /// has a `Get` for. (It does _not_ traverse view definitions transitively.)
-    ///
-    /// !!!WARNING!!!: this method has an HirRelationExpr counterpart. The two
-    /// should be kept in sync w.r.t. HIR ⇒ MIR lowering!
+    // !!!WARNING!!!: this method has an HirRelationExpr counterpart. The two
+    // should be kept in sync w.r.t. HIR ⇒ MIR lowering!
     fn depends_on_into(&self, out: &mut BTreeSet<GlobalId>) {
         if let MirRelationExpr::Get {
             id: Id::Global(id), ..
@@ -3720,6 +3717,25 @@ impl RowSetFinishing {
         if required_memory > usize::cast_from(max_result_size) {
             let max_bytes = ByteSize::b(max_result_size);
             return Err(format!("result exceeds max size of {max_bytes}",));
+        }
+
+        // Fast path: when the finishing is trivial (no ORDER BY, no LIMIT,
+        // no OFFSET, identity projection), skip sorted_view creation, projection
+        // setup, and response_size iteration entirely. The sorted_view is just
+        // the identity permutation and response_size can be derived from the raw
+        // byte length. For max_returned_query_size checks, byte_len() is a
+        // conservative (slightly over-) estimate that avoids iterating all rows.
+        let arity = self.project.len();
+        if self.is_trivial(arity) {
+            let response_size = rows.byte_len();
+            if let Some(max) = max_returned_query_size {
+                if response_size > usize::cast_from(max) {
+                    let max_bytes = ByteSize::b(max);
+                    return Err(format!("result exceeds max size of {max_bytes}"));
+                }
+            }
+            let iter = rows.into_trivial_iter();
+            return Ok((iter, response_size));
         }
 
         let sorted_view = rows.sorted_view(&self.order_by);

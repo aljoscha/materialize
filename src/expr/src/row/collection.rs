@@ -154,6 +154,31 @@ impl RowCollection {
         Some((row, upper))
     }
 
+    /// Creates a [`SortedRowCollectionIter`] that iterates entries in their
+    /// natural (insertion) order, without sorting, projection, or offset.
+    ///
+    /// This is a fast path for when [`RowSetFinishing::is_trivial`] is true:
+    /// no ORDER BY, no LIMIT, no OFFSET, identity projection. Avoids the
+    /// `BinaryHeap` merge in [`sorted_view`](Self::sorted_view) and the
+    /// `Vec` allocation for the sorted index.
+    pub fn into_trivial_iter(self) -> SortedRowCollectionIter {
+        let n = self.metadata.len();
+        let sorted_view: Arc<[usize]> = (0..n).collect();
+        let collection = SortedRowCollection {
+            collection: self,
+            sorted_view,
+        };
+        SortedRowCollectionIter {
+            collection,
+            row_idx: 0,
+            diff_idx: 0,
+            limit: None,
+            offset: 0,
+            projection: None,
+            projection_buf: (DatumVec::new(), Row::default()),
+        }
+    }
+
     /// "Sorts" the [`RowCollection`] by the column order in `order_by`. Returns a sorted view over
     /// the collection.
     pub fn sorted_view(self, order_by: &[ColumnOrder]) -> SortedRowCollection {

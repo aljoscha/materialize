@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
 use std::future::Future;
 use std::ops::Deref;
@@ -17,6 +17,7 @@ use std::{iter, mem};
 
 use base64::prelude::*;
 use byteorder::{ByteOrder, NetworkEndian};
+use futures::StreamExt;
 use futures::future::{BoxFuture, FutureExt, pending};
 use itertools::Itertools;
 use mz_adapter::client::RecordFirstRowStream;
@@ -29,10 +30,10 @@ use mz_adapter::{
     AdapterError, AdapterNotice, ExecuteContextGuard, ExecuteResponse, PeekResponseUnary, metrics,
     verify_datum_desc,
 };
-use mz_auth::Authenticated;
 use mz_auth::password::Password;
 use mz_authenticator::Authenticator;
 use mz_ore::cast::CastFrom;
+use mz_ore::metrics::Histogram;
 use mz_ore::netio::AsyncReady;
 use mz_ore::now::{EpochMillis, SYSTEM_TIME};
 use mz_ore::str::StrExt;
@@ -42,6 +43,7 @@ use mz_pgwire_common::{
     ConnectionCounter, Cursor, ErrorResponse, Format, FrontendMessage, Severity, VERSION_3,
     VERSIONS,
 };
+use mz_repr::user::InternalUserMetadata;
 use mz_repr::{
     CatalogItemId, ColumnIndex, Datum, RelationDesc, RowArena, RowIterator, RowRef,
     SqlRelationType, SqlScalarType,
@@ -160,14 +162,6 @@ where
     }
 
     let user = params.remove("user").unwrap_or_else(String::new);
-    let options = parse_options(params.get("options").unwrap_or(&String::new()));
-
-    // If oidc_auth_enabled exists as an option, return its value and filter it from
-    // the remaining options.
-    // TODO (Oidc): Use oidc_auth_enabled boolean and Authenticator::OIDC
-    // to decide whether or not we want to use OIDC authentication or password
-    // authentication.
-    let (_oidc_auth_enabled, options) = extract_oidc_auth_enabled_from_options(options);
 
     // TODO move this somewhere it can be shared with HTTP
     let is_internal_user = INTERNAL_USER_NAMES.contains(&user);
@@ -191,33 +185,52 @@ where
 
     let (mut session, expired) = match authenticator {
         Authenticator::Frontegg(frontegg) => {
-            let password = match request_cleartext_password(conn).await {
-                Ok(password) => password,
-                Err(PasswordRequestError::IoError(e)) => return Err(e),
-                Err(PasswordRequestError::InvalidPasswordError(e)) => {
-                    return conn.send(e).await;
+            conn.send(BackendMessage::AuthenticationCleartextPassword)
+                .await?;
+            conn.flush().await?;
+            let password = match conn.recv().await? {
+                Some(FrontendMessage::RawAuthentication(data)) => {
+                    match decode_password(Cursor::new(&data)).ok() {
+                        Some(FrontendMessage::Password { password }) => password,
+                        _ => {
+                            return conn
+                                .send(ErrorResponse::fatal(
+                                    SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+                                    "expected Password message",
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                _ => {
+                    return conn
+                        .send(ErrorResponse::fatal(
+                            SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+                            "expected Password message",
+                        ))
+                        .await;
                 }
             };
 
             let auth_response = frontegg.authenticate(&user, &password).await;
             match auth_response {
-                // Create a session based on the auth session.
-                //
-                // In particular, it's important that the username come from the
-                // auth session, as Frontegg may return an email address with
-                // different casing than the user supplied via the pgwire
-                // username fN
                 Ok((mut auth_session, _authenticated)) => {
-                    let session = adapter_client.new_session(
-                        SessionConfig {
-                            conn_id: conn.conn_id().clone(),
-                            uuid: conn_uuid,
-                            user: auth_session.user().into(),
-                            client_ip: conn.peer_addr().clone(),
-                            external_metadata_rx: Some(auth_session.external_metadata_rx()),
-                            helm_chart_version,
-                        },
-                    );
+                    // Create a session based on the auth session.
+                    //
+                    // In particular, it's important that the username come from the
+                    // auth session, as Frontegg may return an email address with
+                    // different casing than the user supplied via the pgwire
+                    // username field. We want to use the Frontegg casing as
+                    // canonical.
+                    let session = adapter_client.new_session(SessionConfig {
+                        conn_id: conn.conn_id().clone(),
+                        uuid: conn_uuid,
+                        user: auth_session.user().into(),
+                        client_ip: conn.peer_addr().clone(),
+                        external_metadata_rx: Some(auth_session.external_metadata_rx()),
+                        internal_user_metadata: None,
+                        helm_chart_version,
+                    });
                     let expired = async move { auth_session.expired().await };
                     (session, expired.left_future())
                 }
@@ -234,27 +247,45 @@ where
         }
         Authenticator::Oidc(oidc) => {
             // OIDC authentication: JWT sent as password in cleartext flow
-            let jwt = match request_cleartext_password(conn).await {
-                Ok(password) => password,
-                Err(PasswordRequestError::IoError(e)) => return Err(e),
-                Err(PasswordRequestError::InvalidPasswordError(e)) => {
-                    return conn.send(e).await;
+            conn.send(BackendMessage::AuthenticationCleartextPassword)
+                .await?;
+            conn.flush().await?;
+            let jwt = match conn.recv().await? {
+                Some(FrontendMessage::RawAuthentication(data)) => {
+                    match decode_password(Cursor::new(&data)).ok() {
+                        Some(FrontendMessage::Password { password }) => password,
+                        _ => {
+                            return conn
+                                .send(ErrorResponse::fatal(
+                                    SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+                                    "expected Password message",
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                _ => {
+                    return conn
+                        .send(ErrorResponse::fatal(
+                            SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+                            "expected Password message",
+                        ))
+                        .await;
                 }
             };
 
             let auth_response = oidc.authenticate(&jwt, Some(&user)).await;
             match auth_response {
                 Ok((claims, _authenticated)) => {
-                    let session = adapter_client.new_session(
-                        SessionConfig {
-                            conn_id: conn.conn_id().clone(),
-                            uuid: conn_uuid,
-                            user: claims.username().into(),
-                            client_ip: conn.peer_addr().clone(),
-                            external_metadata_rx: None,
-                            helm_chart_version,
-                        },
-                    );
+                    let session = adapter_client.new_session(SessionConfig {
+                        conn_id: conn.conn_id().clone(),
+                        uuid: conn_uuid,
+                        user: claims.username().into(),
+                        client_ip: conn.peer_addr().clone(),
+                        external_metadata_rx: None,
+                        internal_user_metadata: None,
+                        helm_chart_version,
+                    });
                     // No invalidation of the auth session once authenticated,
                     // so auth session lasts indefinitely.
                     (session, pending().right_future())
@@ -271,14 +302,33 @@ where
             }
         }
         Authenticator::Password(adapter_client) => {
-            let password = match request_cleartext_password(conn).await {
-                Ok(password) => Password(password),
-                Err(PasswordRequestError::IoError(e)) => return Err(e),
-                Err(PasswordRequestError::InvalidPasswordError(e)) => {
-                    return conn.send(e).await;
+            conn.send(BackendMessage::AuthenticationCleartextPassword)
+                .await?;
+            conn.flush().await?;
+            let password = match conn.recv().await? {
+                Some(FrontendMessage::RawAuthentication(data)) => {
+                    match decode_password(Cursor::new(&data)).ok() {
+                        Some(FrontendMessage::Password { password }) => Password(password),
+                        _ => {
+                            return conn
+                                .send(ErrorResponse::fatal(
+                                    SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+                                    "expected Password message",
+                                ))
+                                .await;
+                        }
+                    }
+                }
+                _ => {
+                    return conn
+                        .send(ErrorResponse::fatal(
+                            SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+                            "expected Password message",
+                        ))
+                        .await;
                 }
             };
-            let _authenticated = match adapter_client.authenticate(&user, &password).await {
+            let auth_response = match adapter_client.authenticate(&user, &password).await {
                 Ok(resp) => resp,
                 Err(err) => {
                     warn!(?err, "pgwire connection failed authentication");
@@ -290,16 +340,17 @@ where
                         .await;
                 }
             };
-            let session = adapter_client.new_session(
-                SessionConfig {
-                    conn_id: conn.conn_id().clone(),
-                    uuid: conn_uuid,
-                    user,
-                    client_ip: conn.peer_addr().clone(),
-                    external_metadata_rx: None,
-                    helm_chart_version,
-                },
-            );
+            let session = adapter_client.new_session(SessionConfig {
+                conn_id: conn.conn_id().clone(),
+                uuid: conn_uuid,
+                user,
+                client_ip: conn.peer_addr().clone(),
+                external_metadata_rx: None,
+                internal_user_metadata: Some(InternalUserMetadata {
+                    superuser: auth_response.superuser,
+                }),
+                helm_chart_version,
+            });
             // No frontegg check, so auth session lasts indefinitely.
             let auth_session = pending().right_future();
             (session, auth_session)
@@ -402,7 +453,7 @@ where
                 }
             };
 
-            let _authenticated = match conn.recv().await? {
+            let auth_resp = match conn.recv().await? {
                 Some(FrontendMessage::RawAuthentication(data)) => {
                     match decode_sasl_response(Cursor::new(&data)).ok() {
                         Some(FrontendMessage::SASLResponse(response)) => {
@@ -429,18 +480,18 @@ where
                                 )
                                 .await
                             {
-                                Ok(proof_response) => {
+                                Ok(resp) => {
                                     conn.send(BackendMessage::AuthenticationSASLFinal(
                                         SASLServerFinalMessage {
                                             kind: SASLServerFinalMessageKinds::Verifier(
-                                                proof_response.verifier,
+                                                resp.verifier,
                                             ),
                                             extensions: vec![],
                                         },
                                     ))
                                     .await?;
                                     conn.flush().await?;
-                                    proof_response.auth_resp
+                                    resp.auth_resp
                                 }
                                 Err(_) => {
                                     return conn
@@ -472,32 +523,31 @@ where
                 }
             };
 
-            let session = adapter_client.new_session(
-                SessionConfig {
-                    conn_id: conn.conn_id().clone(),
-                    uuid: conn_uuid,
-                    user,
-                    client_ip: conn.peer_addr().clone(),
-                    external_metadata_rx: None,
-                    helm_chart_version,
-                },
-            );
+            let session = adapter_client.new_session(SessionConfig {
+                conn_id: conn.conn_id().clone(),
+                uuid: conn_uuid,
+                user,
+                client_ip: conn.peer_addr().clone(),
+                external_metadata_rx: None,
+                internal_user_metadata: Some(InternalUserMetadata {
+                    superuser: auth_resp.superuser,
+                }),
+                helm_chart_version,
+            });
             // No frontegg check, so auth session lasts indefinitely.
             let auth_session = pending().right_future();
             (session, auth_session)
         }
-
         Authenticator::None => {
-            let session = adapter_client.new_session(
-                SessionConfig {
-                    conn_id: conn.conn_id().clone(),
-                    uuid: conn_uuid,
-                    user,
-                    client_ip: conn.peer_addr().clone(),
-                    external_metadata_rx: None,
-                    helm_chart_version,
-                },
-            );
+            let session = adapter_client.new_session(SessionConfig {
+                conn_id: conn.conn_id().clone(),
+                uuid: conn_uuid,
+                user,
+                client_ip: conn.peer_addr().clone(),
+                external_metadata_rx: None,
+                internal_user_metadata: None,
+                helm_chart_version,
+            });
             // No frontegg check, so auth session lasts indefinitely.
             let auth_session = pending().right_future();
             (session, auth_session)
@@ -507,7 +557,7 @@ where
     let system_vars = adapter_client.get_system_vars().await;
     for (name, value) in params {
         let settings = match name.as_str() {
-            "options" => match &options {
+            "options" => match parse_options(&value) {
                 Ok(opts) => opts,
                 Err(()) => {
                     session.add_notice(AdapterNotice::BadStartupSetting {
@@ -517,7 +567,7 @@ where
                     continue;
                 }
             },
-            _ => &vec![(name, value)],
+            _ => vec![(name, value)],
         };
         for (key, val) in settings {
             const LOCAL: bool = false;
@@ -525,12 +575,13 @@ where
             // (silently ignore errors on set), but erroring the connection
             // might be the better behavior. We maybe need to support more
             // options sent by psql and drivers before we can safely do this.
-            if let Err(err) = session
-                .vars_mut()
-                .set(&system_vars, key, VarInput::Flat(val), LOCAL)
+            if let Err(err) =
+                session
+                    .vars_mut()
+                    .set(&system_vars, &key, VarInput::Flat(&val), LOCAL)
             {
                 session.add_notice(AdapterNotice::BadStartupSetting {
-                    name: key.clone(),
+                    name: key,
                     reason: err.to_string(),
                 });
             }
@@ -575,11 +626,16 @@ where
     conn.send_all(buf).await?;
     conn.flush().await?;
 
+    let resolved_metrics = ResolvedPgwireMetrics::new(adapter_client.inner().metrics());
     let machine = StateMachine {
         conn,
         adapter_client,
         txn_needs_commit: false,
         tokio_metrics_intervals,
+        resolved_metrics,
+        cached_time_to_first_row: None,
+        cached_row_desc_bytes: None,
+        cached_encode_state: None,
     };
 
     select! {
@@ -606,31 +662,6 @@ where
             conn.flush().await
         }
     }
-}
-
-/// Gets `oidc_auth_enabled` from options if it exists.
-/// Returns options with oidc_auth_enabled extracted
-/// and the oidc_auth_enabled value.
-fn extract_oidc_auth_enabled_from_options(
-    options: Result<Vec<(String, String)>, ()>,
-) -> (bool, Result<Vec<(String, String)>, ()>) {
-    let options = match options {
-        Ok(opts) => opts,
-        Err(_) => return (false, options),
-    };
-
-    let mut new_options = Vec::new();
-    let mut oidc_auth_enabled = false;
-
-    for (k, v) in options {
-        if k == "oidc_auth_enabled" {
-            oidc_auth_enabled = v.parse::<bool>().unwrap_or(false);
-        } else {
-            new_options.push((k, v));
-        }
-    }
-
-    (oidc_auth_enabled, Ok(new_options))
 }
 
 /// Returns (name, value) session settings pairs from an options value.
@@ -714,53 +745,119 @@ fn split_options(value: &str) -> Vec<String> {
     strs
 }
 
-enum PasswordRequestError {
-    InvalidPasswordError(ErrorResponse),
-    IoError(io::Error),
-}
-
-impl From<io::Error> for PasswordRequestError {
-    fn from(e: io::Error) -> Self {
-        PasswordRequestError::IoError(e)
-    }
-}
-
-/// Requests a cleartext password from a connection and returns it if it is valid.
-/// Sends an error response in the connection if the password
-/// is not valid.
-async fn request_cleartext_password<A>(
-    conn: &mut FramedConn<A>,
-) -> Result<String, PasswordRequestError>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-{
-    conn.send(BackendMessage::AuthenticationCleartextPassword)
-        .await?;
-    conn.flush().await?;
-
-    if let Some(message) = conn.recv().await? {
-        if let FrontendMessage::RawAuthentication(data) = message {
-            if let Some(FrontendMessage::Password { password }) =
-                decode_password(Cursor::new(&data)).ok()
-            {
-                return Ok(password);
-            }
-        }
-    }
-
-    Err(PasswordRequestError::InvalidPasswordError(
-        ErrorResponse::fatal(
-            SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
-            "expected Password message",
-        ),
-    ))
-}
-
 #[derive(Debug)]
 enum State {
     Ready,
     Drain,
     Done,
+}
+
+/// Pre-resolved Prometheus `Histogram` handles for per-message-type metrics.
+/// By resolving these once per connection instead of calling `with_label_values`
+/// (which does a `HashMap` lookup under a global `RwLock`) on every query,
+/// we eliminate cross-connection lock contention.
+struct ResolvedPgwireMetrics {
+    /// `pgwire_message_processing_seconds` keyed by message name.
+    message_processing: HashMap<&'static str, Histogram>,
+    /// `pgwire_recv_scheduling_delay_ms` keyed by message name.
+    recv_scheduling_delay: HashMap<&'static str, Histogram>,
+    /// `pgwire_ensure_transaction_seconds` keyed by message type.
+    ensure_transaction: HashMap<&'static str, Histogram>,
+    /// `result_rows_first_to_last_byte_seconds` keyed by statement type.
+    result_rows_duration: HashMap<&'static str, Histogram>,
+}
+
+impl ResolvedPgwireMetrics {
+    fn new(metrics: &mz_adapter::metrics::Metrics) -> Self {
+        // All possible FrontendMessage::name() values, plus "" for None messages.
+        let message_names: &[&'static str] = &[
+            "",
+            "query",
+            "parse",
+            "describe_statement",
+            "describe_portal",
+            "bind",
+            "execute",
+            "flush",
+            "sync",
+            "close_statement",
+            "close_portal",
+            "terminate",
+            "copy_data",
+            "copy_done",
+            "copy_fail",
+            "raw_authentication",
+            "password",
+            "sasl_initial_response",
+            "sasl_response",
+        ];
+
+        let message_processing = message_names
+            .iter()
+            .map(|&name| {
+                (
+                    name,
+                    metrics
+                        .pgwire_message_processing_seconds
+                        .with_label_values(&[name]),
+                )
+            })
+            .collect();
+
+        let recv_scheduling_delay = message_names
+            .iter()
+            .map(|&name| {
+                (
+                    name,
+                    metrics
+                        .pgwire_recv_scheduling_delay_ms
+                        .with_label_values(&[name]),
+                )
+            })
+            .collect();
+
+        // ensure_transaction is called with a subset of message types.
+        let ensure_txn_types: &[&'static str] = &[
+            "query",
+            "parse",
+            "bind",
+            "execute",
+            "describe_statement",
+            "describe_portal",
+        ];
+        let ensure_transaction = ensure_txn_types
+            .iter()
+            .map(|&name| {
+                (
+                    name,
+                    metrics
+                        .pgwire_ensure_transaction_seconds
+                        .with_label_values(&[name]),
+                )
+            })
+            .collect();
+
+        // Pre-resolve common statement types for result_rows_first_to_last_byte_seconds.
+        let stmt_types: &[&'static str] = &["select", "no-statement"];
+        let result_rows_duration = stmt_types
+            .iter()
+            .map(|&name| {
+                (
+                    name,
+                    metrics
+                        .result_rows_first_to_last_byte_seconds
+                        .with_label_values(&[name]),
+                )
+            })
+            .collect();
+
+        ResolvedPgwireMetrics {
+            message_processing,
+            recv_scheduling_delay,
+            ensure_transaction,
+            result_rows_duration,
+        }
+    }
 }
 
 struct StateMachine<'a, A, I>
@@ -771,6 +868,19 @@ where
     adapter_client: mz_adapter::SessionClient,
     txn_needs_commit: bool,
     tokio_metrics_intervals: I,
+    resolved_metrics: ResolvedPgwireMetrics,
+    /// Cached `time_to_first_row_seconds` histogram handle, keyed by
+    /// `(instance_id_str, strategy_name)`. Avoids per-query `to_string()` on
+    /// `ComputeInstanceId` and `with_label_values` HashMap lookup.
+    cached_time_to_first_row: Option<(String, &'static str, Histogram)>,
+    /// Cached pre-encoded RowDescription bytes for the cached peek fast path.
+    /// Keyed by SQL text (as `Arc<str>` pointer identity from the plan cache).
+    /// Avoids per-query `encode_row_description()` + `ColumnName::clone()` +
+    /// `Type::from()` + Vec allocation overhead.
+    cached_row_desc_bytes: Option<(usize, Vec<u8>)>,
+    /// Cached encode state for DataRow encoding. Avoids per-query
+    /// `update_encode_state_from_desc()` Vec rebuild.
+    cached_encode_state: Option<(usize, Vec<(mz_pgrepr::Type, mz_pgwire_common::Format)>)>,
 }
 
 enum SendRowsEndedReason {
@@ -792,6 +902,99 @@ where
     A: AsyncRead + AsyncWrite + AsyncReady + Send + Sync + Unpin + 'a,
     I: Iterator<Item = TaskMetrics> + Send + 'a,
 {
+    /// Send a RowDescription message using cached pre-encoded bytes when available.
+    ///
+    /// On the first call for a given RelationDesc (identified by column count),
+    /// encodes the RowDescription message and caches the raw bytes. Subsequent
+    /// calls with the same column count write the cached bytes directly to the
+    /// output buffer, avoiding per-query `encode_row_description()` allocations
+    /// (ColumnName clones, Vec<FieldDescription> construction, Type::from()
+    /// conversions).
+    async fn send_cached_row_description(
+        &mut self,
+        desc: &RelationDesc,
+    ) -> Result<(), io::Error> {
+        let ncols = desc.typ().column_types.len();
+        // Check if we have cached bytes for this column count.
+        if let Some((cached_ncols, ref bytes)) = self.cached_row_desc_bytes {
+            if cached_ncols == ncols {
+                self.conn.send_pre_encoded(bytes).await?;
+                return Ok(());
+            }
+        }
+        // Cache miss: encode the RowDescription and cache the bytes.
+        let formats = vec![Format::Text; ncols];
+        let field_descs = message::encode_row_description(desc, &formats);
+        let msg = BackendMessage::RowDescription(field_descs);
+        let bytes = crate::codec::encode_message_to_bytes(msg)?;
+        self.conn.send_pre_encoded(&bytes).await?;
+        self.cached_row_desc_bytes = Some((ncols, bytes));
+        Ok(())
+    }
+
+    /// Set the encode state for DataRow encoding, using a cached state when available.
+    ///
+    /// On the first call for a given RelationDesc (identified by column count),
+    /// builds the encode state and caches it. Subsequent calls with the same
+    /// column count set the encode state from the cache, avoiding per-query
+    /// `update_encode_state_from_desc()` Vec rebuild and `Type::from()` conversions.
+    fn set_cached_encode_state(&mut self, desc: &RelationDesc) {
+        let ncols = desc.typ().column_types.len();
+        // Check if we have cached encode state for this column count.
+        if let Some((cached_ncols, ref state)) = self.cached_encode_state {
+            if cached_ncols == ncols {
+                self.conn.set_encode_state_cached(state);
+                return;
+            }
+        }
+        // Cache miss: build and cache the encode state.
+        let state: Vec<_> = desc
+            .typ()
+            .column_types
+            .iter()
+            .map(|ty| (mz_pgrepr::Type::from(&ty.scalar_type), mz_pgwire_common::Format::Text))
+            .collect();
+        self.conn.set_encode_state_cached(&state);
+        self.cached_encode_state = Some((ncols, state));
+    }
+
+    /// Record the `time_to_first_row_seconds` metric using a cached histogram
+    /// handle. On first call, resolves the histogram via `with_label_values`;
+    /// subsequent calls with the same strategy reuse the cached handle, avoiding
+    /// per-query `ComputeInstanceId::to_string()` and HashMap lookup.
+    fn record_time_to_first_row(
+        &mut self,
+        instance_id: &impl std::fmt::Display,
+        strategy: StatementExecutionStrategy,
+        execute_started: Instant,
+    ) {
+        let strategy_name = strategy.name();
+        // Fast path: reuse cached histogram if strategy matches.
+        // Strategy is a &'static str so pointer comparison is sufficient.
+        // Instance ID rarely changes within a connection, so we don't re-check it.
+        if let Some((_, cached_strategy_name, ref h)) = self.cached_time_to_first_row {
+            if std::ptr::eq(cached_strategy_name, strategy_name) {
+                h.observe(execute_started.elapsed().as_secs_f64());
+                return;
+            }
+        }
+        // Slow path: resolve and cache the histogram handle.
+        let id_str = instance_id.to_string();
+        let isolation_level = *self
+            .adapter_client
+            .session()
+            .vars()
+            .transaction_isolation();
+        let histogram = self
+            .adapter_client
+            .inner()
+            .metrics()
+            .time_to_first_row_seconds
+            .with_label_values(&[id_str.as_str(), isolation_level.as_str(), strategy_name]);
+        histogram.observe(execute_started.elapsed().as_secs_f64());
+        self.cached_time_to_first_row = Some((id_str, strategy_name, histogram));
+    }
+
     // Manually desugar this (don't use `async fn run`) here because a much better
     // error message is produced if there are problems with Send or other traits
     // somewhere within the Future.
@@ -960,19 +1163,17 @@ where
         };
 
         if let Some(start) = start {
-            self.adapter_client
-                .inner()
-                .metrics()
-                .pgwire_message_processing_seconds
-                .with_label_values(&[message_name])
-                .observe(start.elapsed().as_secs_f64());
+            if let Some(h) = self.resolved_metrics.message_processing.get(message_name) {
+                h.observe(start.elapsed().as_secs_f64());
+            }
         }
-        self.adapter_client
-            .inner()
-            .metrics()
-            .pgwire_recv_scheduling_delay_ms
-            .with_label_values(&[message_name])
-            .observe(recv_scheduling_delay_ms);
+        if let Some(h) = self
+            .resolved_metrics
+            .recv_scheduling_delay
+            .get(message_name)
+        {
+            h.observe(recv_scheduling_delay_ms);
+        }
 
         Ok(next_state)
     }
@@ -996,49 +1197,167 @@ where
     #[instrument(level = "debug")]
     async fn one_query(
         &mut self,
-        stmt: Statement<Raw>,
+        stmt: Arc<Statement<Raw>>,
         sql: String,
         lifecycle_timestamps: LifecycleTimestamps,
     ) -> Result<State, io::Error> {
+        // Fast path: for plan-cached queries, bypass declare/portal/remove_portal
+        // entirely and go directly to the cached peek execution. This avoids
+        // StatementDesc::clone, BTreeMap portal insertion/removal, mint_logging
+        // overhead, and catalog_snapshot_local per query.
+        match self
+            .adapter_client
+            .try_cached_peek_direct(&sql, &stmt, lifecycle_timestamps.clone())
+            .await
+        {
+            Ok(Some((response, relation_desc))) => {
+                // Handle the response fully inline to avoid send_rows() portal lookup.
+                // For simple query protocol, result formats are always Text.
+                match response {
+                    ExecuteResponse::SendingRowsImmediate { mut rows } => {
+                        let desc = relation_desc
+                            .expect("missing row desc for SendingRowsImmediate");
+                        self.send_cached_row_description(&desc).await?;
+                        self.set_cached_encode_state(&desc);
+                        let mut total_sent_rows = 0;
+                        let messages = (&mut rows).map(|row| {
+                            total_sent_rows += 1;
+                            let values = mz_pgrepr::values_from_row(row, desc.typ());
+                            BackendMessage::DataRow(values)
+                        });
+                        self.send_all(messages).await?;
+                        self.send(BackendMessage::CommandComplete {
+                            tag: format!("SELECT {}", total_sent_rows),
+                        })
+                        .await?;
+                        return Ok(State::Ready);
+                    }
+                    ExecuteResponse::SendingRowsStreaming {
+                        mut rows,
+                        instance_id,
+                        strategy,
+                    } => {
+                        let desc = relation_desc
+                            .expect("missing row desc for SendingRowsStreaming");
+                        self.send_cached_row_description(&desc).await?;
+                        let execute_started = Instant::now();
+                        // Try inline fast path: await first item.
+                        if let Some(first_item) = rows.next().await {
+                            match first_item {
+                                PeekResponseUnary::Rows(mut batch_rows) => {
+                                    let stream_done = rows.next().await.is_none();
+                                    if stream_done {
+                                        self.record_time_to_first_row(
+                                            &instance_id,
+                                            strategy,
+                                            execute_started,
+                                        );
+                                        self.set_cached_encode_state(&desc);
+                                        let mut total_sent_rows = 0;
+                                        let messages = (&mut batch_rows).map(|row| {
+                                            total_sent_rows += 1;
+                                            let values =
+                                                mz_pgrepr::values_from_row(row, desc.typ());
+                                            BackendMessage::DataRow(values)
+                                        });
+                                        self.send_all(messages).await?;
+                                        self.send(BackendMessage::CommandComplete {
+                                            tag: format!("SELECT {}", total_sent_rows),
+                                        })
+                                        .await?;
+                                        return Ok(State::Ready);
+                                    }
+                                    // Stream not done — fall through to declare path
+                                    // (shouldn't happen for cached fast-path peeks).
+                                }
+                                PeekResponseUnary::Error(text) => {
+                                    return self
+                                        .error(ErrorResponse::error(
+                                            SqlState::INTERNAL_ERROR,
+                                            text,
+                                        ))
+                                        .await;
+                                }
+                                PeekResponseUnary::Canceled => {
+                                    return self
+                                        .error(ErrorResponse::error(
+                                            SqlState::QUERY_CANCELED,
+                                            "canceling statement due to user request",
+                                        ))
+                                        .await;
+                                }
+                            }
+                        } else {
+                            // Empty stream — send empty result.
+                            self.send(BackendMessage::CommandComplete {
+                                tag: "SELECT 0".to_string(),
+                            })
+                            .await?;
+                            return Ok(State::Ready);
+                        }
+                    }
+                    _ => {
+                        // Non-row response (shouldn't happen for cached peeks),
+                        // fall through to declare path.
+                    }
+                }
+            }
+            Ok(None) => {
+                // Fall through to the declare path.
+            }
+            Err(e) => {
+                return self
+                    .error(e.into_response(Severity::Error))
+                    .await;
+            }
+        }
+
         // Bind the portal. Note that this does not set the empty string prepared
         // statement.
         const EMPTY_PORTAL: &str = "";
         if let Err(e) = self
             .adapter_client
-            .declare(EMPTY_PORTAL.to_string(), Arc::new(stmt), sql)
+            .declare(EMPTY_PORTAL.to_string(), stmt, sql)
             .await
         {
             return self.error(e.into_response(Severity::Error)).await;
         }
-        let portal = self
-            .adapter_client
-            .session()
-            .get_portal_unverified_mut(EMPTY_PORTAL)
-            .expect("unnamed portal should be present");
-
-        *portal.lifecycle_timestamps = Some(lifecycle_timestamps);
-
-        let stmt_desc = portal.desc.clone();
-        if !stmt_desc.param_types.is_empty() {
-            return self
-                .error(ErrorResponse::error(
-                    SqlState::UNDEFINED_PARAMETER,
-                    "there is no parameter $1",
-                ))
-                .await;
-        }
-
-        // Maybe send row description.
-        if let Some(relation_desc) = &stmt_desc.relation_desc {
-            if !stmt_desc.is_copy {
-                let formats = vec![Format::Text; stmt_desc.arity()];
-                self.send(BackendMessage::RowDescription(
-                    message::encode_row_description(relation_desc, &formats),
-                ))
-                .await?;
+        // Avoid a full StatementDesc::clone() by borrowing the portal for
+        // encode_row_description, then taking relation_desc after execute().
+        // This saves deep-cloning the BTreeMap<ColumnIndex, ColumnMetadata>
+        // per query (~0.86% CPU).
+        let row_desc_message = {
+            let portal = self
+                .adapter_client
+                .session()
+                .get_portal_unverified_mut(EMPTY_PORTAL)
+                .expect("unnamed portal should be present");
+            *portal.lifecycle_timestamps = Some(lifecycle_timestamps);
+            if !portal.desc.param_types.is_empty() {
+                return self
+                    .error(ErrorResponse::error(
+                        SqlState::UNDEFINED_PARAMETER,
+                        "there is no parameter $1",
+                    ))
+                    .await;
             }
+            // Encode RowDescription by borrowing from the portal (no clone needed).
+            match (&portal.desc.relation_desc, portal.desc.is_copy) {
+                (Some(relation_desc), false) => {
+                    let formats = vec![Format::Text; relation_desc.typ().column_types.len()];
+                    Some(BackendMessage::RowDescription(
+                        message::encode_row_description(relation_desc, &formats),
+                    ))
+                }
+                _ => None,
+            }
+        };
+        // Send the RowDescription after releasing the portal borrow.
+        if let Some(msg) = row_desc_message {
+            self.send(msg).await?;
         }
 
+        // Execute the statement. portal.desc is intact here for verify_portal.
         let result = match self
             .adapter_client
             .execute(EMPTY_PORTAL.to_string(), self.conn.wait_closed(), None)
@@ -1046,9 +1365,15 @@ where
         {
             Ok((response, execute_started)) => {
                 self.send_pending_notices().await?;
+                // Take relation_desc from the portal instead of cloning it.
+                // The portal will be destroyed via remove_portal() below anyway.
+                let relation_desc = self
+                    .adapter_client
+                    .session()
+                    .take_portal_relation_desc(EMPTY_PORTAL);
                 self.send_execute_response(
                     response,
-                    stmt_desc.relation_desc,
+                    relation_desc,
                     EMPTY_PORTAL.to_string(),
                     ExecuteCount::All,
                     portal_exec_message,
@@ -1075,20 +1400,21 @@ where
         num_stmts: usize,
         message_type: &str,
     ) -> Result<(), io::Error> {
-        let start = Instant::now();
+        // Only time the expensive path (when we need to commit a previous
+        // transaction). The fast path (just start_transaction_implicit) is
+        // trivially fast and not worth the Instant::now() + histogram observe
+        // overhead on every query.
         if self.txn_needs_commit {
+            let start = Instant::now();
             self.commit_transaction().await?;
+            if let Some(h) = self.resolved_metrics.ensure_transaction.get(message_type) {
+                h.observe(start.elapsed().as_secs_f64());
+            }
         }
         // start_transaction can't error (but assert that just in case it changes in
         // the future.
         let res = self.adapter_client.start_transaction(Some(num_stmts));
         assert_ok!(res);
-        self.adapter_client
-            .inner()
-            .metrics()
-            .pgwire_ensure_transaction_seconds
-            .with_label_values(&[message_type])
-            .observe(start.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -1117,21 +1443,35 @@ where
     /// For implicit transaction handling, see "Multiple Statements in a Simple Query" in the above.
     #[instrument(level = "debug")]
     async fn query(&mut self, sql: String, received: EpochMillis) -> Result<State, io::Error> {
-        // Parse first before doing any transaction checking.
-        let stmts = match self.parse_sql(&sql) {
-            Ok(stmts) => stmts,
-            Err(err) => {
-                self.error(err).await?;
-                return self.ready().await;
+        // Fast path: if the plan cache has this SQL, skip parsing entirely
+        // and reuse the cached parsed statement as Arc to avoid deep-cloning
+        // the AST. On cache miss, wrap freshly parsed stmts in Arc (once).
+        let cached_stmt = self.adapter_client.get_cached_parsed_stmt(&sql);
+
+        let (num_stmts, stmt_sql_pairs) = if let Some(stmt) = cached_stmt {
+            (1, vec![(stmt, sql)])
+        } else {
+            // Parse first before doing any transaction checking.
+            match self.parse_sql(&sql) {
+                Ok(stmts) => {
+                    let num = stmts.len();
+                    let pairs = stmts
+                        .into_iter()
+                        .map(|r| (Arc::new(r.ast), r.sql.to_string()))
+                        .collect::<Vec<_>>();
+                    (num, pairs)
+                }
+                Err(err) => {
+                    self.error(err).await?;
+                    return self.ready().await;
+                }
             }
         };
 
-        let num_stmts = stmts.len();
-
         // Compare with postgres' backend/tcop/postgres.c exec_simple_query.
-        for StatementParseResult { ast: stmt, sql } in stmts {
+        for (stmt, sql) in stmt_sql_pairs {
             // In an aborted transaction, reject all commands except COMMIT/ROLLBACK.
-            if self.is_aborted_txn() && !is_txn_exit_stmt(Some(&stmt)) {
+            if self.is_aborted_txn() && !is_txn_exit_stmt(Some(&*stmt)) {
                 self.aborted_txn_error().await?;
                 break;
             }
@@ -1146,7 +1486,7 @@ where
             self.ensure_transaction(num_stmts, "query").await?;
 
             match self
-                .one_query(stmt, sql.to_string(), LifecycleTimestamps { received })
+                .one_query(stmt, sql, LifecycleTimestamps { received })
                 .await?
             {
                 State::Ready => (),
@@ -1156,10 +1496,34 @@ where
         }
 
         // Implicit transactions are closed at the end of a Query message.
-        {
-            if self.adapter_client.session().transaction().is_implicit() {
-                self.commit_transaction().await?;
+        // For implicit read-only transactions (the common case for simple
+        // SELECT queries), we skip the adapter round-trip and clear the
+        // transaction state locally. The adapter's Command::Commit handler
+        // for implicit transactions just echoes back the session without
+        // doing meaningful work, so the MPSC round-trip is pure overhead.
+        //
+        // However, for transactions that contain writes (INSERT/UPDATE/DELETE)
+        // or DDL, we must go through the full commit path so the coordinator
+        // can apply the changes.
+        let implicit_txn_action = {
+            let txn = self.adapter_client.session().transaction();
+            if txn.is_implicit() {
+                if txn.needs_coordinator_commit() {
+                    Some(true) // needs full commit
+                } else {
+                    Some(false) // can commit locally
+                }
+            } else {
+                None // not implicit, nothing to do
             }
+        };
+        match implicit_txn_action {
+            Some(true) => self.commit_transaction().await?,
+            Some(false) => {
+                self.txn_needs_commit = false;
+                let _ = self.adapter_client.end_transaction_local();
+            }
+            None => {}
         }
 
         if num_stmts == 0 {
@@ -1396,7 +1760,7 @@ where
 
         let desc = stmt.desc().clone();
         let logging = Arc::clone(stmt.logging());
-        let stmt_ast = stmt.stmt().cloned();
+        let stmt_ast = stmt.stmt().cloned().map(Arc::new);
         let state_revision = stmt.state_revision;
         if let Err(err) = self.adapter_client.session().set_portal(
             portal_name,
@@ -1798,8 +2162,25 @@ where
     #[instrument(level = "debug")]
     async fn sync(&mut self) -> Result<State, io::Error> {
         // Close the current transaction if we are in an implicit transaction.
-        if self.adapter_client.session().transaction().is_implicit() {
-            self.commit_transaction().await?;
+        let implicit_txn_action = {
+            let txn = self.adapter_client.session().transaction();
+            if txn.is_implicit() {
+                if txn.needs_coordinator_commit() {
+                    Some(true)
+                } else {
+                    Some(false)
+                }
+            } else {
+                None
+            }
+        };
+        match implicit_txn_action {
+            Some(true) => self.commit_transaction().await?,
+            Some(false) => {
+                self.txn_needs_commit = false;
+                let _ = self.adapter_client.end_transaction_local();
+            }
+            None => {}
         }
         self.ready().await
     }
@@ -1868,33 +2249,148 @@ where
                 .await
             }
             ExecuteResponse::SendingRowsStreaming {
-                rows,
+                mut rows,
                 instance_id,
                 strategy,
             } => {
                 let row_desc = row_desc
                     .expect("missing row description for ExecuteResponse::SendingRowsStreaming");
 
-                let span = tracing::debug_span!("sending_rows_streaming");
+                // Fast path: for simple queries with no fetch/timeout/max_rows constraints,
+                // await the first item from the stream. For fast-path peeks (where
+                // implement_fast_path_peek_plan inlined the response via oneshot await),
+                // this completes immediately. If the first item is a unary Rows batch
+                // and the stream is done, send rows directly without going through the
+                // full send_rows machinery (RecordFirstRowStream, InProgressRows,
+                // portal lookups, tokio::select!, Sleep timer, etc.).
+                if matches!(max_rows, ExecuteCount::All)
+                    && matches!(timeout, ExecuteTimeout::None)
+                    && fetch_portal_name.is_none()
+                {
+                    if let Some(first_item) = rows.next().await {
+                        match first_item {
+                            PeekResponseUnary::Rows(mut batch_rows) => {
+                                // Check if the stream is done (common case: unary response).
+                                let stream_done = rows.next().await.is_none();
 
-                self.send_rows(
-                    row_desc,
-                    portal_name,
-                    InProgressRows::new(RecordFirstRowStream::new(
-                        Box::new(rows),
-                        execute_started,
-                        &self.adapter_client,
-                        Some(instance_id),
-                        Some(strategy),
-                    )),
-                    max_rows,
-                    get_response,
-                    fetch_portal_name,
-                    timeout,
-                )
-                .instrument(span)
-                .await
-                .map(|(state, _)| state)
+                                if stream_done {
+                                    // Record time-to-first-row metric using cached histogram.
+                                    self.record_time_to_first_row(
+                                        &instance_id,
+                                        strategy,
+                                        execute_started,
+                                    );
+
+                                    // Set up encode state for DataRow encoding,
+                                    // reusing the existing Vec allocation.
+                                    self.conn.update_encode_state_from_desc(&row_desc);
+
+                                    // Send DataRow messages inline.
+                                    let mut total_sent_rows = 0;
+                                    let messages = (&mut batch_rows).map(|row| {
+                                        total_sent_rows += 1;
+                                        let values =
+                                            mz_pgrepr::values_from_row(row, row_desc.typ());
+                                        BackendMessage::DataRow(values)
+                                    });
+                                    self.send_all(messages).await?;
+
+                                    // Send CommandComplete.
+                                    self.send(BackendMessage::CommandComplete {
+                                        tag: format!("SELECT {}", total_sent_rows),
+                                    })
+                                    .await?;
+
+                                    return Ok(State::Ready);
+                                }
+
+                                // Stream not done — fall through to normal path.
+                                // Reconstruct the stream with the already-consumed items.
+                                let remaining_stream = rows;
+                                let first_batch = futures::stream::once(futures::future::ready(
+                                    PeekResponseUnary::Rows(batch_rows),
+                                ));
+                                let combined: std::pin::Pin<
+                                    Box<
+                                        dyn futures::Stream<Item = PeekResponseUnary> + Send + Sync,
+                                    >,
+                                > = Box::pin(first_batch.chain(remaining_stream));
+                                let span = tracing::debug_span!("sending_rows_streaming");
+                                self.send_rows(
+                                    row_desc,
+                                    portal_name,
+                                    InProgressRows::new(RecordFirstRowStream::new(
+                                        Box::new(combined),
+                                        execute_started,
+                                        &self.adapter_client,
+                                        Some(instance_id),
+                                        Some(strategy),
+                                    )),
+                                    max_rows,
+                                    get_response,
+                                    fetch_portal_name,
+                                    timeout,
+                                )
+                                .instrument(span)
+                                .await
+                                .map(|(state, _)| state)
+                            }
+                            PeekResponseUnary::Error(text) => {
+                                self.error(ErrorResponse::error(SqlState::INTERNAL_ERROR, text))
+                                    .await
+                            }
+                            PeekResponseUnary::Canceled => {
+                                self.error(ErrorResponse::error(
+                                    SqlState::QUERY_CANCELED,
+                                    "canceling statement due to user request",
+                                ))
+                                .await
+                            }
+                        }
+                    } else {
+                        // Stream was empty — fall through to normal path.
+                        let span = tracing::debug_span!("sending_rows_streaming");
+                        self.send_rows(
+                            row_desc,
+                            portal_name,
+                            InProgressRows::new(RecordFirstRowStream::new(
+                                Box::new(rows),
+                                execute_started,
+                                &self.adapter_client,
+                                Some(instance_id),
+                                Some(strategy),
+                            )),
+                            max_rows,
+                            get_response,
+                            fetch_portal_name,
+                            timeout,
+                        )
+                        .instrument(span)
+                        .await
+                        .map(|(state, _)| state)
+                    }
+                } else {
+                    // Non-fast-path: has fetch/timeout/max_rows constraints.
+                    let span = tracing::debug_span!("sending_rows_streaming");
+                    self.send_rows(
+                        row_desc,
+                        portal_name,
+                        InProgressRows::new(RecordFirstRowStream::new(
+                            Box::new(rows),
+                            execute_started,
+                            &self.adapter_client,
+                            Some(instance_id),
+                            Some(strategy),
+                        )),
+                        max_rows,
+                        get_response,
+                        fetch_portal_name,
+                        timeout,
+                    )
+                    .instrument(span)
+                    .await
+                    .map(|(state, _)| state)
+                }
             }
             ExecuteResponse::SendingRowsImmediate { rows } => {
                 let row_desc = row_desc
@@ -2296,6 +2792,11 @@ where
                 FetchResult::Rows(rows.current.take())
             } else if want_rows == 0 {
                 FetchResult::Rows(None)
+            } else if rows.remaining.no_more_rows {
+                // The stream already signaled completion on a prior recv().
+                // Skip the tokio::select! entirely to avoid polling
+                // wait_closed, notice, and timeout channels unnecessarily.
+                FetchResult::Rows(None)
             } else {
                 let notice_fut = self.adapter_client.session().recv_notice();
                 tokio::select! {
@@ -2368,6 +2869,38 @@ where
                         break;
                     }
 
+                    // Fast path for immediately-ready streams: if another item (or end-of-stream)
+                    // is already available, consume it now and avoid an extra flush+select hop.
+                    if let Some(next_batch) = rows.remaining.try_recv() {
+                        match next_batch {
+                            None => break,
+                            Some(PeekResponseUnary::Rows(batch_rows)) => {
+                                rows.current = Some(batch_rows);
+                                continue;
+                            }
+                            Some(PeekResponseUnary::Error(text)) => {
+                                return self
+                                    .error(ErrorResponse::error(
+                                        SqlState::INTERNAL_ERROR,
+                                        text.clone(),
+                                    ))
+                                    .await
+                                    .map(|state| {
+                                        (state, SendRowsEndedReason::Errored { error: text })
+                                    });
+                            }
+                            Some(PeekResponseUnary::Canceled) => {
+                                return self
+                                    .error(ErrorResponse::error(
+                                        SqlState::QUERY_CANCELED,
+                                        "canceling statement due to user request",
+                                    ))
+                                    .await
+                                    .map(|state| (state, SendRowsEndedReason::Canceled));
+                            }
+                        }
+                    }
+
                     self.conn.flush().await?;
                 }
                 FetchResult::Notice(notice) => {
@@ -2438,12 +2971,20 @@ where
                 // does flip `saw_rows`, so this code path is currently not exercised.)
                 Duration::ZERO
             };
-            self.adapter_client
-                .inner()
-                .metrics()
-                .result_rows_first_to_last_byte_seconds
-                .with_label_values(&[statement_type])
-                .observe(duration.as_secs_f64());
+            if let Some(h) = self
+                .resolved_metrics
+                .result_rows_duration
+                .get(statement_type)
+            {
+                h.observe(duration.as_secs_f64());
+            } else {
+                self.adapter_client
+                    .inner()
+                    .metrics()
+                    .result_rows_first_to_last_byte_seconds
+                    .with_label_values(&[statement_type])
+                    .observe(duration.as_secs_f64());
+            }
         }
 
         Ok((
@@ -2745,6 +3286,12 @@ where
 
     #[instrument(level = "debug")]
     async fn send_pending_notices(&mut self) -> Result<(), io::Error> {
+        // Fast path: skip drain_notices() entirely when the channel is empty.
+        // This avoids a Vec allocation, try_recv loop, and send_all overhead
+        // for the common case where no notices are pending.
+        if !self.adapter_client.session().has_pending_notices() {
+            return Ok(());
+        }
         let notices = self
             .adapter_client
             .session()
@@ -3071,86 +3618,6 @@ mod test {
         for test in tests {
             let got = split_options(test.input);
             assert_eq!(got, test.expect, "input: {}", test.input);
-        }
-    }
-
-    #[mz_ore::test]
-    fn test_extract_oidc_auth_enabled_from_options() {
-        struct TestCase {
-            input: Result<Vec<(&'static str, &'static str)>, ()>,
-            expect_enabled: bool,
-            expect_options: Result<Vec<(&'static str, &'static str)>, ()>,
-        }
-        let tests = vec![
-            // Empty options
-            TestCase {
-                input: Ok(vec![]),
-                expect_enabled: false,
-                expect_options: Ok(vec![]),
-            },
-            // Error input passthrough
-            TestCase {
-                input: Err(()),
-                expect_enabled: false,
-                expect_options: Err(()),
-            },
-            // oidc_auth_enabled=true
-            TestCase {
-                input: Ok(vec![("oidc_auth_enabled", "true")]),
-                expect_enabled: true,
-                expect_options: Ok(vec![]),
-            },
-            // oidc_auth_enabled=false
-            TestCase {
-                input: Ok(vec![("oidc_auth_enabled", "false")]),
-                expect_enabled: false,
-                expect_options: Ok(vec![]),
-            },
-            // Invalid oidc_auth_enabled value defaults to false
-            TestCase {
-                input: Ok(vec![("oidc_auth_enabled", "invalid")]),
-                expect_enabled: false,
-                expect_options: Ok(vec![]),
-            },
-            // No oidc_auth_enabled, other options preserved
-            TestCase {
-                input: Ok(vec![("key1", "val1"), ("key2", "val2")]),
-                expect_enabled: false,
-                expect_options: Ok(vec![("key1", "val1"), ("key2", "val2")]),
-            },
-            // Mixed: oidc_auth_enabled with other options
-            TestCase {
-                input: Ok(vec![
-                    ("key1", "val1"),
-                    ("oidc_auth_enabled", "true"),
-                    ("key2", "val2"),
-                ]),
-                expect_enabled: true,
-                expect_options: Ok(vec![("key1", "val1"), ("key2", "val2")]),
-            },
-        ];
-        for test in tests {
-            let input = test.input.map(|r| {
-                r.into_iter()
-                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                    .collect()
-            });
-            let (got_enabled, got_options) = extract_oidc_auth_enabled_from_options(input.clone());
-            let expect_options = test.expect_options.map(|r| {
-                r.into_iter()
-                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                    .collect()
-            });
-            assert_eq!(
-                got_enabled, test.expect_enabled,
-                "enabled mismatch for input: {:?}",
-                input
-            );
-            assert_eq!(
-                got_options, expect_options,
-                "options mismatch for input: {:?}",
-                input
-            );
         }
     }
 }

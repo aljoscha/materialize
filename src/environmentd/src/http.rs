@@ -603,6 +603,7 @@ impl AuthedClient {
             user: user.name,
             client_ip: Some(peer_addr),
             external_metadata_rx: user.external_metadata_rx,
+            internal_user_metadata: user.internal_metadata,
             helm_chart_version,
         });
         let connection_guard = active_connection_counter.allocate_connection(session.user())?;

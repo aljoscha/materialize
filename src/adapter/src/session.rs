@@ -31,7 +31,9 @@ use mz_ore::now::{EpochMillis, NowFn};
 use mz_pgwire_common::Format;
 use mz_repr::role_id::RoleId;
 use mz_repr::user::{ExternalUserMetadata, InternalUserMetadata};
-use mz_repr::{CatalogItemId, Datum, Row, RowIterator, SqlScalarType, TimestampManipulation};
+use mz_repr::{
+    CatalogItemId, Datum, RelationDesc, Row, RowIterator, SqlScalarType, TimestampManipulation,
+};
 use mz_sql::ast::{AstInfo, Raw, Statement, TransactionAccessMode};
 use mz_sql::plan::{Params, PlanContext, QueryWhen, StatementDesc};
 use mz_sql::session::metadata::SessionMetadata;
@@ -210,6 +212,8 @@ pub struct SessionConfig {
     /// An optional receiver that the session will periodically check for
     /// updates to a user's external metadata.
     pub external_metadata_rx: Option<watch::Receiver<ExternalUserMetadata>>,
+    /// The metadata of the user associated with the session.
+    pub internal_user_metadata: Option<InternalUserMetadata>,
     /// Helm chart version
     pub helm_chart_version: Option<String>,
 }
@@ -297,6 +301,7 @@ impl<T: TimestampManipulation> Session<T> {
                 user: SYSTEM_USER.name.clone(),
                 client_ip: None,
                 external_metadata_rx: None,
+                internal_user_metadata: None,
                 helm_chart_version: None,
             },
             metrics,
@@ -313,6 +318,7 @@ impl<T: TimestampManipulation> Session<T> {
             user,
             client_ip,
             mut external_metadata_rx,
+            internal_user_metadata,
             helm_chart_version,
         }: SessionConfig,
         metrics: SessionMetrics,
@@ -321,7 +327,7 @@ impl<T: TimestampManipulation> Session<T> {
         let default_cluster = INTERNAL_USER_NAME_TO_DEFAULT_CLUSTER.get(&user);
         let user = User {
             name: user,
-            internal_metadata: None,
+            internal_metadata: internal_user_metadata,
             external_metadata: external_metadata_rx
                 .as_mut()
                 .map(|rx| rx.borrow_and_update().clone()),
@@ -538,6 +544,13 @@ impl<T: TimestampManipulation> Session<T> {
         }
     }
 
+    /// Returns true if the notice channel has no pending notices.
+    /// This is a cheap check that avoids the allocation and try_recv loop
+    /// of `drain_notices()` when there are no notices to send.
+    pub fn has_pending_notices(&self) -> bool {
+        !self.notices_rx.is_empty()
+    }
+
     /// Returns a draining iterator over the notices attached to the session.
     pub fn drain_notices(&mut self) -> Vec<AdapterNotice> {
         let mut notices = Vec::new();
@@ -713,7 +726,7 @@ impl<T: TimestampManipulation> Session<T> {
         &mut self,
         portal_name: String,
         desc: StatementDesc,
-        stmt: Option<Statement<Raw>>,
+        stmt: Option<Arc<Statement<Raw>>>,
         logging: Arc<QCell<PreparedStatementLoggingInfo>>,
         params: Vec<(Datum, SqlScalarType)>,
         result_formats: Vec<Format>,
@@ -724,13 +737,19 @@ impl<T: TimestampManipulation> Session<T> {
             return Err(AdapterError::DuplicateCursor(portal_name));
         }
         self.state_revision += 1;
+        // Use the post-bump session revision for the new portal so it doesn't
+        // immediately appear stale to verify_portal/verify_statement_revision.
+        let portal_revision = StateRevision {
+            session_state_revision: self.state_revision,
+            ..state_revision
+        };
         let param_types = desc.param_types.clone();
         self.portals.insert(
             portal_name,
             Portal {
-                stmt: stmt.map(Arc::new),
+                stmt,
                 desc,
-                state_revision,
+                state_revision: portal_revision,
                 parameters: Params {
                     datums: Row::pack(params.iter().map(|(d, _t)| d)),
                     execute_types: params.into_iter().map(|(_d, t)| t).collect(),
@@ -779,6 +798,15 @@ impl<T: TimestampManipulation> Session<T> {
         })
     }
 
+    /// Takes the `relation_desc` out of a portal's `StatementDesc`, leaving `None`
+    /// in its place. Used to transfer ownership without cloning when the portal
+    /// will be destroyed shortly after.
+    pub fn take_portal_relation_desc(&mut self, portal_name: &str) -> Option<RelationDesc> {
+        self.portals
+            .get_mut(portal_name)
+            .and_then(|p| p.desc.relation_desc.take())
+    }
+
     /// Creates and installs a new portal.
     pub fn create_new_portal(
         &mut self,
@@ -790,6 +818,11 @@ impl<T: TimestampManipulation> Session<T> {
         state_revision: StateRevision,
     ) -> Result<String, AdapterError> {
         self.state_revision += 1;
+        // Use the post-bump session revision so the portal doesn't appear stale.
+        let portal_revision = StateRevision {
+            session_state_revision: self.state_revision,
+            ..state_revision
+        };
 
         // See: https://github.com/postgres/postgres/blob/84f5c2908dad81e8622b0406beea580e40bb03ac/src/backend/utils/mmgr/portalmem.c#L234
         for i in 0usize.. {
@@ -800,7 +833,7 @@ impl<T: TimestampManipulation> Session<T> {
                     entry.insert(Portal {
                         stmt: stmt.map(Arc::new),
                         desc,
-                        state_revision,
+                        state_revision: portal_revision,
                         parameters,
                         result_formats,
                         state: PortalState::NotStarted,
@@ -865,11 +898,6 @@ impl<T: TimestampManipulation> Session<T> {
         // the sending side of this watch channel.
         let metadata = rx.borrow_and_update().clone();
         self.vars.set_external_user_metadata(metadata);
-    }
-
-    /// Applies the internal user metadata to the session.
-    pub fn apply_internal_user_metadata(&mut self, metadata: InternalUserMetadata) {
-        self.vars.set_internal_user_metadata(metadata);
     }
 
     /// Initializes the session's role metadata.
@@ -1149,6 +1177,25 @@ impl<T: TimestampManipulation> TransactionStatus<T> {
             | TransactionStatus::InTransaction(txn)
             | TransactionStatus::InTransactionImplicit(txn)
             | TransactionStatus::Failed(txn) => Some(txn),
+        }
+    }
+
+    /// Whether committing this transaction requires going through the
+    /// coordinator (e.g., writes that need to be applied, DDL ops that need
+    /// to be committed). Returns `false` for no-ops, peeks, and subscribe
+    /// (which don't require coordinator work on commit).
+    pub fn needs_coordinator_commit(&self) -> bool {
+        match self {
+            TransactionStatus::Default => false,
+            TransactionStatus::Started(txn)
+            | TransactionStatus::InTransaction(txn)
+            | TransactionStatus::InTransactionImplicit(txn)
+            | TransactionStatus::Failed(txn) => matches!(
+                txn.ops,
+                TransactionOps::Writes(_)
+                    | TransactionOps::SingleStatement { .. }
+                    | TransactionOps::DDL { .. }
+            ),
         }
     }
 

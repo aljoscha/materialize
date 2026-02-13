@@ -1104,7 +1104,7 @@ impl ResultSender for WebSocket {
             tick.tick().await;
             loop {
                 tick.tick().await;
-                if let Err(err) = self.send(Message::Ping(Vec::new().into())).await {
+                if let Err(err) = self.send(Message::Ping(bytes::Bytes::new())).await {
                     return err.into();
                 }
             }
@@ -1417,7 +1417,7 @@ async fn execute_stmt<S: ResultSender>(
 
     let desc = prep_stmt.desc().clone();
     let logging = Arc::clone(prep_stmt.logging());
-    let stmt_ast = prep_stmt.stmt().cloned();
+    let stmt_ast = prep_stmt.stmt().cloned().map(Arc::new);
     let state_revision = prep_stmt.state_revision;
     if let Err(err) = client.session().set_portal(
         EMPTY_PORTAL.into(),

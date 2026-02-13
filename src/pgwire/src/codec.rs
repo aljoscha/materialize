@@ -130,6 +130,51 @@ where
         self.inner.flush().await
     }
 
+    /// Writes pre-encoded raw bytes directly to the output buffer.
+    ///
+    /// The bytes must be a complete, already-encoded pgwire message (including
+    /// the type byte and length prefix). This bypasses the `Codec::encode`
+    /// step entirely, avoiding per-message allocation and encoding overhead
+    /// for messages whose encoding never changes (e.g., RowDescription for
+    /// a cached query).
+    pub async fn send_pre_encoded(&mut self, bytes: &[u8]) -> Result<(), io::Error> {
+        // Write directly to the underlying framed connection's write buffer.
+        // We need to access the inner Framed's codec buffer. The sink::Buffer
+        // wraps a Framed, which wraps a Conn<A>. We flush the sink buffer first
+        // to ensure ordering, then write raw bytes to the underlying stream.
+        //
+        // Actually, we can't easily bypass the Framed layer. Instead, use a
+        // special BackendMessage variant.
+        //
+        // Alternative approach: encode into the Framed's write buffer directly
+        // by accessing the codec. The Framed<Conn<A>, Codec> has a write buffer
+        // that we can append to.
+        let framed = self.inner.get_mut();
+        let write_buf = framed.write_buffer_mut();
+        write_buf.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Sets the encode state from a cached slice, skipping the update if
+    /// the OIDs already match (for repeated queries with the same schema).
+    pub fn set_encode_state_cached(
+        &mut self,
+        state: &[(mz_pgrepr::Type, mz_pgwire_common::Format)],
+    ) {
+        let codec_state = &mut self.inner.get_mut().codec_mut().encode_state;
+        if codec_state.len() == state.len() {
+            let same = codec_state
+                .iter()
+                .zip(state.iter())
+                .all(|(a, b)| a.0.oid() == b.0.oid());
+            if same {
+                return;
+            }
+        }
+        codec_state.clear();
+        codec_state.extend_from_slice(state);
+    }
+
     /// Injects state that affects how certain backend messages are encoded.
     ///
     /// Specifically, the encoding of `BackendMessage::DataRow` depends upon the
@@ -143,6 +188,22 @@ where
         encode_state: Vec<(mz_pgrepr::Type, mz_pgwire_common::Format)>,
     ) {
         self.inner.get_mut().codec_mut().encode_state = encode_state;
+    }
+
+    /// Update the encode state in-place from a RelationDesc, reusing the
+    /// existing Vec allocation when the column count hasn't changed.
+    /// This avoids a per-query Vec allocation for repeated queries with
+    /// the same schema.
+    pub fn update_encode_state_from_desc(&mut self, desc: &mz_repr::RelationDesc) {
+        let state = &mut self.inner.get_mut().codec_mut().encode_state;
+        let column_types = &desc.typ().column_types;
+        state.clear();
+        state.extend(column_types.iter().map(|ty| {
+            (
+                mz_pgrepr::Type::from(&ty.scalar_type),
+                mz_pgwire_common::Format::Text,
+            )
+        }));
     }
 
     /// Waits for the connection to be closed.
@@ -323,7 +384,7 @@ impl Encoder<BackendMessage> for Codec {
             BackendMessage::RowDescription(fields) => {
                 dst.put_length_i16(fields.len())?;
                 for f in &fields {
-                    dst.put_string(&f.name.to_string());
+                    dst.put_string(&f.name);
                     dst.put_u32(f.table_id);
                     dst.put_u16(f.column_id);
                     dst.put_u32(f.type_oid);
@@ -425,6 +486,28 @@ impl Encoder<BackendMessage> for Codec {
 
         Ok(())
     }
+}
+
+impl Codec {
+    /// Encode a single BackendMessage into raw bytes.
+    ///
+    /// This is used to pre-encode messages for caching. The returned bytes
+    /// include the type byte and length prefix, and can be written directly
+    /// to the output buffer via `FramedConn::send_pre_encoded`.
+    pub fn encode_to_vec(&mut self, msg: BackendMessage) -> Result<Vec<u8>, io::Error> {
+        let mut buf = BytesMut::new();
+        self.encode(msg, &mut buf)?;
+        Ok(buf.to_vec())
+    }
+}
+
+/// Encode a BackendMessage into raw bytes for caching.
+///
+/// This creates a temporary Codec to encode the message. The returned bytes
+/// include the type byte and length prefix.
+pub fn encode_message_to_bytes(msg: BackendMessage) -> Result<Vec<u8>, io::Error> {
+    let mut codec = Codec::new();
+    codec.encode_to_vec(msg)
 }
 
 impl Decoder for Codec {

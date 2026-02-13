@@ -90,7 +90,7 @@ impl Coordinator {
         session.set_portal(
             name,
             desc,
-            Some(stmt),
+            Some(Arc::new(stmt)),
             logging,
             params,
             result_formats,
