@@ -55,6 +55,7 @@ pub struct Metrics {
     pub group_commit_confirm_leadership_seconds: Histogram,
     pub group_commit_table_advancement_seconds: Histogram,
     pub frontend_peek_seconds: HistogramVec,
+    pub frontend_peek_read_ts_seconds: Histogram,
 }
 
 impl Metrics {
@@ -252,6 +253,11 @@ impl Metrics {
                 name: "mz_frontend_peek_seconds",
                 help: "Wall-clock duration of frontend peek methods.",
                 var_labels: ["method"],
+                buckets: histogram_seconds_buckets(0.000_128, 16.0),
+            )),
+            frontend_peek_read_ts_seconds: registry.register(metric!(
+                name: "mz_frontend_peek_read_ts_seconds",
+                help: "Wall-clock duration of frontend peek read_ts oracle calls.",
                 buckets: histogram_seconds_buckets(0.000_128, 16.0),
             )),
         }

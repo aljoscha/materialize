@@ -794,7 +794,11 @@ impl PeekClient {
         let oracle_read_ts = match timeline {
             Some(timeline) if needs_linearized_read_ts => {
                 let oracle = self.ensure_oracle(timeline).await?;
+                let read_ts_start = Instant::now();
                 let ts = oracle.read_ts().await;
+                self.metrics()
+                    .frontend_peek_read_ts_seconds
+                    .observe(read_ts_start.elapsed().as_secs_f64());
                 Some(ts)
             }
             Some(_) | None => None,
@@ -1898,7 +1902,14 @@ impl PeekClient {
                         // oracle hasn't been initialized yet.
                         let ts = match oracle.peek_read_ts_fast() {
                             Some(ts) => ts,
-                            None => oracle.read_ts().await,
+                            None => {
+                                let read_ts_start = Instant::now();
+                                let ts = oracle.read_ts().await;
+                                self.metrics()
+                                    .frontend_peek_read_ts_seconds
+                                    .observe(read_ts_start.elapsed().as_secs_f64());
+                                ts
+                            }
                         };
                         Some(ts)
                     }
@@ -2042,7 +2053,11 @@ impl PeekClient {
             let oracle_read_ts = match timeline {
                 Some(timeline) if needs_linearized_read_ts => {
                     let oracle = self.ensure_oracle(timeline).await?;
+                    let read_ts_start = Instant::now();
                     let ts = oracle.read_ts().await;
+                    self.metrics()
+                        .frontend_peek_read_ts_seconds
+                        .observe(read_ts_start.elapsed().as_secs_f64());
                     Some(ts)
                 }
                 Some(_) | None => None,
