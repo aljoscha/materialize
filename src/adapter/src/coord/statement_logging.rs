@@ -574,11 +574,18 @@ impl Coordinator {
         logging: &Arc<QCell<PreparedStatementLoggingInfo>>,
         lifecycle_timestamps: Option<LifecycleTimestamps>,
     ) -> Option<StatementLoggingId> {
-        let enable_internal_statement_logging = self
-            .catalog()
-            .system_config()
-            .enable_internal_statement_logging();
-        if session.user().is_internal() && !enable_internal_statement_logging {
+        // Fast path: when max_sample_rate is 0, no statement will ever be sampled.
+        // Skip all sampling, metrics, and accounting work.
+        let system_config = self.catalog().system_config();
+        let max_sample_rate: f64 = system_config
+            .statement_logging_max_sample_rate()
+            .try_into()
+            .expect("value constrained to be convertible to f64");
+        if max_sample_rate == 0.0 {
+            return None;
+        }
+
+        if session.user().is_internal() && !system_config.enable_internal_statement_logging() {
             return None;
         }
 

@@ -307,6 +307,10 @@ pub enum PreparedStatementLoggingInfo {
 impl PreparedStatementLoggingInfo {
     /// Constructor for the [`PreparedStatementLoggingInfo::StillToLog`] variant that ensures SQL
     /// statements are properly redacted.
+    ///
+    /// The `redacted_sql` field is computed lazily (deferred to
+    /// [`get_prepared_statement_info`]) to avoid the cost of AST-to-string
+    /// conversion on every query. Only sampled statements pay this cost.
     pub fn still_to_log<A: AstInfo>(
         raw_sql: String,
         stmt: Option<&Statement<A>>,
@@ -333,7 +337,10 @@ impl PreparedStatementLoggingInfo {
 
         PreparedStatementLoggingInfo::StillToLog {
             sql,
-            redacted_sql: stmt.map(|s| s.to_ast_string_redacted()).unwrap_or_default(),
+            // Deferred: computed lazily in get_prepared_statement_info() by
+            // re-parsing the sql field. This avoids the cost of
+            // to_ast_string_redacted() on every query.
+            redacted_sql: String::new(),
             prepared_at,
             name,
             session_id,
@@ -505,7 +512,19 @@ impl StatementLoggingFrontend {
                 );
                 let uuid = epoch_to_uuid_v7(prepared_at);
                 let sql = std::mem::take(sql);
-                let redacted_sql = std::mem::take(redacted_sql);
+                // Compute redacted_sql lazily: if it was deferred in
+                // still_to_log(), re-parse the SQL and redact it now.
+                let redacted_sql = {
+                    let stored = std::mem::take(redacted_sql);
+                    if stored.is_empty() && !sql.is_empty() {
+                        match mz_sql_parser::parser::parse_statements(&sql) {
+                            Ok(stmts) if !stmts.is_empty() => stmts[0].ast.to_ast_string_redacted(),
+                            _ => "<invalid SQL>".to_string(),
+                        }
+                    } else {
+                        stored
+                    }
+                };
                 let sql_hash: [u8; 32] = Sha256::digest(sql.as_bytes()).into();
 
                 // Copy session_id before mutating logging_ref
@@ -583,6 +602,20 @@ impl StatementLoggingFrontend {
         Row,
         Option<PreparedStatementEvent>,
     )> {
+        // Fast path: when max_sample_rate is 0, no statement will ever be sampled.
+        // Skip all sampling, metrics, and accounting work. Check is_zero() on the
+        // raw Numeric to avoid the Decimal→f64 conversion on the hot path.
+        let max_sample_rate_numeric = system_config.statement_logging_max_sample_rate();
+        if max_sample_rate_numeric.is_zero() {
+            return None;
+        }
+        let max_sample_rate: f64 = max_sample_rate_numeric
+            .try_into()
+            .expect("value constrained to be convertible to f64");
+        if max_sample_rate == 0.0 {
+            return None;
+        }
+
         // Skip logging for internal users unless explicitly enabled
         let enable_internal_statement_logging = system_config.enable_internal_statement_logging();
         if session.user().is_internal() && !enable_internal_statement_logging {
@@ -986,7 +1019,7 @@ impl WatchSetCreation {
 
         for item_id in input_id_bundle
             .iter()
-            .map(|gid| catalog_state.get_entry_by_global_id(&gid).id())
+            .map(|gid| catalog_state.resolve_item_id(&gid))
             .flat_map(|id| catalog_state.transitive_uses(id))
         {
             let entry = catalog_state.get_entry(&item_id);
