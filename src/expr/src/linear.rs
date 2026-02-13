@@ -1531,6 +1531,19 @@ pub mod util {
     /// The permutations and thinning expressions generated here will be tracked in
     /// `dataflow::plan::AvailableCollections`; see the
     /// documentation there for more details.
+    /// Returns `true` if the arrangement keys form an identity permutation,
+    /// i.e., `keys[i] == Column(i)` for all `i` and `keys.len() == arity`.
+    /// When this is true, `permutation_for_arrangement` would return an
+    /// identity permutation and empty thinning, so callers can skip computing
+    /// the permutation entirely.
+    pub fn is_identity_arrangement(key: &[MirScalarExpr], arity: usize) -> bool {
+        key.len() == arity
+            && key
+                .iter()
+                .enumerate()
+                .all(|(i, k)| k.as_column() == Some(i))
+    }
+
     pub fn permutation_for_arrangement(
         key: &[MirScalarExpr],
         unthinned_arity: usize,
@@ -1745,6 +1758,17 @@ pub mod plan {
         /// If any unsupported expression is found, for example one that uses `mz_now`
         /// in an unsupported position, an error is returned.
         pub fn create_from(mut mfp: MapFilterProject) -> Result<Self, String> {
+            // Fast path: if the MFP has no expressions and no predicates,
+            // skip the optimize() call entirely — there's nothing to optimize
+            // and no temporal predicates to extract.
+            if mfp.expressions.is_empty() && mfp.predicates.is_empty() {
+                return Ok(Self {
+                    mfp: SafeMfpPlan { mfp },
+                    lower_bounds: Vec::new(),
+                    upper_bounds: Vec::new(),
+                });
+            }
+
             let mut lower_bounds = Vec::new();
             let mut upper_bounds = Vec::new();
 

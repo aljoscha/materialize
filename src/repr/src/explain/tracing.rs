@@ -11,6 +11,7 @@
 
 use std::fmt::{Debug, Display};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mz_sql_parser::ast::NamedPlan;
 use tracing::{Level, span, subscriber};
@@ -19,6 +20,13 @@ use tracing_subscriber::{field, layer};
 
 use crate::explain::UsedIndexes;
 use smallvec::SmallVec;
+
+/// Global counter tracking the number of active [`PlanTrace`] instances.
+///
+/// When zero, [`trace_plan`] returns immediately without calling
+/// [`tracing::Span::current()`], avoiding expensive thread-local dispatcher
+/// lookups on every transform step during normal query execution.
+static ACTIVE_PLAN_TRACES: AtomicUsize = AtomicUsize::new(0);
 
 /// A tracing layer used to accumulate a sequence of explainable plans.
 #[allow(missing_debug_implementations)]
@@ -106,6 +114,9 @@ pub struct TraceEntry<T> {
 ///   ... // preceding stages
 /// ```
 pub fn trace_plan<T: Clone + 'static>(plan: &T) {
+    if ACTIVE_PLAN_TRACES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     tracing::Span::current().with_subscriber(|(_id, subscriber)| {
         if let Some(trace) = subscriber.downcast_ref::<PlanTrace<T>>() {
             trace.push(plan)
@@ -120,6 +131,9 @@ pub fn trace_plan<T: Clone + 'static>(plan: &T) {
 ///
 /// [^example]: <https://github.com/MaterializeInc/materialize/commit/2ce93229>
 pub fn dbg_plan<S: Display, T: Clone + 'static>(segment: S, plan: &T) {
+    if ACTIVE_PLAN_TRACES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     span!(target: "optimizer", Level::DEBUG, "segment", path.segment = %segment).in_scope(|| {
         trace_plan(plan);
     });
@@ -132,6 +146,9 @@ pub fn dbg_plan<S: Display, T: Clone + 'static>(segment: S, plan: &T) {
 ///
 /// [^example]: <https://github.com/MaterializeInc/materialize/commit/2ce93229>
 pub fn dbg_misc<S: Display, T: Display>(segment: S, misc: T) {
+    if ACTIVE_PLAN_TRACES.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     span!(target: "optimizer", Level::DEBUG, "segment", path.segment = %segment).in_scope(|| {
         trace_plan(&misc.to_string());
     });
@@ -231,6 +248,7 @@ impl<T: 'static + Clone> PlanTrace<T> {
     /// Create a new trace for plans of type `T` that will only accumulate
     /// [`TraceEntry`] instances along the prefix of the given `path`.
     pub fn new(filter: Option<SmallVec<[NamedPlan; 4]>>) -> Self {
+        ACTIVE_PLAN_TRACES.fetch_add(1, Ordering::Relaxed);
         Self {
             filter,
             path: Mutex::new(String::with_capacity(256)),
@@ -314,6 +332,12 @@ impl<T: 'static + Clone> PlanTrace<T> {
             }
             None => Some(path.to_owned()),
         }
+    }
+}
+
+impl<T> Drop for PlanTrace<T> {
+    fn drop(&mut self) {
+        ACTIVE_PLAN_TRACES.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

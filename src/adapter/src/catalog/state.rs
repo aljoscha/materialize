@@ -171,9 +171,6 @@ pub struct CatalogState {
 }
 
 /// Keeps track of what expressions are cached or not during startup.
-/// It's also used during catalog transactions to avoid re-optimizing CREATE VIEW / CREATE MAT VIEW
-/// statements when going back and forth between durable catalog operations and in-memory catalog
-/// operations.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) enum LocalExpressionCache {
     /// The cache is being used.
@@ -433,11 +430,11 @@ impl CatalogState {
                 }
             }
             CatalogItem::Sink(sink) => {
-                let from_item_id = self.get_entry_by_global_id(&sink.from).id();
+                let from_item_id = self.resolve_item_id(&sink.from);
                 self.introspection_dependencies_inner(from_item_id, out)
             }
             CatalogItem::Index(idx) => {
-                let on_item_id = self.get_entry_by_global_id(&idx.on).id();
+                let on_item_id = self.resolve_item_id(&idx.on);
                 self.introspection_dependencies_inner(on_item_id, out)
             }
             CatalogItem::Table(_)
@@ -737,6 +734,14 @@ impl CatalogState {
 
     pub fn get_entry(&self, id: &CatalogItemId) -> &CatalogEntry {
         self.entry_by_id
+            .get(id)
+            .unwrap_or_else(|| panic!("catalog out of sync, missing id {id:?}"))
+    }
+
+    /// Returns the [`CatalogItemId`] for a [`GlobalId`] without cloning the entry.
+    pub fn resolve_item_id(&self, id: &GlobalId) -> CatalogItemId {
+        *self
+            .entry_by_global_id
             .get(id)
             .unwrap_or_else(|| panic!("catalog out of sync, missing id {id:?}"))
     }
@@ -1303,7 +1308,7 @@ impl CatalogState {
                 let dependencies: BTreeSet<_> = raw_expr
                     .depends_on()
                     .into_iter()
-                    .map(|gid| self.get_entry_by_global_id(&gid).id())
+                    .map(|gid| self.resolve_item_id(&gid))
                     .collect();
 
                 let typ = infer_sql_type_for_catalog(&raw_expr, &optimized_expr);
@@ -1370,7 +1375,6 @@ impl CatalogState {
                     }
                 };
                 let mut typ = infer_sql_type_for_catalog(&raw_expr, &optimized_expr);
-
                 for &i in &materialized_view.non_null_assertions {
                     typ.column_types[i].nullable = false;
                 }
@@ -1383,7 +1387,7 @@ impl CatalogState {
                 let dependencies = raw_expr
                     .depends_on()
                     .into_iter()
-                    .map(|gid| self.get_entry_by_global_id(&gid).id())
+                    .map(|gid| self.resolve_item_id(&gid))
                     .collect();
 
                 CatalogItem::MaterializedView(MaterializedView {
@@ -2228,7 +2232,22 @@ impl CatalogState {
     /// For an [`ObjectId`] gets the corresponding [`CommentObjectId`].
     pub(super) fn get_comment_id(&self, object_id: ObjectId) -> CommentObjectId {
         match object_id {
-            ObjectId::Item(item_id) => self.get_entry(&item_id).comment_object_id(),
+            ObjectId::Item(item_id) => {
+                let entry = self.get_entry(&item_id);
+                match entry.item_type() {
+                    CatalogItemType::Table => CommentObjectId::Table(item_id),
+                    CatalogItemType::Source => CommentObjectId::Source(item_id),
+                    CatalogItemType::Sink => CommentObjectId::Sink(item_id),
+                    CatalogItemType::View => CommentObjectId::View(item_id),
+                    CatalogItemType::MaterializedView => CommentObjectId::MaterializedView(item_id),
+                    CatalogItemType::Index => CommentObjectId::Index(item_id),
+                    CatalogItemType::Func => CommentObjectId::Func(item_id),
+                    CatalogItemType::Connection => CommentObjectId::Connection(item_id),
+                    CatalogItemType::Type => CommentObjectId::Type(item_id),
+                    CatalogItemType::Secret => CommentObjectId::Secret(item_id),
+                    CatalogItemType::ContinualTask => CommentObjectId::ContinualTask(item_id),
+                }
+            }
             ObjectId::Role(role_id) => CommentObjectId::Role(role_id),
             ObjectId::Database(database_id) => CommentObjectId::Database(database_id),
             ObjectId::Schema((database, schema)) => CommentObjectId::Schema((database, schema)),

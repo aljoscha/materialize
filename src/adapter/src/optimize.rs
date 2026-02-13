@@ -66,7 +66,6 @@ use mz_adapter_types::connection::ConnectionId;
 use mz_adapter_types::dyncfgs::PERSIST_FAST_PATH_ORDER;
 use mz_catalog::memory::objects::{CatalogCollectionEntry, CatalogEntry, Index};
 use mz_compute_types::dataflows::DataflowDescription;
-use mz_compute_types::dyncfgs::SUBSCRIBE_SNAPSHOT_OPTIMIZATION;
 use mz_compute_types::plan::Plan;
 use mz_controller_types::ClusterId;
 use mz_expr::{EvalError, MirRelationExpr, OptimizedMirRelationExpr, UnmaterializableFunc};
@@ -164,8 +163,6 @@ pub struct OptimizerConfig {
     // If set, allow some additional queries down the Persist fast path when we believe
     // the orderings are compatible.
     persist_fast_path_order: bool,
-    // Enable calculating with_snapshot metadata for subscribes.
-    subscribe_snapshot_optimization: bool,
     /// Optimizer feature flags.
     pub features: OptimizerFeatures,
 }
@@ -185,7 +182,6 @@ impl From<&SystemVars> for OptimizerConfig {
             replan: None,
             no_fast_path: false,
             persist_fast_path_order: PERSIST_FAST_PATH_ORDER.get(vars.dyncfgs()),
-            subscribe_snapshot_optimization: SUBSCRIBE_SNAPSHOT_OPTIMIZATION.get(vars.dyncfgs()),
             features: OptimizerFeatures::from(vars),
         }
     }
@@ -336,9 +332,36 @@ impl MaybeShouldPanic for OptimizerError {
 
 #[mz_ore::instrument(target = "optimizer", level = "debug", name = "local")]
 fn optimize_mir_local(
-    expr: MirRelationExpr,
+    mut expr: MirRelationExpr,
     ctx: &mut TransformCtx,
 ) -> Result<OptimizedMirRelationExpr, OptimizerError> {
+    // Fast path: apply the same pre-optimizer checks that Optimizer::transform()
+    // does, but BEFORE constructing the logical optimizer. This avoids allocating
+    // ~20 Box<dyn Transform> objects (and immediately dropping them) for expressions
+    // that are already in their simplest form after lowering.
+    //
+    // For SELECT 1: try_fold_trivial_constant folds Let{Constant, Map{Get, [Lit]}}
+    // down to a bare Constant.
+    // For SELECT * FROM t: try_strip_outer_join strips the identity Let/Join from
+    // lowering, leaving a bare Get(GlobalId).
+    if mz_transform::Optimizer::try_fold_trivial_constant(&mut expr) {
+        let optimized = OptimizedMirRelationExpr(expr);
+        mz_repr::explain::trace_plan(optimized.as_inner());
+        return Ok(optimized);
+    }
+    mz_transform::Optimizer::try_strip_outer_join(&mut expr);
+    if matches!(
+        &expr,
+        MirRelationExpr::Get {
+            id: mz_expr::Id::Global(_),
+            ..
+        }
+    ) {
+        let optimized = OptimizedMirRelationExpr(expr);
+        mz_repr::explain::trace_plan(optimized.as_inner());
+        return Ok(optimized);
+    }
+
     #[allow(deprecated)]
     let optimizer = mz_transform::Optimizer::logical_optimizer(ctx);
     let expr = optimizer.optimize(expr, ctx)?;

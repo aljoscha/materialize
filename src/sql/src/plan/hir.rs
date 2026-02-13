@@ -1595,15 +1595,6 @@ impl AggregateFunc {
 }
 
 impl HirRelationExpr {
-    /// Gets the SQL type of a self-contained, top-level expression.
-    pub fn top_level_typ(&self) -> SqlRelationType {
-        self.typ(&[], &BTreeMap::new())
-    }
-
-    /// Gets the SQL type of the expression.
-    ///
-    /// `outers` gives types for outer relations.
-    /// `params` gives types for parameters.
     pub fn typ(
         &self,
         outers: &[SqlRelationType],
@@ -2426,12 +2417,8 @@ impl HirRelationExpr {
 }
 
 impl CollectionPlan for HirRelationExpr {
-    /// Collects the global collections that this HIR expression directly depends on, i.e., that it
-    /// has a `Get` for. (It does _not_ traverse view definitions transitively.)
-    /// (It does explore inside subqueries.)
-    ///
-    /// !!!WARNING!!!: this method has an MirRelationExpr counterpart. The two
-    /// should be kept in sync w.r.t. HIR ⇒ MIR lowering!
+    // !!!WARNING!!!: this method has an MirRelationExpr counterpart. The two
+    // should be kept in sync w.r.t. HIR ⇒ MIR lowering!
     fn depends_on_into(&self, out: &mut BTreeSet<GlobalId>) {
         if let Self::Get {
             id: Id::Global(id), ..
@@ -3737,6 +3724,18 @@ impl HirScalarExpr {
     ///
     /// Panics if this expression does not have type [`SqlScalarType::Int64`].
     pub fn try_into_literal_int64(self) -> Result<i64, PlanError> {
+        // Fast path: if the expression is already a literal, extract the value directly
+        // without going through is_constant/clone/lower_uncorrelated/reduce.
+        if let Some(datum) = self.as_literal() {
+            return if datum.is_null() {
+                Err(PlanError::ConstantExpressionSimplificationFailed(format!(
+                    "Expected an expression that evaluates to a non-null value, got {}",
+                    self
+                )))
+            } else {
+                Ok(datum.unwrap_int64())
+            };
+        }
         // TODO: add the `is_constant` check also to all the other into_literal_... (by adding it to
         // `simplify_to_literal`), but those should be just soft_asserts at first that it doesn't
         // actually happen that it's weaker than `reduce`, and then add them for real after 1 week.

@@ -85,6 +85,18 @@ impl crate::Transform for NormalizeLets {
 }
 
 impl NormalizeLets {
+    /// Returns `true` if the expression contains any `Let` or `LetRec` nodes.
+    fn has_let_bindings(expr: &MirRelationExpr) -> bool {
+        let mut worklist = vec![expr];
+        while let Some(expr) = worklist.pop() {
+            match expr {
+                MirRelationExpr::Let { .. } | MirRelationExpr::LetRec { .. } => return true,
+                _ => worklist.extend(expr.children()),
+            }
+        }
+        false
+    }
+
     /// Normalize `Let` and `LetRec` bindings in `relation`.
     ///
     /// Mechanically, `action` first renumbers all bindings, erroring if any shadowing is encountered.
@@ -100,6 +112,14 @@ impl NormalizeLets {
         relation: &mut MirRelationExpr,
         features: &OptimizerFeatures,
     ) -> Result<(), crate::TransformError> {
+        // Fast path: if the expression has no Let or LetRec nodes, all
+        // normalize_lets operations are no-ops. This avoids multiple expensive
+        // tree traversals (renumbering, let promotion, inlining, type refresh)
+        // for expressions that have no bindings.
+        if !Self::has_let_bindings(relation) {
+            return Ok(());
+        }
+
         // Record whether the relation was initially recursive, to confirm that we do not introduce
         // recursion to a non-recursive expression.
         let was_recursive = relation.is_recursive();

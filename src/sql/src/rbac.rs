@@ -207,7 +207,15 @@ impl RbacRequirements {
         let role_membership =
             catalog.collect_role_membership(&session.role_metadata().current_role);
 
-        check_usage(catalog, session, resolved_ids, self.item_usage)?;
+        // Pass the pre-computed role membership to avoid a redundant
+        // collect_role_membership call inside check_usage.
+        check_usage_inner(
+            catalog,
+            session,
+            resolved_ids,
+            self.item_usage,
+            &role_membership,
+        )?;
 
         // Validate that the current session has the required role membership to execute the provided
         // plan.
@@ -238,7 +246,7 @@ impl RbacRequirements {
         check_object_privileges(
             catalog,
             self.privileges,
-            role_membership,
+            &role_membership,
             session.role_metadata().current_role,
         )?;
 
@@ -301,9 +309,19 @@ pub fn check_usage(
 ) -> Result<(), UnauthorizedError> {
     rbac_check_preamble(catalog, session)?;
 
-    // Obtain all roles that the current session is a member of.
     let role_membership = catalog.collect_role_membership(&session.role_metadata().current_role);
+    check_usage_inner(catalog, session, resolved_ids, item_types, &role_membership)
+}
 
+/// Inner implementation of `check_usage` that accepts a pre-computed role membership set,
+/// avoiding redundant `collect_role_membership` calls when the caller already has it.
+fn check_usage_inner(
+    catalog: &impl SessionCatalog,
+    session: &dyn SessionMetadata,
+    resolved_ids: &ResolvedIds,
+    item_types: &BTreeSet<CatalogItemType>,
+    role_membership: &BTreeSet<RoleId>,
+) -> Result<(), UnauthorizedError> {
     // Certain statements depend on objects that haven't been created yet, like sub-sources, so we
     // need to filter those out.
     let existing_resolved_ids =
@@ -1743,11 +1761,11 @@ fn generate_cluster_usage_privileges(
 fn check_object_privileges(
     catalog: &impl SessionCatalog,
     privileges: Vec<(SystemObjectId, AclMode, RoleId)>,
-    role_membership: BTreeSet<RoleId>,
+    role_membership: &BTreeSet<RoleId>,
     current_role_id: RoleId,
 ) -> Result<(), UnauthorizedError> {
     let mut role_memberships: BTreeMap<RoleId, BTreeSet<RoleId>> = BTreeMap::new();
-    role_memberships.insert(current_role_id, role_membership);
+    role_memberships.insert(current_role_id, role_membership.clone());
     for (object_id, acl_mode, role_id) in privileges {
         // Temporary schemas are owned by the connection that created them,
         // so users implicitly have all privileges on their own temp schema.

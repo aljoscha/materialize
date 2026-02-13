@@ -821,6 +821,22 @@ impl mz_sql::catalog::CatalogItem for CatalogCollectionEntry {
         })
     }
 
+    fn desc_and_global_id_at_version(
+        &self,
+        version: RelationVersionSelector,
+    ) -> Option<(RelationDesc, GlobalId)> {
+        let desc = self.entry.item.relation_desc(version)?;
+        let global_id = self.entry.item.global_id_for_version(version)?;
+        Some((desc.into_owned(), global_id))
+    }
+
+    fn global_id_at_version(&self, version: RelationVersionSelector) -> GlobalId {
+        self.entry
+            .item
+            .global_id_for_version(version)
+            .expect("item must have a GlobalId")
+    }
+
     fn latest_version(&self) -> Option<RelationVersion> {
         self.entry.latest_version()
     }
@@ -2156,6 +2172,7 @@ impl CatalogItem {
             }
         }
     }
+
     /// Updates the retain history for an item. Returns the previous retain history value. Returns
     /// an error if this item does not support retain history.
     pub fn update_retain_history(
@@ -3603,6 +3620,21 @@ impl mz_sql::catalog::CatalogItem for CatalogEntry {
             entry: self.clone(),
             version,
         })
+    }
+
+    fn desc_and_global_id_at_version(
+        &self,
+        version: RelationVersionSelector,
+    ) -> Option<(RelationDesc, GlobalId)> {
+        let desc = self.item.relation_desc(version)?;
+        let global_id = self.item.global_id_for_version(version)?;
+        Some((desc.into_owned(), global_id))
+    }
+
+    fn global_id_at_version(&self, version: RelationVersionSelector) -> GlobalId {
+        self.item
+            .global_id_for_version(version)
+            .expect("item must have a GlobalId")
     }
 
     fn latest_version(&self) -> Option<RelationVersion> {

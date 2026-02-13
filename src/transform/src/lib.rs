@@ -29,15 +29,15 @@ use std::{fmt, iter};
 
 use mz_expr::{MirRelationExpr, MirScalarExpr};
 use mz_ore::id_gen::IdGen;
-use mz_ore::soft_panic_or_log;
 use mz_ore::stack::RecursionLimitError;
+use mz_ore::{soft_assert_or_log, soft_panic_or_log};
 use mz_repr::GlobalId;
 use mz_repr::optimize::OptimizerFeatures;
+use mz_repr::{Row, RowArena};
 use mz_sql::optimizer_metrics::OptimizerMetrics;
 use tracing::error;
 
 use crate::canonicalize_mfp::CanonicalizeMfp;
-use crate::collect_notices::CollectNotices;
 use crate::column_knowledge::ColumnKnowledge;
 use crate::dataflow::DataflowMetainfo;
 use crate::demand::Demand;
@@ -66,7 +66,6 @@ pub use dataflow::optimize_dataflow;
 pub mod analysis;
 pub mod canonicalization;
 pub mod canonicalize_mfp;
-pub mod collect_notices;
 pub mod column_knowledge;
 pub mod compound;
 pub mod cse;
@@ -219,25 +218,33 @@ pub trait Transform: fmt::Debug {
         relation: &mut MirRelationExpr,
         args: &mut TransformCtx,
     ) -> Result<(), TransformError> {
-        let hash_before = args
-            .global_id
-            .and_then(|id| args.last_hash.get(&id).copied())
-            .unwrap_or_else(|| relation.hash_to_u64());
+        if args.metrics.is_some() {
+            let hash_before = args
+                .global_id
+                .and_then(|id| args.last_hash.get(&id).copied())
+                .unwrap_or_else(|| relation.hash_to_u64());
 
-        mz_ore::soft_assert_eq_no_log!(hash_before, relation.hash_to_u64(), "cached hash clash");
-        // actually run the transform, recording the time taken
-        let start = std::time::Instant::now();
-        let res = self.actually_perform_transform(relation, args);
-        let duration = start.elapsed();
+            mz_ore::soft_assert_eq_no_log!(
+                hash_before,
+                relation.hash_to_u64(),
+                "cached hash clash"
+            );
+            // actually run the transform, recording the time taken
+            let start = std::time::Instant::now();
+            let res = self.actually_perform_transform(relation, args);
+            let duration = start.elapsed();
 
-        let hash_after = args.update_last_hash(relation);
-        if let Some(metrics) = &mut args.metrics {
-            let transform_name = self.name();
-            metrics.observe_transform_time(transform_name, duration);
-            metrics.inc_transform(hash_before != hash_after, transform_name);
+            let hash_after = args.update_last_hash(relation);
+            if let Some(metrics) = &mut args.metrics {
+                let transform_name = self.name();
+                metrics.observe_transform_time(transform_name, duration);
+                metrics.inc_transform(hash_before != hash_after, transform_name);
+            }
+
+            res
+        } else {
+            self.actually_perform_transform(relation, args)
         }
-
-        res
     }
 
     /// Transform a relation into a functionally equivalent relation.
@@ -445,6 +452,16 @@ impl Transform for Fixpoint {
         relation: &mut MirRelationExpr,
         ctx: &mut TransformCtx,
     ) -> Result<(), TransformError> {
+        // Fast path: a bare Constant node cannot be structurally simplified
+        // by any transform in the fixpoint loop. Transforms like FoldConstants
+        // (consolidation, nullability) are idempotent on canonical constants,
+        // and no transform introduces new structure from a bare Constant.
+        // This avoids cloning, hashing, and running all transforms for trivial
+        // expressions like SELECT 1.
+        if matches!(relation, MirRelationExpr::Constant { .. }) {
+            return Ok(());
+        }
+
         // The number of iterations for a relation to settle depends on the
         // number of nodes in the relation. Instead of picking an arbitrary
         // hard limit on the number of iterations, we use a soft limit and
@@ -499,7 +516,9 @@ impl Transform for Fixpoint {
                             );
                             return Ok(());
                         }
-                        ctx.update_last_hash(&again);
+                        if ctx.metrics.is_some() {
+                            ctx.update_last_hash(&again);
+                        }
                         self.apply_transforms(
                             &mut again,
                             ctx,
@@ -735,9 +754,7 @@ impl Optimizer {
     #[deprecated = "Create an Optimize instance and call `optimize` instead."]
     pub fn logical_optimizer(ctx: &mut TransformCtx) -> Self {
         let transforms: Vec<Box<dyn Transform>> = transforms![
-            // 0. `Transform`s that don't actually change the plan.
             Box::new(ReprTypecheck::new(ctx.repr_typecheck()).strict_join_equivalences()),
-            Box::new(CollectNotices),
             // 1. Structure-agnostic cleanup
             Box::new(normalize()),
             Box::new(NonNullRequirements::default()),
@@ -990,6 +1007,15 @@ impl Optimizer {
     ) -> Result<mz_expr::OptimizedMirRelationExpr, TransformError> {
         let transform_result = self.transform(&mut relation, ctx);
 
+        // Make sure we are not swallowing any notice.
+        // TODO: we should actually wire up notices that come from here. This is not urgent, because
+        // currently notices can only come from the physical MIR optimizer (specifically,
+        // `LiteralConstraints`), and callers of this method are running the logical MIR optimizer.
+        soft_assert_or_log!(
+            ctx.df_meta.optimizer_notices.is_empty(),
+            "logical MIR optimization unexpectedly produced notices"
+        );
+
         match transform_result {
             Ok(_) => {
                 mz_repr::explain::trace_plan(&relation);
@@ -1015,12 +1041,220 @@ impl Optimizer {
         relation: &mut MirRelationExpr,
         args: &mut TransformCtx,
     ) -> Result<(), TransformError> {
-        args.update_last_hash(relation);
+        // Fast path: if the expression is trivially constant (a tree of only
+        // Constant nodes, Map nodes with literal-only scalars, and Project
+        // nodes), eagerly fold it to a bare Constant and skip the entire
+        // optimizer pipeline. This avoids all per-transform overhead (tree
+        // traversals, recursion guards, analysis construction, tracing spans)
+        // for simple queries like SELECT 1 whose MIR is `Map{Constant, [Lit]}`.
+        if Self::try_fold_trivial_constant(relation) {
+            return Ok(());
+        }
+
+        // Fast path: strip the identity outer join produced by lowering for
+        // uncorrelated queries. The lowering wraps every query in
+        // `Let { Constant(0-col, 1-row), body }` where body references the
+        // constant via Get(LocalId). For simple queries like SELECT * FROM t,
+        // this produces `Let { Constant(0-col), Join { Get(Local), Get(Global) } }`.
+        // We inline the Let and eliminate the cross-join with the 0-col constant,
+        // reducing the expression to a bare `Get(GlobalId)`.
+        Self::try_strip_outer_join(relation);
+
+        // Fast path: a bare Get(GlobalId) is already in its simplest form.
+        // No transform in the optimizer pipeline can structurally modify it —
+        // there are no Lets to normalize, no constants to fold, no filters to
+        // push down, no joins to simplify. Skip the entire pipeline.
+        if matches!(
+            relation,
+            MirRelationExpr::Get {
+                id: mz_expr::Id::Global(_),
+                ..
+            }
+        ) {
+            return Ok(());
+        }
+
+        if args.metrics.is_some() {
+            args.update_last_hash(relation);
+        }
 
         for transform in self.transforms.iter() {
             transform.transform(relation, args)?;
         }
 
         Ok(())
+    }
+
+    /// Attempts to eagerly fold a trivially-constant expression into a bare
+    /// `MirRelationExpr::Constant`. Returns `true` if the expression was
+    /// folded (and the full optimizer pipeline can be skipped), `false` otherwise.
+    ///
+    /// This handles expressions that are "trivially constant" — small expression
+    /// trees built entirely from `Constant`, `Map` with evaluable scalars, and
+    /// `Project` nodes. These arise from simple queries like `SELECT 1` whose
+    /// MIR after lowering is `Map { Constant, [Literal(1)] }` rather than a
+    /// bare `Constant`.
+    pub fn try_fold_trivial_constant(relation: &mut MirRelationExpr) -> bool {
+        match relation {
+            MirRelationExpr::Constant { .. } => true,
+            MirRelationExpr::Let { id, value, body } => {
+                // Only handle Let bindings where the value is a Constant.
+                // Inline the binding by substituting Get(id) → Constant in the body,
+                // then try to fold the body.
+                if !matches!(value.as_ref(), MirRelationExpr::Constant { .. }) {
+                    return false;
+                }
+                let bound_value = value.take_dangerous();
+                let bound_id = *id;
+                // Replace the Let with its body (moving the body out).
+                let mut body_expr = body.take_dangerous();
+                // Substitute all Get(bound_id) references with the constant value.
+                Self::substitute_local_get(&mut body_expr, bound_id, &bound_value);
+                *relation = body_expr;
+                // Now try to fold the resulting expression.
+                if Self::try_fold_trivial_constant(relation) {
+                    return true;
+                }
+                // If folding failed, we've already modified the expression in-place.
+                // This is fine — the semantics are preserved (Let inlining is always valid).
+                false
+            }
+            MirRelationExpr::Map { input, scalars } => {
+                // First, recursively fold the input.
+                if !Self::try_fold_trivial_constant(input) {
+                    return false;
+                }
+                // Don't evaluate unmaterializable functions.
+                if scalars.iter().any(|s| s.contains_unmaterializable()) {
+                    return false;
+                }
+                // The input is now a Constant — evaluate the map scalars.
+                if let Some((Ok(rows), _typ)) = input.as_const() {
+                    let temp_storage = RowArena::new();
+                    let new_rows: Result<Vec<_>, _> = rows
+                        .iter()
+                        .map(|(input_row, diff)| {
+                            let mut unpacked = input_row.unpack();
+                            for scalar in scalars.iter() {
+                                match scalar.eval(&unpacked, &temp_storage) {
+                                    Ok(datum) => unpacked.push(datum),
+                                    Err(_) => return Err(()),
+                                }
+                            }
+                            Ok((Row::pack_slice(&unpacked), *diff))
+                        })
+                        .collect();
+                    if let Ok(new_rows) = new_rows {
+                        let typ = relation.typ();
+                        *relation = MirRelationExpr::Constant {
+                            rows: Ok(new_rows),
+                            typ,
+                        };
+                        return true;
+                    }
+                }
+                false
+            }
+            MirRelationExpr::Project { input, outputs } => {
+                // First, recursively fold the input.
+                if !Self::try_fold_trivial_constant(input) {
+                    return false;
+                }
+                // The input is now a Constant — apply the projection.
+                if let Some((Ok(rows), _typ)) = input.as_const() {
+                    let mut row_buf = Row::default();
+                    let new_rows: Vec<_> = rows
+                        .iter()
+                        .map(|(input_row, diff)| {
+                            let datums = input_row.unpack();
+                            row_buf.packer().extend(outputs.iter().map(|i| datums[*i]));
+                            (row_buf.clone(), *diff)
+                        })
+                        .collect();
+                    let typ = relation.typ();
+                    *relation = MirRelationExpr::Constant {
+                        rows: Ok(new_rows),
+                        typ,
+                    };
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Attempts to strip the identity outer join produced by HIR-to-MIR lowering.
+    ///
+    /// The lowering wraps every uncorrelated query in:
+    /// ```text
+    /// Let { id, value: Constant(0-col, 1-row), body }
+    /// ```
+    /// where `body` contains `Get(Local(id))` cross-joined with the actual query
+    /// expression. For simple queries like `SELECT * FROM t`, this produces:
+    /// ```text
+    /// Let { Constant(0-col, 1-row), Join { Get(Local), Get(Global(table)) } }
+    /// ```
+    ///
+    /// This method performs two simplification steps:
+    /// 1. Inline a `Let` binding whose value is a 0-column, 1-row constant
+    ///    (the identity element for cross-join).
+    /// 2. Eliminate a `Join` where one input is a 0-column, 1-row constant
+    ///    (cross-join with identity is a no-op).
+    ///
+    /// This is semantics-preserving: cross-joining with a single empty row
+    /// produces the same result as the original relation.
+    pub fn try_strip_outer_join(relation: &mut MirRelationExpr) {
+        // Step 1: Inline Let with 0-col, 1-row constant value.
+        if let MirRelationExpr::Let { id, value, body } = relation {
+            if value.is_constant_singleton() {
+                let const_val = value.take_dangerous();
+                let bound_id = *id;
+                let mut body_expr = body.take_dangerous();
+                Self::substitute_local_get(&mut body_expr, bound_id, &const_val);
+                *relation = body_expr;
+            }
+        }
+
+        // Step 2: Eliminate cross-join with 0-col, 1-row constant.
+        if let MirRelationExpr::Join {
+            inputs,
+            equivalences,
+            ..
+        } = relation
+        {
+            if inputs.len() == 2 && equivalences.is_empty() {
+                if inputs[0].is_constant_singleton() {
+                    *relation = inputs.swap_remove(1);
+                } else if inputs[1].is_constant_singleton() {
+                    *relation = inputs.swap_remove(0);
+                }
+            }
+        }
+    }
+
+    /// Substitutes all `Get { id: Local(local_id) }` nodes with a clone of
+    /// the given replacement expression. Used by `try_fold_trivial_constant`
+    /// to inline Let bindings.
+    fn substitute_local_get(
+        expr: &mut MirRelationExpr,
+        local_id: mz_expr::LocalId,
+        replacement: &MirRelationExpr,
+    ) {
+        // Use a worklist to avoid recursion.
+        let mut worklist = vec![expr];
+        while let Some(e) = worklist.pop() {
+            if let MirRelationExpr::Get {
+                id: mz_expr::Id::Local(id),
+                ..
+            } = e
+            {
+                if *id == local_id {
+                    *e = replacement.clone();
+                    continue;
+                }
+            }
+            worklist.extend(e.children_mut());
+        }
     }
 }

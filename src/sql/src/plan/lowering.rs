@@ -199,6 +199,16 @@ impl HirRelationExpr {
                     typ,
                 }
             }
+            // A bare Get(GlobalId) lowers directly to MirRelationExpr::Get,
+            // skipping the identity cross-join wrapper that applied_to() creates.
+            HirRelationExpr::Get {
+                id: id @ mz_expr::Id::Global(_),
+                typ,
+            } => MirRelationExpr::Get {
+                id,
+                typ,
+                access_strategy: mz_expr::AccessStrategy::UnknownOrLocal,
+            },
             mut other => {
                 let mut id_gen = mz_ore::id_gen::IdGen::default();
                 transform_hir::split_subquery_predicates(&mut other)?;

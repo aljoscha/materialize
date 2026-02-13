@@ -1534,12 +1534,11 @@ impl<'a> NameResolver<'a> {
 
         match r {
             Ok(item) => {
-                // Record the item at its current version.
-                let item = item.at_version(RelationVersionSelector::Latest);
-                self.ids
-                    .entry(item.id())
-                    .or_default()
-                    .insert(item.global_id());
+                // Record the item at its current version. Use direct trait
+                // methods instead of at_version() to avoid cloning the entire
+                // CatalogEntry into a Box<dyn CatalogCollectionItem>.
+                let global_id = item.global_id_at_version(RelationVersionSelector::Latest);
+                self.ids.entry(item.id()).or_default().insert(global_id);
                 let print_id = !matches!(
                     item.item_type(),
                     CatalogItemType::Func | CatalogItemType::Type
@@ -1647,11 +1646,10 @@ impl<'a> NameResolver<'a> {
                 }
             }
         };
-        let item = item.at_version(version);
-        self.ids
-            .entry(item.id())
-            .or_default()
-            .insert(item.global_id());
+        // Use global_id_at_version directly to avoid cloning the entire
+        // CatalogEntry via at_version().
+        let global_id = item.global_id_at_version(version);
+        self.ids.entry(item.id()).or_default().insert(global_id);
 
         let full_name = match normalize::full_name(raw_name) {
             Ok(full_name) => full_name,
@@ -2468,7 +2466,7 @@ impl<'a, 'ast> Visit<'ast, Aug> for DependencyVisitor<'a> {
         if let ResolvedItemName::Item { id, version, .. } = item_name {
             let global_ids = self.ids.entry(*id).or_default();
             if let Some(item) = self.catalog.try_get_item(id) {
-                global_ids.insert(item.at_version(*version).global_id());
+                global_ids.insert(item.global_id_at_version(*version));
             }
         }
     }

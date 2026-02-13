@@ -5665,13 +5665,6 @@ fn plan_is_expr<'a>(
             .type_as(ecx, &SqlScalarType::Bool)?
             .call_unary(UnaryFunc::IsFalse(expr_func::IsFalse)),
         IsExprConstruct::DistinctFrom(expr2) => {
-            // There are three cases:
-            // 1. Both terms are non-null, in which case the result should be `a != b`.
-            // 2. Exactly one term is null, in which case the result should be true.
-            // 3. Both terms are null, in which case the result should be false.
-            //
-            // (a != b OR a IS NULL OR b IS NULL) AND (a IS NOT NULL OR b IS NOT NULL)
-
             // We'll need `expr != expr2`, but don't just construct this HIR directly. Instead,
             // construct an AST expression for `expr != expr2` and plan it to get proper type
             // checking, implicit casts, etc. (This seems to be also what Postgres does.)
@@ -5680,7 +5673,12 @@ fn plan_is_expr<'a>(
 
             let expr1_hir = expr_hir.type_as_any(ecx)?;
             let expr2_hir = plan_expr(ecx, expr2)?.type_as_any(ecx)?;
-
+            // There are three cases:
+            // 1. Both terms are non-null, in which case the result should be `a != b`.
+            // 2. Exactly one term is null, in which case the result should be true.
+            // 3. Both terms are null, in which case the result should be false.
+            //
+            // (a != b OR a IS NULL OR b IS NULL) AND (a IS NOT NULL OR b IS NOT NULL)
             let term1 = HirScalarExpr::variadic_or(vec![
                 ne_hir,
                 expr1_hir.clone().call_is_null(),
@@ -6593,18 +6591,18 @@ impl<'a> QueryContext<'a> {
                 version,
                 ..
             } => {
-                let item = self.scx.get_item(&id).at_version(version);
-                let desc = match item.relation_desc() {
-                    Some(desc) => desc.clone(),
+                let catalog_item = self.scx.get_item(&id);
+                let (desc, global_id) = match catalog_item.desc_and_global_id_at_version(version) {
+                    Some(result) => result,
                     None => {
                         return Err(PlanError::InvalidDependency {
                             name: full_name.to_string(),
-                            item_type: item.item_type().to_string(),
+                            item_type: catalog_item.item_type().to_string(),
                         });
                     }
                 };
                 let expr = HirRelationExpr::Get {
-                    id: Id::Global(item.global_id()),
+                    id: Id::Global(global_id),
                     typ: desc.typ().clone(),
                 };
 

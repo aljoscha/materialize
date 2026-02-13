@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 use mz_compute_types::ComputeInstanceId;
 use mz_compute_types::dataflows::IndexDesc;
 use mz_compute_types::plan::Plan;
-use mz_expr::{MirRelationExpr, MirScalarExpr, OptimizedMirRelationExpr, RowSetFinishing};
+use mz_expr::{
+    Id, MapFilterProject, MirRelationExpr, MirScalarExpr, OptimizedMirRelationExpr,
+    RowSetFinishing, is_identity_arrangement, permutation_for_arrangement,
+};
 use mz_ore::soft_assert_or_log;
 use mz_repr::explain::trace_plan;
 use mz_repr::{GlobalId, SqlRelationType, Timestamp};
@@ -34,8 +37,7 @@ use tracing::debug_span;
 
 use crate::TimestampContext;
 use crate::catalog::Catalog;
-use crate::coord::infer_sql_type_for_catalog;
-use crate::coord::peek::{PeekDataflowPlan, PeekPlan, create_fast_path_plan};
+use crate::coord::peek::{FastPathPlan, PeekDataflowPlan, PeekPlan, create_fast_path_plan};
 use crate::optimize::dataflows::{
     ComputeInstanceSnapshot, DataflowBuilder, EvalTime, ExprPrep, ExprPrepOneShot,
 };
@@ -139,7 +141,6 @@ pub struct Unresolved;
 #[derive(Clone)]
 pub struct LocalMirPlan<T = Unresolved> {
     expr: MirRelationExpr,
-    typ: SqlRelationType,
     df_meta: DataflowMetainfo,
     context: T,
 }
@@ -177,7 +178,7 @@ impl Optimize<HirRelationExpr> for Optimizer {
         trace_plan!(at: "raw", &expr);
 
         // HIR ⇒ MIR lowering and decorrelation
-        let mir_expr = expr.clone().lower(&self.config, Some(&self.metrics))?;
+        let expr = expr.lower(&self.config, Some(&self.metrics))?;
 
         // MIR ⇒ MIR optimization (local)
         let mut df_meta = DataflowMetainfo::default();
@@ -185,18 +186,16 @@ impl Optimize<HirRelationExpr> for Optimizer {
             &self.config.features,
             &self.repr_typecheck_ctx,
             &mut df_meta,
-            Some(&mut self.metrics),
+            None,
             Some(self.select_id),
         );
-        let mir_expr = optimize_mir_local(mir_expr, &mut transform_ctx)?.into_inner();
-        let typ = infer_sql_type_for_catalog(&expr, &mir_expr);
+        let expr = optimize_mir_local(expr, &mut transform_ctx)?.into_inner();
 
         self.duration += time.elapsed();
 
         // Return the (sealed) plan at the end of this optimization step.
         Ok(LocalMirPlan {
-            expr: mir_expr,
-            typ,
+            expr,
             df_meta,
             context: Unresolved,
         })
@@ -214,7 +213,6 @@ impl LocalMirPlan<Unresolved> {
     ) -> LocalMirPlan<Resolved<'_>> {
         LocalMirPlan {
             expr: self.expr,
-            typ: self.typ,
             df_meta: self.df_meta,
             context: Resolved {
                 timestamp_ctx,
@@ -233,7 +231,6 @@ impl<'s> Optimize<LocalMirPlan<Resolved<'s>>> for Optimizer {
 
         let LocalMirPlan {
             expr,
-            typ,
             mut df_meta,
             context:
                 Resolved {
@@ -245,9 +242,64 @@ impl<'s> Optimize<LocalMirPlan<Resolved<'s>>> for Optimizer {
 
         let expr = OptimizedMirRelationExpr(expr);
 
+        // Fast path: for a bare Get(GlobalId), skip ALL dataflow setup and look up the
+        // index directly from the catalog. This avoids import_view_into_dataflow,
+        // create_fast_path_plan, DataflowBuilder construction, format! allocation,
+        // ExprPrepOneShot visits, export_index, and TransformCtx construction.
+        if !self.config.no_fast_path {
+            if let MirRelationExpr::Get {
+                id: Id::Global(get_id),
+                typ: get_typ,
+                ..
+            } = expr.as_inner()
+            {
+                let instance_id = self.compute_instance.instance_id();
+                // Find the first index on this collection that's available on the compute instance.
+                let maybe_index = self
+                    .catalog
+                    .state()
+                    .get_indexes_on(*get_id, instance_id)
+                    .find(|(idx_id, _idx)| self.compute_instance.contains_collection(idx_id));
+
+                if let Some((index_id, index)) = maybe_index {
+                    let arity = get_typ.column_types.len();
+                    let mfp = MapFilterProject::new(arity);
+                    let mut safe_mfp = mfp
+                        .into_plan()
+                        .map_err(OptimizerError::InternalUnsafeMfpPlan)?
+                        .into_nontemporal()
+                        .map_err(|e| OptimizerError::InternalUnsafeMfpPlan(format!("{:?}", e)))?;
+                    // Skip permutation when the index keys form an identity
+                    // arrangement (keys = [Column(0), Column(1), ...,
+                    // Column(arity-1)]). This avoids building a BTreeMap and
+                    // reconstructing the MFP for the common case of a default
+                    // table index.
+                    if !is_identity_arrangement(&index.keys, arity) {
+                        let (permute, thinning) = permutation_for_arrangement(&index.keys, arity);
+                        safe_mfp.permute_fn(|c| permute[c], index.keys.len() + thinning.len());
+                    }
+
+                    let plan = FastPathPlan::PeekExisting(*get_id, index_id, None, safe_mfp);
+
+                    let typ = get_typ.clone();
+
+                    self.duration += time.elapsed();
+                    self.metrics
+                        .observe_e2e_optimization_time("peek:fast_path", self.duration);
+
+                    return Ok(GlobalLirPlan {
+                        peek_plan: PeekPlan::FastPath(plan),
+                        df_meta,
+                        typ,
+                    });
+                }
+            }
+        }
+
         // We create a dataflow and optimize it, to determine if we can avoid building it.
         // This can happen if the result optimizes to a constant, or to a `Get` expression
         // around a maintained arrangement.
+        let typ = expr.typ();
         let key = typ
             .default_key()
             .iter()
@@ -343,30 +395,80 @@ impl<'s> Optimize<LocalMirPlan<Resolved<'s>>> for Optimizer {
             &self.config.features,
             &self.repr_typecheck_ctx,
             &mut df_meta,
-            Some(&mut self.metrics),
+            None,
         );
 
-        // Let's already try creating a fast path plan. If successful, we don't need to run the
-        // whole optimizer pipeline, but just a tiny subset of it. (But we'll need to run
-        // `create_fast_path_plan` later again, because, e.g., running `LiteralConstraints` is still
-        // ahead of us.)
-        let use_fast_path_optimizer = match create_fast_path_plan(
+        // Try creating a fast path plan. If the result is a bare Constant, we can skip the
+        // entire global optimizer pipeline (optimize_dataflow) since no transform can improve a
+        // Constant and there are no index imports to prune. For non-Constant fast paths
+        // (PeekExisting, PeekPersist), we still run a reduced optimizer pipeline, and we'll
+        // re-check create_fast_path_plan after optimization since LiteralConstraints may
+        // change the result.
+        let maybe_fast_path_plan = match create_fast_path_plan(
             &mut df_desc,
             self.select_id,
             Some(&self.finishing),
             self.config.features.persist_fast_path_limit,
             self.config.persist_fast_path_order,
         ) {
-            Ok(maybe_fast_path_plan) => maybe_fast_path_plan.is_some(),
+            Ok(plan) => plan,
             Err(OptimizerError::InternalUnsafeMfpPlan(_)) => {
                 // This is expected, in that `create_fast_path_plan` can choke on `mz_now`, which we
                 // haven't removed yet.
-                false
+                None
             }
             Err(e) => {
                 return Err(e);
             }
         };
+
+        // For bare Constants, optimize_dataflow is entirely a no-op: no transform can
+        // structurally improve a Constant, and there are no index imports to prune.
+        // Similarly, for a bare Get(GlobalId) that already has a fast path plan
+        // (PeekExisting or PeekPersist), optimize_dataflow cannot improve the
+        // expression — there are no filters to push, no joins to reorder, no
+        // projections to lift. Skip the global optimizer pipeline and return the
+        // fast path plan immediately.
+        let is_constant_fast_path =
+            matches!(&maybe_fast_path_plan, Some(FastPathPlan::Constant(..)));
+        let is_bare_get_fast_path = maybe_fast_path_plan.is_some()
+            && df_desc.objects_to_build.len() >= 1
+            && matches!(
+                &*df_desc.objects_to_build[0].plan.as_inner_mut(),
+                MirRelationExpr::Get {
+                    id: mz_expr::Id::Global(_),
+                    ..
+                }
+            );
+        if (is_constant_fast_path || is_bare_get_fast_path) && !self.config.no_fast_path {
+            let plan = maybe_fast_path_plan.unwrap();
+
+            if self.config.mode == OptimizeMode::Explain {
+                trace_plan!(at: "global", &df_meta.used_indexes(&df_desc));
+                debug_span!(target: "optimizer", "fast_path").in_scope(|| {
+                    let finishing = if !self.finishing.is_trivial(typ.arity()) {
+                        Some(&self.finishing)
+                    } else {
+                        None
+                    };
+                    trace_plan(&plan.used_indexes(finishing));
+                });
+            }
+            trace_plan!(at: "fast_path", &plan);
+            trace_plan(&plan);
+
+            self.duration += time.elapsed();
+            self.metrics
+                .observe_e2e_optimization_time("peek:fast_path", self.duration);
+
+            return Ok(GlobalLirPlan {
+                peek_plan: PeekPlan::FastPath(plan),
+                df_meta,
+                typ,
+            });
+        }
+
+        let use_fast_path_optimizer = maybe_fast_path_plan.is_some();
 
         // Run global optimization.
         mz_transform::optimize_dataflow(&mut df_desc, &mut transform_ctx, use_fast_path_optimizer)?;

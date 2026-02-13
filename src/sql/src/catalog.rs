@@ -866,6 +866,26 @@ pub trait CatalogItem {
     /// [`CatalogItem`].
     fn at_version(&self, version: RelationVersionSelector) -> Box<dyn CatalogCollectionItem>;
 
+    /// Returns the relation description and global ID for a specific version
+    /// without boxing or cloning the entire catalog entry. This is more
+    /// efficient than `at_version` when only the desc and ID are needed.
+    fn desc_and_global_id_at_version(
+        &self,
+        version: RelationVersionSelector,
+    ) -> Option<(RelationDesc, GlobalId)> {
+        let item = self.at_version(version);
+        let desc = item.relation_desc()?.into_owned();
+        let global_id = item.global_id();
+        Some((desc, global_id))
+    }
+
+    /// Returns the [`GlobalId`] for a specific version of this item without
+    /// boxing or cloning the entire catalog entry. This is more efficient than
+    /// `at_version` when only the global ID is needed.
+    fn global_id_at_version(&self, version: RelationVersionSelector) -> GlobalId {
+        self.at_version(version).global_id()
+    }
+
     /// The latest version of this item, if it's version-able.
     fn latest_version(&self) -> Option<RelationVersion>;
 }
