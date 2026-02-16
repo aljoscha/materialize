@@ -12,8 +12,9 @@
 use std::time::{Duration, Instant};
 
 use mz_ore::metric;
-use mz_ore::metrics::raw::{CounterVec, IntCounterVec};
-use mz_ore::metrics::{Counter, IntCounter, MetricsRegistry};
+use mz_ore::metrics::raw::{CounterVec, HistogramVec, IntCounterVec};
+use mz_ore::metrics::{Counter, Histogram, IntCounter, MetricsRegistry};
+use mz_ore::stats::histogram_seconds_buckets;
 use mz_postgres_client::metrics::PostgresClientMetrics;
 
 use crate::retry::RetryStream;
@@ -76,6 +77,8 @@ struct MetricsVecs {
 
     batched_op_count: IntCounterVec,
     batches_count: IntCounterVec,
+    batch_wait_seconds: HistogramVec,
+    batch_inner_read_seconds: HistogramVec,
 }
 
 impl MetricsVecs {
@@ -134,6 +137,18 @@ impl MetricsVecs {
                 help: "count of batches of operations",
                 var_labels: ["op"],
             )),
+            batch_wait_seconds: registry.register(metric!(
+                name: "mz_ts_oracle_batch_wait_seconds",
+                help: "time callers wait from ticket acquisition until their batch result is available",
+                var_labels: ["op"],
+                buckets: histogram_seconds_buckets(0.000_001, 8.0),
+            )),
+            batch_inner_read_seconds: registry.register(metric!(
+                name: "mz_ts_oracle_batch_inner_read_seconds",
+                help: "time spent in each backing oracle call for a batch",
+                var_labels: ["op"],
+                buckets: histogram_seconds_buckets(0.000_001, 8.0),
+            )),
         }
     }
 
@@ -165,6 +180,8 @@ impl MetricsVecs {
         BatchedOpMetrics {
             ops_count: self.batched_op_count.with_label_values(&[op]),
             batches_count: self.batches_count.with_label_values(&[op]),
+            wait_seconds: self.batch_wait_seconds.with_label_values(&[op]),
+            inner_read_seconds: self.batch_inner_read_seconds.with_label_values(&[op]),
         }
     }
 
@@ -231,6 +248,8 @@ pub struct OracleMetrics {
 pub struct BatchedOpMetrics {
     pub ops_count: IntCounter,
     pub batches_count: IntCounter,
+    pub wait_seconds: Histogram,
+    pub inner_read_seconds: Histogram,
 }
 
 #[derive(Debug)]

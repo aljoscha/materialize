@@ -15,12 +15,14 @@
 //! are broadcast via a `tokio::sync::watch` channel. This eliminates per-call
 //! `oneshot::channel()` allocations and `mpsc` sends from the hot path.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use async_trait::async_trait;
+use mz_ore::metrics::Histogram;
 use tokio::pin;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 
 use crate::metrics::Metrics;
 use crate::{TimestampOracle, WriteTimestamp};
@@ -66,6 +68,7 @@ pub struct BatchingTimestampOracle<T> {
     next_ticket: Arc<AtomicU64>,
     worker_notify: Arc<Notify>,
     result_tx: watch::Sender<BatchResult>,
+    read_ts_wait_seconds: Histogram,
 }
 
 impl<T> std::fmt::Debug for BatchingTimestampOracle<T> {
@@ -86,6 +89,7 @@ where
             completed_up_to: 0,
             ts: 0,
         });
+        let read_ts_wait_seconds = metrics.batching.read_ts.wait_seconds.clone();
 
         let task_oracle = Arc::clone(&oracle);
         let task_next_ticket = Arc::clone(&next_ticket);
@@ -112,12 +116,14 @@ where
                         break;
                     }
 
-                    read_ts_metrics
-                        .ops_count
-                        .inc_by(target - completed_up_to);
+                    read_ts_metrics.ops_count.inc_by(target - completed_up_to);
                     read_ts_metrics.batches_count.inc();
 
+                    let inner_start = Instant::now();
                     let ts = task_oracle.read_ts().await;
+                    read_ts_metrics
+                        .inner_read_seconds
+                        .observe(inner_start.elapsed().as_secs_f64());
                     completed_up_to = target;
 
                     // Broadcast result. It's okay if there are no receivers.
@@ -137,6 +143,7 @@ where
             next_ticket,
             worker_notify,
             result_tx,
+            read_ts_wait_seconds,
         }
     }
 }
@@ -155,6 +162,7 @@ where
     }
 
     async fn read_ts(&self) -> T {
+        let wait_start = Instant::now();
         let my_ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         self.worker_notify.notify_one();
 
@@ -164,6 +172,8 @@ where
             {
                 let state = rx.borrow_and_update();
                 if state.completed_up_to > my_ticket {
+                    self.read_ts_wait_seconds
+                        .observe(wait_start.elapsed().as_secs_f64());
                     return T::from(state.ts);
                 }
             }
