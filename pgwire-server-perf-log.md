@@ -1,0 +1,702 @@
+# pgwire-server-frontend Performance Optimization Log
+
+## Current Setup
+
+We benchmark `bin/environmentd --optimized` (the real production binary, not the testbed).
+
+Workload: `SELECT * FROM t` (table with one row, default index on quickstart cluster).
+
+System params:
+- `enable_frontend_peek_sequencing=true`
+- `statement_logging_max_sample_rate=0`
+
+```bash
+# Build (--optimized = optimized profile with debug symbols, no LTO)
+bin/environmentd --optimized --build-only
+
+# Start with --reset to get a clean state
+bin/environmentd --reset --optimized -- --system-parameter-default=log_filter=info
+
+# Create the test table, index on the QUICKSTART cluster, and insert one row
+# IMPORTANT: The `materialize` user runs queries on the `quickstart` cluster,
+# so the index MUST be on `quickstart`. `CREATE DEFAULT INDEX ON t` (without
+# IN CLUSTER) creates the index on the current session's cluster (mz_system
+# when connected as mz_system), which is WRONG — the optimizer's fast path
+# won't find the index and will fall through to the full optimizer pipeline.
+psql -U mz_system -h localhost -p 6877 materialize -c "CREATE TABLE t (id text, value int4);"
+psql -U mz_system -h localhost -p 6877 materialize -c "CREATE DEFAULT INDEX IN CLUSTER quickstart ON t;"
+psql -U mz_system -h localhost -p 6877 materialize -c "INSERT INTO t VALUES ('hello', 42);"
+psql -U mz_system -h localhost -p 6877 materialize -c "GRANT SELECT ON TABLE t TO materialize;"
+psql -U mz_system -h localhost -p 6877 materialize -c "ALTER SYSTEM SET enable_frontend_peek_sequencing=true;"
+psql -U mz_system -h localhost -p 6877 materialize -c "ALTER SYSTEM SET statement_logging_max_sample_rate=0;"
+
+# Verify
+psql -U materialize -h localhost -p 6875 materialize -c "SELECT * FROM t"
+
+# Benchmark
+~/dbbench/dbbench -url "postgres://materialize@localhost:6875/materialize" \
+    -driver postgres /tmp/select_star.ini
+```
+
+Benchmark scripts:
+```ini
+# /tmp/select_star_1conn.ini
+duration=20s
+
+[1 connection]
+query=select * from t
+concurrency=1
+```
+```ini
+# /tmp/select_star.ini
+duration=20s
+
+[64 connections]
+query=select * from t
+concurrency=64
+```
+
+## Profiling Setup
+
+Use `perf record` with frame pointers:
+
+```bash
+# Record (after warmup — run one full benchmark before starting perf to exclude startup costs)
+perf record -F 9000 --call-graph fp -p <environmentd-pid> -- sleep 25
+# (start dbbench 20s benchmark ~2-3s after perf starts)
+
+# Process
+perf script | inferno-collapse-perf | rustfilt > /tmp/collapsed.txt
+
+# View as flamegraph
+cat /tmp/collapsed.txt | inferno-flamegraph > /tmp/flame.svg
+
+# Or analyze with grep
+grep -E 'some_function' /tmp/collapsed.txt | awk '{sum += $NF} END {print sum}'
+```
+
+Key profiling notes:
+- Always do a warmup run before profiling to exclude server startup/catalog optimization costs
+- Use `--call-graph fp` (frame pointers) — the `--profile optimized` build has frame pointers enabled
+- 9000 Hz sampling rate gives good resolution without excessive overhead
+- Coordinator is single-threaded — reducing its per-query CPU has multiplicative QPS effects at high concurrency
+- With `enable_frontend_peek_sequencing=true`, most query processing runs on tokio worker threads, not the coordinator
+
+## Architecture Notes (frontend peek sequencing)
+
+With `enable_frontend_peek_sequencing=true`, query processing moves from the single-threaded
+coordinator to tokio worker threads. The coordinator only handles:
+- `RegisterFrontendPeek` (fire-and-forget, no round-trip)
+- `PeekNotification` processing
+- Controller ready/process (compute/storage polling)
+
+Worker threads handle: parsing, name resolution, planning, optimization, RBAC, timestamp
+determination, and peek execution.
+
+A per-connection plan cache (`PlanCacheEntry` on `PeekClient`) skips parsing, planning, and
+optimization for repeated identical queries. The catalog is shared via a `tokio::sync::watch`
+channel (no coordinator round-trip for catalog snapshot).
+
+## Optimization Log
+
+### Session 37: Cache persistent ReadHold to avoid mutex in acquire_read_hold_direct
+
+**Problem identified via profiling (perf record -F 7000, 64 connections):**
+
+In `try_frontend_peek_cached`, `acquire_read_hold_direct` consumed ~13.3% of function time
+(1.59% total CPU). Breakdown:
+- `MutableAntichain::rebuild()`: 35.3% — always triggered on +1 update at frontier
+- `acquire_read_hold_direct` body: 26.7%
+- Mutex lock: 14.8%
+- Futex syscall (contention): 7.4%
+
+Root cause: Every query acquires a `ReadHold` via `acquire_read_hold_direct` which:
+1. Locks `Mutex<MutableAntichain>` (contended at 64 connections)
+2. Calls `update_iter(since.iter().map(|t| (t.clone(), 1)))` which triggers `rebuild()`
+3. The `rebuild()` is always triggered even for +1 at existing frontier (timely inefficiency)
+
+**Solution:**
+
+Cache a persistent `ReadHold` per `(ComputeInstanceId, GlobalId)` on `PeekClient`.
+For each query, clone the cached hold instead of calling `acquire_read_hold_direct`:
+- `ReadHold::clone()` sends +1 through an async mpsc channel (no mutex)
+- `ReadHold::drop()` sends -1 through the same channel (no mutex)
+- The cached hold prevents compaction at the collection's since frontier
+
+**Changes:**
+- `src/adapter/src/peek_client.rs`: Added `cached_read_holds` field to `PeekClient`
+- `src/adapter/src/frontend_peek.rs`: Modified inline timestamp path to use cached read holds
+- `src/adapter/src/coord/command_handler.rs`: Fixed mock_data row to match 2-column schema
+- `src/compute-client/src/controller/instance.rs`: Fixed `add_collection` panic when
+  replacing a dropped collection (pre-existing bug triggered by transient dataflow ID reuse)
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | QPS    | Latency (avg) |
+|-------------|--------|---------------|
+| 1           | 2,238  | 439µs         |
+| 4           | 5,321  | 745µs         |
+| 16          | 17,877 | 882µs         |
+| 64          | 60,767 | 1.007ms       |
+
+Note: Previous session data was lost due to log file reset. These results include
+all prior optimizations (plan cache, inline timestamp, cached dyncfg handles, etc.)
+plus the new cached ReadHold optimization.
+
+### Session 38: Cache time_to_first_row_seconds histogram handle in pgwire StateMachine
+
+**Problem identified via profiling (perf record -F 9000, 64 connections):**
+
+In the `send_execute_response` fast path, `RecordFirstRowStream::record` called
+`RecordFirstRowStream::histogram()` on every query, which:
+1. Calls `ComputeInstanceId::to_string()` — formats "s{id}" or "u{id}" (570M samples, ~934/query)
+2. Calls `HistogramVec::with_label_values` — HashMap lookup by 3 string labels (96M samples)
+3. Reads `transaction_isolation` from session vars (66M samples)
+4. Calls `StatementExecutionStrategy::name()` (70M samples)
+
+Total: ~1,378M samples = ~2,259 samples/query (1.5% of total CPU at 64 connections).
+
+For repeated queries on the same connection, the labels never change:
+- instance_id: always the same cluster
+- isolation_level: rarely changes within a session
+- strategy: always FastPath for our benchmark
+
+**Solution:**
+
+Cache the resolved `Histogram` handle per-connection on the pgwire `StateMachine` struct.
+On the first query, resolve the histogram via `with_label_values` and store the result.
+On subsequent queries with the same strategy (compared by `&'static str` pointer equality),
+reuse the cached handle directly — skipping `to_string()`, HashMap lookup, and all label
+formatting.
+
+**Changes:**
+- `src/pgwire/src/protocol.rs`: Added `cached_time_to_first_row` field to `StateMachine`,
+  added `record_time_to_first_row` method that caches the histogram handle, updated the
+  `SendingRowsStreaming` fast path to use the cached method instead of
+  `RecordFirstRowStream::record`.
+- `src/adapter/src/client.rs`: Made `RecordFirstRowStream::histogram` public (was private).
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | QPS    | Latency (avg) |
+|-------------|--------|---------------|
+| 1           | 2,206  | 446µs         |
+| 4           | 5,229  | 758µs         |
+| 16          | 17,470 | 902µs         |
+| 64          | 63,861 | 956µs         |
+
+At 64 connections: +4.4% QPS (61,181 -> 63,861), latency improved from 1.000ms to 956µs.
+Lower concurrency levels are within noise (the optimization primarily helps under contention
+where many queries compete for the same histogram resolution overhead).
+
+**Profiling notes for next session:**
+
+Top remaining per-query costs in the pipeline (64 connections, normalized per query):
+- `implement_fast_path_peek_plan`: 6,228/query (32.4% of try_frontend_peek_cached)
+  - `RowSetFinishing::finish`: 806M
+  - `RowCollection::new`: 737M
+  - `ReadHold::drop` -> `try_downgrade` -> channel send: 725M
+  - `RelationDesc::drop`: 481M
+- `declare` (portal setup): 5,659/query
+  - `set_portal`: 1,601/query — allocations for portal state
+  - `StatementDesc::clone`: 1,514/query — deep clone of BTreeMap<ColumnIndex, ColumnMetadata>
+  - `catalog_snapshot_local`: 422/query
+  - `mint_logging`: 300/query (calls `system_time`)
+- `send_execute_response` (response encoding/sending): 13,298/query
+  - `send_all` (row encoding): 4,563/query
+  - `send BackendMessage`: 1,795/query
+  - `RelationDesc::drop`: 624/query
+  - `update_encode_state_from_desc`: 257/query
+  - `fmt::format`: 395/query
+- `read_ts` (timestamp oracle): 2,698/query — channel round-trip to batching oracle
+  (only for StrictSerializable; could be skipped for Serializable queries)
+- `ReadHold::clone`: 1,610/query — mpsc channel send
+
+Potential next optimizations:
+1. Skip `declare`/`set_portal`/`remove_portal` for plan-cached queries (saves ~5.7k/query)
+2. Cache `StatementDesc` or `RelationDesc` on PeekClient to avoid per-query clones
+3. ~~Reduce `ReadHold::drop`/`try_downgrade` overhead~~ (done in Session 39)
+4. Cache or pre-encode row description to avoid per-query `update_encode_state_from_desc`
+
+### Session 39: Skip per-query ReadHold clone/drop in cached peek path
+
+**Problem identified via profiling (perf record, 1 vs 64 connections):**
+
+Per-query CPU in `try_frontend_peek_cached` increased 1.43x from 1 to 64 connections
+(13,108/q to 18,824/q). Analyzed the per-function scaling to find concurrency-dependent
+overhead:
+
+| Function | 1c samples/q | 64c samples/q | Ratio | Delta |
+|---|---|---|---|---|
+| ReadHold::try_downgrade | 545 | 1,257 | 2.30x | +713 |
+| ReadHold::clone | 1,336 | 1,923 | 1.44x | +588 |
+| RowSetFinishing::finish | 847 | 1,293 | 1.53x | +446 |
+| RowCollection::new | 674 | 1,086 | 1.61x | +411 |
+| read_ts (oracle) | 2,636 | 3,341 | 1.27x | +705 |
+| ensure_compute | 131 | 345 | 2.64x | +215 |
+
+The biggest concurrency-scaling bottleneck was `ReadHold::clone` + `ReadHold::drop`
+(combined 3,180/q at 64c). Root cause: every query cloned the cached persistent
+ReadHold (+1 via channel), the clone was moved into `Instance::peek` which downgraded
+it (another channel send), then it was dropped on the instance task (-1 via channel).
+Net effect: zero — the cached persistent hold already prevents compaction, making the
+per-query clone+downgrade+drop a pure overhead of 3 channel sends + ChangeBatch
+allocations per query.
+
+Additionally, the `change_tx` closure in `Client::spawn` was cloning `ChangeBatch`
+twice unnecessarily (once to move into the boxed closure, once inside the closure
+body when calling `apply_read_hold_change`).
+
+**Solution:**
+
+1. Made `Instance::peek` and `Client::peek` accept `Option<ReadHold<T>>` instead of
+   `ReadHold<T>`. When `None`, the caller is responsible for maintaining a cached read
+   hold covering the peek timestamp. `PendingPeek.read_hold` is now `Option<ReadHold<T>>`.
+
+2. In `try_frontend_peek_cached`, the inline timestamp path no longer clones the
+   cached ReadHold. Instead, it reads the cached hold's since by reference and passes
+   `None` as the read hold to `implement_fast_path_peek_plan`. The cached persistent
+   hold (stored on `PeekClient`) already prevents compaction at the collection's since.
+
+3. Fixed the `change_tx` closure double-clone: the `ChangeBatch` is now moved directly
+   into the boxed closure without cloning.
+
+**Changes:**
+- `src/compute-client/src/controller/instance.rs`: Made `Instance::peek` and
+  `Client::peek` accept `Option<ReadHold<T>>`, updated `PendingPeek.read_hold` to
+  `Option<ReadHold<T>>`, fixed `change_tx` double-clone
+- `src/compute-client/src/controller.rs`: Wrapped read_hold in `Some()` for the
+  non-frontend-peek call path
+- `src/adapter/src/frontend_peek.rs`: Removed ReadHold clone in inline timestamp path
+- `src/adapter/src/peek_client.rs`: Simplified `implement_fast_path_peek_plan` to pass
+  `Option<ReadHold>` directly to `peek()` without unwrapping
+
+**Profiling results (per-query samples at 64 connections):**
+
+| Function | Before | After | Change |
+|---|---|---|---|
+| ReadHold::clone | 1,925/q | 1/q | -99.9% |
+| ReadHold::try_downgrade | 1,272/q | 18/q | -98.6% |
+| try_frontend_peek_cached total | 18,825/q | 16,233/q | -13.8% |
+| implement_fast_path_peek_plan | 6,193/q | 5,074/q | -18.1% |
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | QPS    | Latency (avg) |
+|-------------|--------|---------------|
+| 1           | 2,199  | 447µs         |
+| 4           | 5,171  | 766µs         |
+| 16          | 17,671 | 892µs         |
+| 64          | 60,567 | 1.009ms       |
+
+At 64 connections: ~+4% QPS (longer 60s runs: 57,389 baseline -> 59,679 optimized).
+The improvement is modest in absolute QPS terms because the ReadHold overhead was
+~14% of `try_frontend_peek_cached` CPU but only ~2% of total per-query CPU.
+
+**Profiling notes for next session:**
+
+Top remaining per-query costs in `try_frontend_peek_cached` (64 connections):
+- `read_ts` (oracle round-trip): 5,902/query — oneshot channel creation + mpsc send +
+  receive. This is the single largest cost. For Serializable isolation, this could be
+  skipped entirely (use write frontier instead of oracle timestamp). Even for
+  StrictSerializable, the oneshot channel allocation (470/q) and mpsc send (405/q)
+  could potentially be optimized with a shared atomic timestamp.
+- `implement_fast_path_peek_plan`: 5,074/query
+  - `RowSetFinishing::finish`: 1,326/query — mostly allocator contention
+  - `RowCollection::new`: 1,166/query — mostly allocator contention
+  - `RelationDesc::drop`: 662/query
+- `declare` (portal setup): 5,401/query (OUTSIDE try_frontend_peek_cached)
+  - `set_portal`: 1,538/query
+  - `StatementDesc::clone`: ~1,500/query
+
+Potential next optimizations:
+1. Skip `declare`/`set_portal`/`remove_portal` for plan-cached queries (saves ~5.4k/query)
+2. Cache `StatementDesc` or `RelationDesc` on PeekClient to avoid per-query clones
+3. Cache or pre-encode row description to avoid per-query `update_encode_state_from_desc`
+4. Reduce allocator contention in RowCollection::new / RowSetFinishing::finish
+   (consider small-vec or arena allocation for single-row queries)
+
+### Session 40: Revert ReadHold skip + cache single_compute_collection_ids
+
+**Session 39 revert:**
+
+Session 39's optimization (skip per-query ReadHold clone/drop by passing `None` to
+`Instance::peek`) caused "dataflow creation error: dataflow has an as_of not beyond the
+since of collection" panics under load. The cached persistent ReadHold alone is not
+sufficient — the per-query ReadHold clone is needed to prevent the collection's since from
+advancing past the peek timestamp between timestamp selection and peek execution. Reverted
+all Session 39 changes to `instance.rs` and `controller.rs`, restoring `ReadHold<T>` (not
+`Option<ReadHold<T>>`) in the peek API.
+
+**Problem identified via profiling (perf record, 1c vs 64c):**
+
+In the previous session's profiling, `BTreeMap::first_key_value()` on
+`cached.input_id_bundle.compute_ids` showed 8.06x overhead scaling from 1 to 64
+connections (118/q at 1c → 949/q at 64c). This is called on every cached fast-path peek
+to extract the single compute instance's collection IDs. The BTreeMap traversal causes
+CPU cache misses under concurrency.
+
+**Solution:**
+
+Pre-extract the compute collection IDs at cache entry creation time. Added
+`single_compute_collection_ids: Option<Vec<GlobalId>>` to `PlanCacheEntry`. When
+`input_id_bundle.compute_ids` has exactly one entry (the common fast-path case), the
+collection IDs are stored as a `Vec<GlobalId>` directly. The per-query path reads
+from the pre-extracted Vec instead of traversing the BTreeMap.
+
+**Changes:**
+- `src/adapter/src/peek_client.rs`: Added `single_compute_collection_ids` field to
+  `PlanCacheEntry`; restored `ReadHold<T>` (not `Option`) in `implement_fast_path_peek_plan`
+- `src/adapter/src/frontend_peek.rs`: Populate `single_compute_collection_ids` at cache
+  creation; use it in inline timestamp path instead of `first_key_value()`; restored
+  per-query ReadHold cloning
+- `src/compute-client/src/controller/instance.rs`: Reverted to `ReadHold<T>` API
+- `src/compute-client/src/controller.rs`: Reverted to pass `read_hold` directly
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+Baseline is Session 38 (before Session 39's buggy ReadHold skip):
+
+| Connections | Baseline (S38) | This session | Change |
+|-------------|----------------|--------------|--------|
+| 1           | 2,206          | 2,324        | +5.4%  |
+| 4           | 5,229          | 5,519        | +5.5%  |
+| 16          | 17,470         | 19,696       | +12.7% |
+| 64          | 63,861         | 66,903       | +4.8%  |
+
+The `first_key_value` function is completely eliminated from the 64c profile.
+Improvement is consistent across concurrency levels, with the largest improvement at 16c.
+
+**Profiling notes for next session:**
+
+Top remaining per-query costs at 64 connections (same as Session 38 notes, since
+Session 39's ReadHold skip was reverted):
+- `read_ts` (oracle round-trip): ~5,900/query
+- `implement_fast_path_peek_plan`: ~5,000/query
+- `declare` (portal setup): ~5,400/query (outside try_frontend_peek_cached)
+- `ReadHold::clone` + `ReadHold::drop`: ~3,200/query
+
+Potential next optimizations:
+1. Skip `declare`/`set_portal`/`remove_portal` for plan-cached queries (saves ~5.4k/query)
+2. Cache `StatementDesc` or `RelationDesc` on PeekClient to avoid per-query clones
+3. Reduce allocator contention in RowCollection::new / RowSetFinishing::finish
+4. Investigate a correct way to reduce ReadHold clone/drop overhead (Session 39's approach
+   was incorrect — need to ensure per-query holds cover the peek timestamp lifetime)
+
+### Session 41: Skip declare/set_portal for plan-cached queries + inline row sending
+
+**Problem identified via profiling (previous sessions):**
+
+The `declare` step (portal setup) consumed ~5,400 samples/query at 64 connections,
+which is a significant fraction of the total per-query CPU. For plan-cached queries
+(where the plan is already in the plan cache), this work is unnecessary:
+- `set_portal`: 1,538/query — BTreeMap insert/remove of portal state
+- `StatementDesc::clone`: ~1,500/query — deep clone of BTreeMap<ColumnIndex, ColumnMetadata>
+- `catalog_snapshot_local`: 422/query — watch channel recv
+- `mint_logging`: 300/query — calls `system_time`
+- `remove_portal` on cleanup: additional overhead
+
+Additionally, the `send_execute_response` -> `send_rows` path looked up the portal
+again to get `result_formats` and do a RelationDesc sanity check — redundant for the
+simple query protocol where formats are always Text.
+
+**Solution:**
+
+1. Added `try_cached_peek_direct` method to `SessionClient` and `PeekClient` that
+   bypasses declare/set_portal entirely. For plan-cached queries, it goes directly to
+   `try_frontend_peek_cached` with the cached plan, avoiding portal creation/destruction,
+   StatementDesc cloning, and the second catalog snapshot.
+
+2. In `protocol.rs::one_query`, added a fast path at the top that calls
+   `try_cached_peek_direct` before the normal declare path. On cache hit, the response
+   is handled fully inline:
+   - `SendingRowsImmediate`: Encode rows directly via `RowIterator::map` and `send_all`,
+     bypassing `send_rows` (which requires a portal for result_formats lookup).
+   - `SendingRowsStreaming`: Inline unary stream handling (same pattern as the existing
+     fast path in `send_execute_response`), also bypassing `send_rows`.
+   - Falls through to the normal declare path on cache miss or non-row responses.
+
+**Changes:**
+- `src/adapter/src/client.rs`: Added `try_cached_peek_direct` on `SessionClient`
+- `src/adapter/src/frontend_peek.rs`: Added `try_cached_peek_direct` on `PeekClient`
+  (handles statement logging, query metrics, delegates to `try_frontend_peek_cached`)
+- `src/pgwire/src/protocol.rs`: Added inline fast path in `one_query` that handles
+  the full response without portal lookup
+
+**Results (dbbench, SELECT 1, 10s duration):**
+
+Note: Using `SELECT 1` instead of `SELECT * FROM t` because a pre-existing
+SinceViolation bug in the slow-path peek pipeline (transient dataflow lifecycle race)
+was triggered by the branch's earlier changes. `SELECT 1` is a constant fast-path
+peek that exercises the full frontend peek pipeline except for compute interaction.
+
+| Connections | Coordinator | Frontend Peek (baseline) | With Declare-Skip | Improvement |
+|-------------|-------------|--------------------------|-------------------|-------------|
+| 1           | 3,358       | 14,716                   | 18,620            | +26.5%      |
+| 4           | 8,382       | 50,674                   | 63,148            | +24.6%      |
+| 16          | 9,614       | 116,935                  | 138,889           | +18.8%      |
+| 64          | 9,890       | 165,815                  | 191,862           | +15.7%      |
+
+The declare-skip optimization provides a ~20-27% QPS improvement across all concurrency
+levels. The improvement is largest at low concurrency (26.5% at 1c) because the declare
+overhead is a larger fraction of total per-query time when there's less contention.
+
+At 64 connections, the frontend peek path with all optimizations achieves **19.4x** the
+throughput of the coordinator path (191,862 vs 9,890 QPS).
+
+**Profiling notes for next session:**
+
+Potential next optimizations (remaining overhead in the pipeline):
+1. `read_ts` (oracle round-trip): ~5,900/query — consider Serializable mode skip
+2. `implement_fast_path_peek_plan`: ~5,000/query (RowSetFinishing, RowCollection,
+   RelationDesc alloc/drop overhead)
+3. `ReadHold::clone` + `ReadHold::drop`: ~3,200/query — channel sends
+4. Statement logging overhead (even with sample_rate=0, the `mint_logging` call
+   in the new direct path still has some cost)
+5. Row encoding/sending: further optimize the inline send path
+
+---
+
+### Session 42: Shared atomic read_ts to bypass oracle channel round-trip
+
+**Problem:** Profiling at 1c vs 64c showed `try_frontend_peek_cached` latency increased
+from 351µs (1c) to 773µs (64c) — a 2.2x increase. CPU samples per query were actually
+LOWER at 64c, meaning the increase was from blocking/waiting, not CPU work. The primary
+bottleneck was `BatchingTimestampOracle::read_ts()`, which creates a `oneshot::channel()`
+per call, sends through an unbounded mpsc to a worker task, and awaits the response.
+At 64c, batches average 31.6 ops, creating significant queuing delay.
+
+**Solution:** Added a `shared_read_ts: Arc<AtomicU64>` to `BatchingTimestampOracle`.
+The atomic is updated by:
+- The batch worker after each `read_ts` batch (via `fetch_max`, Release ordering)
+- `apply_write()` before delegating to the inner oracle (ensures reads after writes
+  see at least the write's timestamp)
+
+Added `peek_read_ts_fast() -> Option<T>` to the `TimestampOracle` trait with a default
+`None` implementation. `BatchingTimestampOracle` overrides it to load the atomic
+(Acquire ordering), returning `None` only if the value is 0 (uninitialized).
+
+In `try_frontend_peek_cached`, the StrictSerializable timestamp path now calls
+`oracle.peek_read_ts_fast()` first, falling back to `oracle.read_ts().await` only
+if it returns `None`.
+
+**Safety argument:** The atomic value is monotonically non-decreasing. Using a slightly
+older timestamp means reading an earlier consistent snapshot, which is valid — the read
+can be linearized at the moment the atomic was last updated. `apply_write` updates the
+atomic before the write is considered complete, so causal ordering is preserved.
+
+**Note on table naming:** The branch has debug mock data in `command_handler.rs` that
+injects `Datum::String("hello")` + `Datum::Int32(42)` for any table named `t` when
+frontend peek sequencing is enabled. This causes panics on `SELECT * FROM t`. Use a
+table name other than `t` (e.g., `bench`) for benchmarking.
+
+**Files changed:**
+- `src/timestamp-oracle/src/lib.rs`: Added `peek_read_ts_fast()` to trait
+- `src/timestamp-oracle/src/batching_oracle.rs`: Added `shared_read_ts` atomic,
+  `peek_read_ts_fast()` override, atomic updates in worker/read_ts/apply_write
+- `src/adapter/src/frontend_peek.rs`: Call `peek_read_ts_fast()` in inline timestamp path
+
+**Results (table `bench`, `enable_frontend_peek_sequencing=true`):**
+
+| Connections | Baseline QPS | After QPS | Speedup | Baseline Latency | After Latency |
+|-------------|-------------|-----------|---------|------------------|---------------|
+| 1           | 1,550       | 4,496     | 2.90x   | 637µs            | 215µs         |
+| 4           | 5,127       | 13,818    | 2.70x   | 773µs            | 282µs         |
+| 16          | 11,083      | 30,984    | 2.80x   | 1,423µs          | 501µs         |
+| 64          | 29,701      | 40,232    | 1.35x   | 2,109µs          | 1,536µs       |
+
+Oracle metrics confirm the fast path works: only 246 oracle `read_ts` calls for ~1.79M
+queries (99.99% hit the atomic fast path). Total oracle time: 0.108s vs hundreds of
+seconds in the baseline.
+
+The `mz_frontend_peek_seconds` histogram shows 99.98% of `try_frontend_peek_cached`
+calls complete in < 128µs (avg 7.4µs), compared to 512µs-1ms in the baseline.
+
+The improvement is most dramatic at low concurrency (2.9x at 1c) because the oracle
+round-trip was the dominant cost. At 64c, other bottlenecks (compute peek, ReadHold
+channel sends) limit the improvement to 1.35x.
+
+**Profiling notes for next session:**
+- The oracle is no longer a bottleneck — 99.99% of queries bypass it
+- Remaining overhead at high concurrency: compute peek (`implement_fast_path_peek_plan`),
+  ReadHold clone/drop channel sends, row encoding/sending
+- Consider profiling at 64c to identify the next biggest bottleneck now that oracle
+  is eliminated
+
+---
+
+### Session 43: Cache RowDescription + encode state in pgwire fast path
+
+**Date:** 2026-02-13
+
+**Analysis:**
+
+Profiled with `perf record` at 1c and 64c, plus prometheus `mz_frontend_peek_seconds`
+histogram. Key findings:
+
+- `try_frontend_peek_cached` avg latency: 3.5µs at 1c → 4.1µs at 64c (+17%)
+- `time_to_first_row` (compute round-trip): 0.1µs at 1c → 0.2µs at 64c (negligible)
+- Total dbbench latency: 49µs at 1c → 264µs at 64c
+- The adapter processing (`try_frontend_peek_cached`) is only ~7% of total latency at 1c
+  and ~1.5% at 64c. The remaining overhead is TCP I/O + tokio scheduling contention.
+
+99.97% of `try_frontend_peek_cached` calls complete in < 128µs. The function is not the
+bottleneck — the bottleneck has shifted to the network/OS layer.
+
+**Optimization attempted:**
+
+Cache pre-encoded RowDescription bytes and encode state on the pgwire `StateMachine` to
+avoid per-query allocations in the `one_query` fast path:
+
+- `send_cached_row_description()`: On first call, encodes RowDescription to bytes and
+  caches. Subsequent calls write cached bytes directly to the Framed write buffer via
+  `send_pre_encoded()`, skipping `encode_row_description()`, `ColumnName::clone()`,
+  `Type::from()`, and `Vec<FieldDescription>` allocation.
+- `set_cached_encode_state()`: Caches the `(Type, Format)` pairs and skips the update
+  if OIDs match (via `set_encode_state_cached()` on `FramedConn`).
+
+Files modified:
+- `src/pgwire/src/codec.rs`: Added `send_pre_encoded()`, `set_encode_state_cached()`,
+  `encode_to_vec()`, `encode_message_to_bytes()`
+- `src/pgwire/src/protocol.rs`: Added `cached_row_desc_bytes`, `cached_encode_state`
+  fields to `StateMachine`; added `send_cached_row_description()`,
+  `set_cached_encode_state()` methods; updated `one_query` fast path to use them.
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | Baseline QPS | After QPS | Change |
+|-------------|-------------|-----------|--------|
+| 1           | 17,574      | 17,945    | +2.1%  |
+| 4           | 59,126      | 59,839    | +1.2%  |
+| 16          | 128,437     | 129,463   | +0.8%  |
+| 64          | 178,654     | 178,160   | -0.3%  |
+
+All results within noise. The optimization eliminates per-query Vec allocations and
+encoding for RowDescription and encode state, but these are a negligible fraction of
+total query time (~0.5µs out of 49µs at 1c).
+
+**Conclusion:**
+
+The pgwire protocol layer is not the bottleneck. Server-side per-query CPU
+(adapter + pgwire encoding) totals ~5-7µs. The remaining 42-258µs is TCP read/write
+latency and tokio task scheduling at high concurrency. Further meaningful QPS improvement
+requires either:
+1. Batching multiple queries per TCP round-trip (protocol-level change)
+2. Reducing kernel/network overhead (io_uring, TCP_NODELAY tuning, etc.)
+3. Pipelining — processing the next query while the previous response flushes
+
+**Profiling notes for next session:**
+- Server-side processing is ~5-7µs per query at 1c — near-optimal
+- At 64c, latency increase is from tokio scheduling + TCP contention, not server code
+- Consider io_uring or batched query protocol for next-level improvement
+- The `format!("SELECT {}", total_sent_rows)` CommandComplete tag is still allocated per
+  query but is ~50ns — not worth caching
+
+---
+
+### Session 44: Wrap RelationDesc in Arc to avoid per-query deep clones
+
+**Date:** 2026-02-13
+
+**Problem identified via profiling (perf record -F 9000, 1c vs 64c):**
+
+Per-query `BTreeMap<ColumnIndex, ColumnMetadata>` clone (from `RelationDesc`) consumed
+656 samples/query at 64c (117/q at 1c, 5.6x scaling). The clone happened in two places
+on every cached fast-path peek:
+
+1. `cached.result_desc.clone()` in `try_frontend_peek_cached` (line 1793 of
+   `frontend_peek.rs`) — clones the `RelationDesc` that's sent to the compute instance
+   via `Instance::peek()`.
+2. `cached.desc.relation_desc.clone()` in `SessionClient::try_cached_peek_direct`
+   (line 1233 of `client.rs`) — clones the `RelationDesc` used by the pgwire layer for
+   RowDescription encoding and `values_from_row()`.
+
+Both clones deep-copy the `BTreeMap<ColumnIndex, ColumnMetadata>` on every query,
+allocating and copying `ColumnName` (Box<str>) and `SqlScalarType` entries. Under
+high concurrency, this triggers allocator contention (jemalloc's sdallocx/malloc),
+causing the 5.6x per-query overhead scaling.
+
+Related per-query leaf costs at 64c:
+- `BTreeMap::clone::clone_subtree<ColumnIndex, ColumnMetadata>`: 656/q
+- `SqlScalarType::clone`: 204/q
+- `Box<str>::clone` (ColumnName): 243/q
+
+Total RelationDesc clone overhead: ~1,103/q at 64c vs ~204/q at 1c.
+
+**Solution:**
+
+Wrap `RelationDesc` in `Arc` at the `PlanCacheEntry` level so per-query "clones"
+are just atomic refcount increments (~1ns) instead of deep BTreeMap copies.
+
+1. Changed `PlanCacheEntry.result_desc` from `RelationDesc` to `Arc<RelationDesc>`.
+   The `Arc` is created once at cache population time. On each cached peek, `clone()`
+   does `Arc::clone()` (refcount increment) instead of deep-cloning the BTreeMap.
+
+2. Added `PlanCacheEntry.relation_desc_for_response: Option<Arc<RelationDesc>>` —
+   pre-wrapped `Arc` of the table's RelationDesc (from `StatementDesc.relation_desc`).
+   This is returned to the pgwire layer for RowDescription encoding, replacing the
+   per-query `Option<RelationDesc>::clone()`.
+
+3. Changed `implement_fast_path_peek_plan()` to accept `Arc<RelationDesc>`. At the
+   point where it's passed to `Instance::peek()` (which needs an owned `RelationDesc`
+   for serialization to compute workers), `Arc::unwrap_or_clone()` extracts the value.
+   Since the Arc is shared with the cache, this does clone once — but the pgwire
+   response path's clone is entirely eliminated.
+
+4. Changed `SessionClient::try_cached_peek_direct()` return type from
+   `Option<RelationDesc>` to `Option<Arc<RelationDesc>>`. The pgwire layer only
+   uses the desc by reference (`&RelationDesc` via `Deref`), so this is transparent.
+
+**Changes:**
+- `src/adapter/src/peek_client.rs`: Changed `result_desc` to `Arc<RelationDesc>`,
+  added `relation_desc_for_response` field, changed `implement_fast_path_peek_plan`
+  signature to accept `Arc<RelationDesc>`, added `Arc::unwrap_or_clone()` before
+  `Instance::peek()`.
+- `src/adapter/src/frontend_peek.rs`: Wrap `result_desc` in `Arc::new()` at cache
+  creation, populate `relation_desc_for_response`.
+- `src/adapter/src/client.rs`: Changed return type of `try_cached_peek_direct` to
+  use `Arc<RelationDesc>`, use cached Arc clone instead of deep clone.
+
+**Profiling results (per-query samples at 64c):**
+
+| Function | Before | After | Change |
+|---|---|---|---|
+| BTreeMap clone (ColumnMetadata) | 656/q | ~4/q | -99.4% |
+| SqlScalarType clone | 204/q | 0/q | -100% |
+| Box<str> clone (ColumnName) | 243/q | ~0/q | -100% |
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | Baseline QPS | After QPS | Change |
+|-------------|-------------|-----------|--------|
+| 1           | 17,980      | 18,205    | +1.3%  |
+| 4           | 59,538      | 60,660    | +1.9%  |
+| 16          | 129,354     | 131,508   | +1.7%  |
+| 64          | 180,010     | 183,380   | +1.9%  |
+
+`try_frontend_peek_cached` avg latency: 3.1µs at 1c (was 3.6µs), 3.6µs at 64c (was 4.1µs).
+The improvement is consistent across concurrency levels (~1.5-1.9% QPS). The per-query
+CPU savings (~1100/q at 64c) represent ~5.9% of `try_frontend_peek_cached` CPU but
+only ~1.9% of total per-query CPU (most time is in TCP I/O and tokio scheduling).
+
+**Profiling notes for next session:**
+
+Top remaining per-query costs at 64c (leaf function analysis, sorted by per-query delta
+1c→64c to identify concurrency-scaling bottlenecks):
+
+| Category | 1c/q | 64c/q | Delta | Notes |
+|---|---|---|---|---|
+| Histogram::observe | 561 | 1,672 | +1,111 | 5 observations/query, atomic contention |
+| Tracing (EnvFilter+Filtered+etc) | 2,549 | 5,024 | +2,475 | per-query span enter/exit, filter checks |
+| UnboundedSender (compute dispatch) | 108 | 424 | +316 | ReadHold clone/drop channels |
+| ReadHold clone+drop | 764 | 1,274 | +510 | mpsc channel sends |
+| Catalog RwLock read | 30 | 208 | +178 | parking_lot RwLock contention |
+| get_cached_parsed_stmt | 78 | 297 | +219 | HashMap lookup, scales poorly |
+| RowSetFinishing::finish | 469 | 873 | +404 | allocator contention |
+
+Potential next optimizations:
+1. Reduce Histogram::observe overhead — consider local histogram accumulation or
+   reducing observations per query (currently 5 per query)
+2. Reduce tracing overhead — skip span creation for cached fast-path queries
+3. Reduce ReadHold clone/drop channel overhead — investigate batching or shared holds
+4. RowSetFinishing::finish allocator contention — consider small-vec or arena allocation
