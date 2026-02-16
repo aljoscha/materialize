@@ -34,8 +34,17 @@ psql -U mz_system -h localhost -p 6877 materialize -c "ALTER SYSTEM SET statemen
 psql -U materialize -h localhost -p 6875 materialize -c "SELECT * FROM t"
 
 # Benchmark
+# IMPORTANT: pin dbbench's pool sizes to the benchmark concurrency and pre-auth
+# connections. Otherwise (notably at 128 connections with default
+# max-idle-conns=100), dbbench churns sessions heavily, which floods
+# command-startup/command-terminate builtin table updates and artificially
+# inflates group commits (~30-40/s instead of ~1/s), distorting oracle metrics.
 ~/dbbench/dbbench -url "postgres://materialize@localhost:6875/materialize" \
-    -driver postgres /tmp/select_star.ini
+    -driver postgres \
+    -max-active-conns 64 \
+    -max-idle-conns 64 \
+    -force-pre-auth \
+    /tmp/select_star.ini
 ```
 
 Benchmark scripts:
@@ -55,6 +64,24 @@ duration=20s
 query=select * from t
 concurrency=64
 ```
+
+For any other concurrency `N`, use:
+
+```bash
+~/dbbench/dbbench -url "postgres://materialize@localhost:6875/materialize" \
+    -driver postgres \
+    -max-active-conns N \
+    -max-idle-conns N \
+    -force-pre-auth \
+    /tmp/select_star_N.ini
+```
+
+Connection churn sanity checks (should stay low/flat during steady-state runs):
+- `mz_slow_message_handling_count{message_kind="command-startup"}`
+- `mz_slow_message_handling_count{message_kind="command-terminate"}`
+- `mz_connection_status{source="external",status="success"}`
+- `mz_append_table_duration_seconds_count`
+- `mz_ts_oracle_started_count{op="apply_write"}`
 
 ## Profiling Setup
 
