@@ -44,8 +44,23 @@ http://localhost:6878/metrics. Interesting metrics for us are
 mz_frontend_peek_seconds, with the try_frontend_peek_cached label. This covers
 the runtime of try_frontend_peek_cached mentioned above. These are histograms,
 so you have to look at the one with the _bucket suffix and figure out the
-histogram by yourself. As a first step look at how that varies with number of
-concurrent clients and then find out why that is. Maybe there is something in
-there that still forces us to serialize through something, maybe a client call
-or something like that.
+histogram by yourself. Another important metric is
+mz_frontend_peek_read_ts_seconds, which covers the read_ts calls we make to the
+oracle from the frontend. Looks like this is the main culprit right now for why
+QPS doesn't scale and latency goes up as we add more concurrent clients.
+
+We recently changed the batching timestamp oracle to a different
+implementation, but looks like that hasn't resolved the scaling issues. Looks
+like oracle calls to the backing crdb oracle are actually going down, with
+higher concurrency, but still latency seems to go up.
+
+Below here, I have some immediate next steps to explore. Once you feel you have
+resolved on of them, please update this prompt so that we don't consider them
+anymore in our next sessions. Update the prompt in a separate jj change with a
+good description.
+
+Immediate next steps:
+ - overall, figure out why read_ts doesn't scale
+ - benchmark at different concurrency levels and figure out how that impacts read_ts
+ - come up with solution or solutions for resolving these bottlenecks
 
