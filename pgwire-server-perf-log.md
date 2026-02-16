@@ -700,3 +700,79 @@ Potential next optimizations:
 2. Reduce tracing overhead — skip span creation for cached fast-path queries
 3. Reduce ReadHold clone/drop channel overhead — investigate batching or shared holds
 4. RowSetFinishing::finish allocator contention — consider small-vec or arena allocation
+
+---
+
+### Session 45: Parallelize batching oracle read_ts and tune max in-flight batches
+
+**Date:** 2026-02-16
+
+**Problem observed:**
+
+The ticketed batching oracle reduced CRDB `read_ts` call count at higher user QPS,
+but end-to-end throughput did not improve enough. New instrumentation split
+`read_ts` time into:
+
+- caller wait time: `mz_ts_oracle_batch_wait_seconds`
+- backing oracle call time: `mz_ts_oracle_batch_inner_read_seconds`
+
+At high concurrency, caller wait was significantly larger than inner call time,
+indicating queueing delay in the batching layer.
+
+**Solution implemented:**
+
+Allow multiple backing-oracle `read_ts` calls in flight in the batching worker
+while preserving ticketed correctness.
+
+- Worker now schedules up to `max_in_flight` non-overlapping ticket frontiers.
+- Completed batches are consumed out-of-order, but `completed_up_to` is only
+  advanced monotonically.
+- Callers still wait for `completed_up_to > my_ticket`, preserving linearization.
+
+Added runtime tuning knob:
+
+- `MZ_TS_ORACLE_MAX_IN_FLIGHT_READ_TS_BATCHES`
+
+Tried values `2`, `3`, and `4`, then set code default to `3`.
+
+**Changes:**
+
+- `src/timestamp-oracle/src/batching_oracle.rs`
+  - parallel in-flight batching worker
+  - env override for max in-flight batches
+  - default changed from `2` to `3`
+- `src/timestamp-oracle/src/metrics.rs`
+  - added:
+    - `mz_ts_oracle_batch_wait_seconds{op="read_ts"}`
+    - `mz_ts_oracle_batch_inner_read_seconds{op="read_ts"}`
+
+**Results (dbbench, SELECT * FROM t, 20s, after warmup):**
+
+| max_inflight | connections | QPS       | latency      | wait ms | inner ms |
+|--------------|-------------|-----------|--------------|---------|----------|
+| 2            | 1           | 4,345.856 | 226.050µs    | 0.172   | 0.168    |
+| 2            | 4           | 10,726.767| 367.953µs    | 0.293   | 0.225    |
+| 2            | 16          | 25,912.014| 603.565µs    | 0.461   | 0.346    |
+| 2            | 64          | 57,382.281| 1.036234ms   | 0.783   | 0.579    |
+| 3            | 1           | 4,576.069 | 214.460µs    | 0.160   | 0.157    |
+| 3            | 4           | 12,051.905| 326.554µs    | 0.250   | 0.222    |
+| 3            | 16          | 27,188.870| 574.959µs    | 0.435   | 0.357    |
+| 3            | 64          | 58,453.389| 1.012381ms   | 0.755   | 0.617    |
+| 4            | 1           | 4,263.617 | 230.524µs    | 0.176   | 0.172    |
+| 4            | 4           | 12,235.776| 321.464µs    | 0.243   | 0.243    |
+| 4            | 16          | 26,645.446| 587.688µs    | 0.451   | 0.394    |
+| 4            | 64          | 57,195.902| 1.032153ms   | 0.770   | 0.688    |
+
+**Conclusion:**
+
+- `max_inflight=3` is best overall and best at 64c QPS.
+- Increasing from 2 to 3 reduces queueing enough to improve throughput.
+- Increasing from 3 to 4 further shrinks queue-gap but increases inner call
+  time enough to lose net throughput at high concurrency.
+
+**Next question:**
+
+Why does `inner_read` increase with concurrency/in-flight parallelism?
+Likely candidates: Postgres/CRDB connection-pool contention, increased CRDB
+hot-row read contention, and/or client-side scheduling overhead in
+`PostgresTimestampOracle::read_ts()`.

@@ -20,12 +20,47 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use mz_ore::metrics::Histogram;
 use tokio::pin;
 use tokio::sync::{Notify, watch};
 
 use crate::metrics::Metrics;
 use crate::{TimestampOracle, WriteTimestamp};
+
+/// Maximum number of backing-oracle `read_ts` calls we allow in flight at once.
+///
+/// Allowing a small amount of parallelism reduces queueing delay under load
+/// while still keeping pressure on the backing oracle bounded.
+const MAX_IN_FLIGHT_READ_TS_BATCHES: usize = 3;
+const MAX_IN_FLIGHT_READ_TS_BATCHES_ENV: &str = "MZ_TS_ORACLE_MAX_IN_FLIGHT_READ_TS_BATCHES";
+
+fn max_in_flight_read_ts_batches() -> usize {
+    match std::env::var(MAX_IN_FLIGHT_READ_TS_BATCHES_ENV) {
+        Ok(raw) => match raw.parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!(
+                    env = %MAX_IN_FLIGHT_READ_TS_BATCHES_ENV,
+                    value = %raw,
+                    fallback = MAX_IN_FLIGHT_READ_TS_BATCHES,
+                    "max in-flight read_ts batches must be >= 1; using fallback"
+                );
+                MAX_IN_FLIGHT_READ_TS_BATCHES
+            }
+            Ok(parsed) => parsed,
+            Err(_) => {
+                tracing::warn!(
+                    env = %MAX_IN_FLIGHT_READ_TS_BATCHES_ENV,
+                    value = %raw,
+                    fallback = MAX_IN_FLIGHT_READ_TS_BATCHES,
+                    "failed to parse max in-flight read_ts batches; using fallback"
+                );
+                MAX_IN_FLIGHT_READ_TS_BATCHES
+            }
+        },
+        Err(_) => MAX_IN_FLIGHT_READ_TS_BATCHES,
+    }
+}
 
 /// The state broadcast by the worker task to waiting callers.
 ///
@@ -53,16 +88,19 @@ struct BatchResult {
 ///
 /// The ticketed approach works as follows:
 /// 1. Each caller atomically increments `next_ticket` to take a ticket number.
-/// 2. The worker task snapshots `next_ticket`, calls `inner.read_ts()`, and
-///    broadcasts the result via a `watch` channel.
+/// 2. The worker task snapshots `next_ticket`, calls `inner.read_ts()` in up
+///    to `MAX_IN_FLIGHT_READ_TS_BATCHES` in-flight batches, and broadcasts the
+///    highest completed snapshot via a `watch` channel.
 /// 3. Callers subscribe to the watch and wait until `completed_up_to > my_ticket`.
 ///
 /// Correctness: the worker snapshots `next_ticket = N` after tickets 0..N-1
 /// were taken (i.e., after those callers arrived). The oracle call happens after
 /// the snapshot, so the returned timestamp is within the real-time bounds of
-/// every caller with ticket < N. Callers with ticket >= N wait for the next
-/// batch. This is the same argument as the channel-based batching — we never
-/// cache or reuse a timestamp from before a caller arrived.
+/// every caller with ticket < N. Even with multiple in-flight batches,
+/// `completed_up_to` only advances monotonically, so callers only ever observe a
+/// result from a snapshot taken after they arrived. This is the same argument as
+/// the channel-based batching — we never cache or reuse a timestamp from before
+/// a caller arrived.
 pub struct BatchingTimestampOracle<T> {
     inner: Arc<dyn TimestampOracle<T> + Send + Sync>,
     next_ticket: Arc<AtomicU64>,
@@ -83,6 +121,7 @@ where
 {
     /// Creates a [`BatchingTimestampOracle`] that uses the given inner oracle.
     pub fn new(metrics: Arc<Metrics>, oracle: Arc<dyn TimestampOracle<T> + Send + Sync>) -> Self {
+        let max_in_flight = max_in_flight_read_ts_batches();
         let next_ticket = Arc::new(AtomicU64::new(0));
         let worker_notify = Arc::new(Notify::new());
         let (result_tx, _) = watch::channel(BatchResult {
@@ -99,42 +138,62 @@ where
         mz_ore::task::spawn(|| "BatchingTimestampOracle Worker Task", async move {
             let read_ts_metrics = &metrics.batching.read_ts;
             let mut completed_up_to = 0u64;
+            let mut scheduled_up_to = 0u64;
+            let mut in_flight = FuturesUnordered::new();
 
             loop {
-                // Register for wake-up BEFORE checking for pending tickets.
-                // This ensures we don't miss a notify_one() that arrives
-                // between our check and our sleep.
-                let notified = task_notify.notified();
-                pin!(notified);
-                notified.as_mut().enable();
-
-                // Inner loop: process batches as long as there are pending
-                // tickets.
-                loop {
+                while in_flight.len() < max_in_flight {
                     let target = task_next_ticket.load(Ordering::Acquire);
-                    if target <= completed_up_to {
+                    if target <= scheduled_up_to {
                         break;
                     }
 
-                    read_ts_metrics.ops_count.inc_by(target - completed_up_to);
+                    read_ts_metrics.ops_count.inc_by(target - scheduled_up_to);
                     read_ts_metrics.batches_count.inc();
 
-                    let inner_start = Instant::now();
-                    let ts = task_oracle.read_ts().await;
-                    read_ts_metrics
-                        .inner_read_seconds
-                        .observe(inner_start.elapsed().as_secs_f64());
-                    completed_up_to = target;
-
-                    // Broadcast result. It's okay if there are no receivers.
-                    let _ = task_result_tx.send(BatchResult {
-                        completed_up_to,
-                        ts: ts.into(),
+                    let batch_oracle = Arc::clone(&task_oracle);
+                    in_flight.push(async move {
+                        let inner_start = Instant::now();
+                        let ts = batch_oracle.read_ts().await;
+                        (target, ts, inner_start.elapsed().as_secs_f64())
                     });
+                    scheduled_up_to = target;
                 }
 
-                // Sleep until a caller takes a new ticket and notifies us.
-                notified.await;
+                if in_flight.is_empty() {
+                    // Register for wake-up BEFORE checking for pending tickets.
+                    // This ensures we don't miss a notify_one() that arrives
+                    // between our check and our sleep.
+                    let notified = task_notify.notified();
+                    pin!(notified);
+                    notified.as_mut().enable();
+                    if task_next_ticket.load(Ordering::Acquire) <= scheduled_up_to {
+                        notified.await;
+                    }
+                    continue;
+                }
+
+                tokio::select! {
+                    // A batch finished; update metrics and publish the highest
+                    // completed ticket boundary seen so far.
+                    completed = in_flight.next() => {
+                        let Some((target, ts, inner_seconds)) = completed else {
+                            continue;
+                        };
+                        read_ts_metrics.inner_read_seconds.observe(inner_seconds);
+                        if target > completed_up_to {
+                            completed_up_to = target;
+                            // Broadcast result. It's okay if there are no receivers.
+                            let _ = task_result_tx.send(BatchResult {
+                                completed_up_to,
+                                ts: ts.into(),
+                            });
+                        }
+                    }
+                    // New callers arrived; loop around so we can schedule
+                    // additional batches (if below the in-flight limit).
+                    _ = task_notify.notified(), if in_flight.len() < max_in_flight => {}
+                }
             }
         });
 
