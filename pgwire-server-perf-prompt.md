@@ -61,8 +61,29 @@ resolved on of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate jj change with a
 good description.
 
-Immediate next steps:
- - overall, figure out why read_ts doesn't scale
- - benchmark at different concurrency levels and figure out how that impacts read_ts
- - come up with solution or solutions for resolving these bottlenecks
-
+Immediate next steps (handoff):
+ - Run all dbbench runs with fixed pool settings to avoid churn artifacts:
+   `-max-active-conns N -max-idle-conns N -force-pre-auth` (with `N=concurrency`).
+ - Sanity-check each run for churn:
+   `command-startup ~= N`, `command-terminate ~= N`, and `mz_append_table_duration_seconds_count` / `apply_write` should stay near the read-ts tick rate (not spike).
+ - Run a concurrency sweep on the bigger machine (`1,4,16,64,128` and optionally `256`) and capture:
+   `mz_frontend_peek_seconds{kind="try_frontend_peek_cached"}`,
+   `mz_frontend_peek_read_ts_seconds`,
+   `mz_ts_oracle_batch_wait_seconds{op="read_ts"}`,
+   `mz_ts_oracle_batch_inner_read_seconds{op="read_ts"}`,
+   `mz_ts_oracle_batched_op_count{op="read_ts"}`,
+   `mz_ts_oracle_batches_count{op="read_ts"}`.
+ - Use the new phase histograms to break down postgres-backed `read_ts`:
+   `mz_ts_oracle_postgres_read_ts_phase_seconds{phase="get_connection|prepare_cached|query_one"}`.
+   We already observed that 64->128 inner-read growth is almost entirely in `phase="query_one"`.
+ - For each case, reset CRDB SQL stats before the run (`SELECT crdb_internal.reset_sql_stats();`) and compare CRDB statement stats for
+   `SELECT read_ts FROM timestamp_oracle WHERE timeline = $1` (`svcLat`, `runLat`, `cpuSQLNanos`, `contentionTime`)
+   against the `query_one` phase metric. This separates DB server time from envd/runtime overhead.
+ - Check CPU/runtime pressure on the bigger machine using Tokio runtime metrics:
+   `mz_tokio_worker_total_busy_duration{runtime="main"}`,
+   `mz_tokio_budget_forced_yield_count{runtime="main"}`,
+   `mz_tokio_worker_poll_count{runtime="main"}`.
+   Goal: determine if we are scheduler/CPU bound vs DB-latency bound.
+ - Decision after data:
+   if `query_one` rises mainly because CRDB `svcLat` rises, focus on CRDB-side causes (storage/compaction/hot-row effects);
+   if `query_one` rises much more than CRDB `svcLat`, focus on envd/runtime scheduling and oracle call path isolation.
