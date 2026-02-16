@@ -14,7 +14,7 @@
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use deadpool_postgres::tokio_postgres::Config;
@@ -766,9 +766,26 @@ where
             SELECT read_ts FROM timestamp_oracle
                 WHERE timeline = $1;
         "#;
+        let get_connection_start = Instant::now();
         let client = self.get_connection().await?;
+        self.metrics
+            .postgres_read_ts
+            .get_connection_seconds
+            .observe(get_connection_start.elapsed().as_secs_f64());
+
+        let prepare_cached_start = Instant::now();
         let statement = client.prepare_cached(q).await?;
+        self.metrics
+            .postgres_read_ts
+            .prepare_cached_seconds
+            .observe(prepare_cached_start.elapsed().as_secs_f64());
+
+        let query_one_start = Instant::now();
         let result = client.query_one(&statement, &[&self.timeline]).await?;
+        self.metrics
+            .postgres_read_ts
+            .query_one_seconds
+            .observe(query_one_start.elapsed().as_secs_f64());
 
         let read_ts: Numeric = result.try_get("read_ts").expect("missing column read_ts");
         let read_ts = Self::decimal_to_ts(read_ts);

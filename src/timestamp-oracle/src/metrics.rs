@@ -40,6 +40,9 @@ pub struct Metrics {
 
     /// Metrics for [`PostgresClient`](mz_postgres_client::PostgresClient).
     pub postgres_client: PostgresClientMetrics,
+
+    /// Fine-grained metrics for `PostgresTimestampOracle::read_ts`.
+    pub postgres_read_ts: PostgresReadTsPhaseMetrics,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -58,6 +61,7 @@ impl Metrics {
             batching: vecs.batching_metrics(),
             retries: vecs.retries_metrics(),
             postgres_client: PostgresClientMetrics::new(registry, "mz_ts_oracle"),
+            postgres_read_ts: vecs.postgres_read_ts_phase_metrics(),
             _vecs: vecs,
         }
     }
@@ -79,6 +83,7 @@ struct MetricsVecs {
     batches_count: IntCounterVec,
     batch_wait_seconds: HistogramVec,
     batch_inner_read_seconds: HistogramVec,
+    postgres_read_ts_phase_seconds: HistogramVec,
 }
 
 impl MetricsVecs {
@@ -149,6 +154,12 @@ impl MetricsVecs {
                 var_labels: ["op"],
                 buckets: histogram_seconds_buckets(0.000_001, 8.0),
             )),
+            postgres_read_ts_phase_seconds: registry.register(metric!(
+                name: "mz_ts_oracle_postgres_read_ts_phase_seconds",
+                help: "time spent in each phase of postgres-backed read_ts calls",
+                var_labels: ["phase"],
+                buckets: histogram_seconds_buckets(0.000_001, 8.0),
+            )),
         }
     }
 
@@ -193,6 +204,20 @@ impl MetricsVecs {
             peek_write_ts: self.retry_metrics("peek_write_ts"),
             read_ts: self.retry_metrics("read_ts"),
             apply_write: self.retry_metrics("apply_write"),
+        }
+    }
+
+    fn postgres_read_ts_phase_metrics(&self) -> PostgresReadTsPhaseMetrics {
+        PostgresReadTsPhaseMetrics {
+            get_connection_seconds: self
+                .postgres_read_ts_phase_seconds
+                .with_label_values(&["get_connection"]),
+            prepare_cached_seconds: self
+                .postgres_read_ts_phase_seconds
+                .with_label_values(&["prepare_cached"]),
+            query_one_seconds: self
+                .postgres_read_ts_phase_seconds
+                .with_label_values(&["query_one"]),
         }
     }
 
@@ -255,6 +280,13 @@ pub struct BatchedOpMetrics {
 #[derive(Debug)]
 pub struct BatchingMetrics {
     pub read_ts: BatchedOpMetrics,
+}
+
+#[derive(Debug)]
+pub struct PostgresReadTsPhaseMetrics {
+    pub get_connection_seconds: Histogram,
+    pub prepare_cached_seconds: Histogram,
+    pub query_one_seconds: Histogram,
 }
 
 #[derive(Debug)]
