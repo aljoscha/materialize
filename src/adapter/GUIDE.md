@@ -50,3 +50,13 @@ the new query arrived, so assigning it to the new query places the query's
 timestamp outside its real-time bounds. A query arriving after the cached value
 was last updated would receive a stale timestamp --- one that predates its own
 start --- violating strict serializability.
+
+### No local-only assumptions in a distributed system
+
+Materialize is designed to run as a distributed system: multiple `environmentd`
+instances may share the same backing store (for example CRDB) concurrently. Any
+optimization that relies on local-only state --- such as tracking writes with
+an in-process counter and assuming no other writer exists --- is incorrect
+unless the backing store is also consulted or the invariant is otherwise
+guaranteed system-wide. Always ask: "does this still work if another node is
+running the same code against the same backing store?"
