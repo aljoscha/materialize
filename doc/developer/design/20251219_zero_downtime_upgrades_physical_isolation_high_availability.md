@@ -6,39 +6,22 @@ collaborate on shared durable state. One key insight connects them:
 
 **Zero-downtime upgrades are high availability across two versions.**
 
-The ultimate goal for zero-downtime upgrades is to have two versions of
-Materialize running concurrently, serving traffic with no downtime, where we
-can cut over network routes when we're confident the new version is ready. This
-will enable us to roll out a new version, observe its behavior, and abandon the
-update if something isn't right -- true flexibility in version management.
-
-This document proposes an incremental step toward that vision: a "lame-duck"
-upgrade procedure that achieves true zero-downtime for DML and DQL queries.
-This is not a detour from the end goal but a direct stepping stone: it requires
-us to build the foundational capabilities that all three initiatives need --
-running multiple `environmentd` instances with concurrent access to shared
-state.
+The goal for zero-downtime upgrades is to have two versions of Materialize
+running concurrently, serving traffic with no downtime, where we can cut over
+network routes when we're confident the new version is ready. This will enable
+us to roll out a new version, observe its behavior, and abandon the update if
+something isn't right --- true flexibility in version management.
 
 We currently have a brief window (10-30 seconds) where an environment is
-unreachable during upgrades (see Context for details). This proposal eliminates
-that unreachability for DML and DQL, with DDL seeing a brief window where it
-cannot proceed.
+unreachable during upgrades (see Context for details). This document proposes
+the changes required to eliminate that unreachability.
 
 ## Goals
 
-- True zero-downtime upgrades for DML and DQL
-
-The lived experience for users will be: **no perceived downtime for DQL and
-DML, and an error message about DDL not being allowed during version cutover,
-which should be on the order of 10s of seconds**.
-
-Alternative: we can think about instead delaying DDL statements, they will
-eventually be cancelled when we cut over network connections and then succeed
-on the new version.
+- True zero-downtime upgrades for DML, DQL, and DDL
 
 ## Non-Goals
 
-- True zero-downtime upgrades for DDL
 - High availability, so no downtime during upgrades or any other time
 - Physical isolation
 
@@ -116,14 +99,48 @@ this framing clarifies what makes each initiative unique:
 | physical isolation | 1 (typically) | permanent | workload routing |
 
 All three share a common foundation: the ability to run multiple `environmentd`
-instances that can read/write shared state concurrently. The work proposed in
-this document directly builds that foundation, making it a stepping stone toward
-the full vision rather than a parallel effort.
+instances that can read/write shared state concurrently.
 
-## Proposal (lame-duck upgrades)
+## Proposal
 
-As the next incremental milestone for zero-downtime upgrades, I propose that we
-change from our current upgrade procedure to this flow:
+The major work required for zero-downtime upgrades, and shared across high
+availability and physical isolation, is enabling multiple actors to interact
+with and modify the catalog. Multiple instances of `environmentd` need to be
+able to:
+
+- subscribe to catalog changes and apply their implications
+- collaborate in writing down changes to the catalog
+
+The foundational ideas behind this are explained in [platform v2
+architecture](20231127_pv2_uci_logical_architecture.md), and there is ongoing
+work towards allowing the adapter to subscribe to catalog changes and apply
+their implications.
+
+Beyond the ability for multiple actors to work with the durable catalog, for
+zero-downtime upgrades we need the ability for _multiple versions_ to interact
+with the catalog. This is currently not possible because of catalog migrations
+and because a new version fences out old versions.
+
+A jumping-off point for this work is the recent work that allows multiple
+versions to work with persist shards. Here we already have forward and backward
+compatibility by tracking what versions are still "touching" a shard and
+deferring the equivalent of migrations to a moment when no older versions are
+touching the shard. For Materialize as a whole, this means that changes or new
+features need to be gated by what version the catalog currently has, and that
+catalog version can be different from the version of Materialize that is
+currently running. We would then have gating both by regular feature flags and
+by catalog version.
+
+The proposed upgrade flow requires a number of changes across different
+components. I will sketch these below, but each of the sub-sections will
+require a small-ish design document of its own or at the very least a thorough
+GitHub issue.
+
+## Work Required
+
+### Improved Upgrade Flow
+
+The change from the current upgrade procedure would be this flow:
 
 1. New `environmentd` starts with higher `deploy_generation`/`version`
 2. Boots in read-only mode: opens catalog in read-only mode, spawns `clusterd`
@@ -133,10 +150,9 @@ change from our current upgrade procedure to this flow:
 4. Orchestrator triggers promotion: new `environmentd` opens catalog in
    read/write mode, which writes its `deploy_generation`/`version` to the
    catalog, **then halts and is restarted in read/write mode**
-5. Old `environmentd` notices the new version in the catalog and enters
-   **lame-duck mode**: it does not halt, and none of its cluster processes are
-   reaped, it can still serve queries but not apply writes to the catalog
-   anymore, so cannot process DDL queries
+5. Old `environmentd` notices the new version in the catalog but will stay
+   running: it does not halt, and none of its cluster processes are reaped, it
+   can still serve queries 
 6. New `environmentd` re-establishes connection to clusters, brings them out of
    read-only mode
 7. Cutover: once orchestration determines that the new-version `environmentd`
@@ -144,63 +160,12 @@ change from our current upgrade procedure to this flow:
 8. Eventually: resources of old-version deployment are reaped
 
 The big difference to before is that the fenced deployment is not immediately
-halted/reaped but can still serve queries. This includes DML and DQL (so
-INSERTs and SELECTs), but not DDL.
+halted/reaped but can still serve queries.
 
 We cut over network routes once the new deployment is fully ready, so any
 residual downtime is the route change itself. During that window the old
-deployment still accepts connections but rejects DDL with an error message.
-When cutting over, we drop connections and rely on reconnects to reach the new
-version.
-
-Implicit in this proposal is that we initially still don't want to support DDL
-during the upgrade window. In addition to all the proposed work, this would
-require two additional pieces of engineering work. The lame-duck approach lets
-us deliver immediate value while building the foundation those pieces will need.
-
-The proposed upgrade flow and the other initiatives requires a number of
-changes across different components. I will sketch these below, but each of the
-sub-sections will require a small-ish design document of its own or at the very
-least a thorough GitHub issue.
-
-## Work required for Zero-Downtime Upgrades (lame-duck upgrades)
-
-### Lame-Duck `environmentd` at Old Version
-
-The observation that makes this proposal work is that neither the schema nor
-the contents of user collections (so tables, sources, etc.) change between
-versions. So both the old version and the new version _should_ be able to
-collaborate in writing down source data, accepting INSERTs for tables and
-serving SELECT queries.
-
-DDL will not work because the new-version deployment will potentially have
-migrated (applied catalog migrations) the catalog and so the old version cannot
-be allowed to write to it anymore. And it wouldn't currently be able to read
-newer changes. Backward/forward compatibility for catalog changes is one of the
-things we need to get true zero-downtime working for all types of queries.
-
-Once an `environmentd` notices that there is a newer version in the catalog it
-enters lame-duck mode, where it does not allow writes to the catalog anymore
-and will serve DQL/DML workload off of the catalog snapshot that it has. An
-important detail to figure out here is what happens when the old-version
-`environmentd` process crashes while we're in a lame-duck phase. If the since
-of the catalog shard has advanced, it will not be able to restart and read the
-catalog at the old version that it understands. This may require holding back
-the since of the catalog shard during upgrades or a similar mechanism. On the
-other hand, this might be okay if we assume that the new version restarts about
-as fast as the old version, so the new version will be ready to take over about
-as fast as the old `environmentd` could restart.
-
-TODO: It could even be the case that builtin tables are compatible for writing
-between the versions, because of how persist schema backward compatibility
-works. We have to audit whether it would work for both the old and new version
-to write at the same time. This is important for builtin tables that are not
-derived from catalog state, for example `mz_sessions`, the storage-usage table,
-and probably others.
-
-TODO: Figure out if we want to allow background tasks to keep writing. This
-includes, but is not limited to storage usage collection and all the
-storage-managed collections.
+deployment still accepts connections. When cutting over, we drop connections
+and rely on reconnects to reach the new version.
 
 ### Change How Old-Version Processes are Reaped
 
@@ -208,7 +173,7 @@ Currently, the fenced-out `environmentd` halts itself when the new version
 fences it via the catalog. And a newly establishing `environmentd` will reap
 replica processes (`clusterd`) of any versions older than itself.
 
-We can't have this because the lame-duck `environmentd` still needs all its
+We can't have this because both versions of `environmentd` still need their
 processes alive to serve traffic.
 
 Instead we need to change the orchestration logic to determine when the
@@ -217,18 +182,13 @@ eventually reap processes of the old version.
 
 ### Get Orchestration Ready for Managing Version Cutover
 
-We need to update the orchestration logic to use the new flow as outlined
-above.
+We need to update the orchestration logic to manage the new flow where both
+versions serve traffic concurrently.
 
 TODO: What's the latency incurred by us cutting over between `environmentd`s
 when everything is ready. That's how close to zero we will get with this
 approach.
 
-## Foundation Work (Required for This Proposal)
-
-The following changes are required for this proposal and form the foundation
-for working towards the full goal for zero-downtime upgrades, high
-availability, and physical isolation:
 
 ### Get Builtin Tables Ready for Concurrent Writers
 
@@ -297,7 +257,7 @@ Kafka Sinks use a transactional producer ID, so they would also fight over this
 but settle down when the old-version cluster processes are eventually reaped.
 
 Alternative: instead of letting sources and sinks fight, we _could_ shut them
-down on the lame-duck deployment to give the new version room to work.
+down on the old-version deployment to give the new version room to work.
 
 TODO: Figure out how big the impact of the above-mentioned squabbling would be.
 
@@ -308,11 +268,11 @@ critical since handles of storage collections, currently has a single critical
 handle per collection. When a new version comes online it "takes ownership" of
 that handle.
 
-We have to figure out how that works in the lame-duck phase, where we have two
-`environmentd` instances running concurrently, and hence also two instances of
-`StorageCollections`. This is closely related (if not the same) to how multiple
-instances of `environmentd` have to have handles for physical isolation and
-high availability.
+We have to figure out how that works when we have two `environmentd` instances
+running concurrently, and hence also two instances of `StorageCollections`.
+This is closely related (if not the same) to how multiple instances of
+`environmentd` have to have handles for physical isolation and high
+availability.
 
 The solution is to track critical handle IDs in the catalog rather than pushing
 this complexity into persist. Each version or instance of `environmentd` writes
@@ -339,50 +299,22 @@ the other `environmentd` and vice-versa.
 
 We have to somehow address this, or accept the fact that we will have degraded
 latency for the short period where both the old and new `environmentd` serve
-traffic (the lame-duck phase).
+traffic.
 
-## Shared Work Required for all of Physical Isolation, High Availability, and Full Zero-Downtime Upgrades
+## Physical Isolation and High Availability
 
-> [!NOTE]
-> Beyond here we are talking about future work that is not part of this
-> proposal.
+Much of the ground work for zero-downtime upgrades v2 is also useful for these
+other user-facing goals. The ability to run concurrent `environmentd` instances
+is the common requirement. Both of these require substantial work on top,
+though.
 
-The major work required for all of the related future initiatives is enabling
-multiple actors to interact with and modify the catalog. Multiple instances of
-`environmentd` need to be able to:
+### Work required for Physical Isolation
 
-- subscribe to catalog changes and apply their implications
-- collaborate in writing down changes to the catalog
+WIP: sketch this?
 
-The foundational ideas behind this are explained in [platform v2
-architecture](20231127_pv2_uci_logical_architecture.md), and there is ongoing
-work towards allowing the adapter to subscribe to catalog changes and apply
-their implications.
+### Work required for High Availability
 
-## Work required for Zero-Downtime Upgrades (full vision)
-
-Beyond the ability for multiple actors to work with the durable catalog, for
-zero-downtime upgrades with DDL we need the ability for _multiple versions_ to
-interact with the catalog. This is currently not possible because of catalog
-migrations and because a new version fences out old versions.
-
-A jumping-off point for this work is the recent work that allows multiple
-versions to work with persist shards. Here we already have forward and backward
-compatibility by tracking what versions are still "touching" a shard and
-deferring the equivalent of migrations to a moment when no older versions are
-touching the shard. For Materialize as a whole, this means that changes or new
-features need to be gated by what version the catalog currently has, and that
-catalog version can be different from the version of Materialize that is
-currently running. We would then have gating both by regular feature flags and
-by catalog version.
-
-## Work required for Physical Isolation
-
-WIP: Maybe leave out of this proposal?
-
-## Work required for High Availability
-
-WIP: Maybe leave out of this proposal?
+WIP: sketch this?
 
 ## Alternatives
 
@@ -407,24 +339,97 @@ largest customer environments. Going from there to sub-second restart times
 looks prohibitively hard. Plus, there is never a guarantee that you will be
 able to restart in time.
 
-Here again I content that only an approach with HA across versions can deliver
+Here again I contend that only an approach with HA across versions can deliver
 true zero downtime.
-
-### True zero-downtime for everything, including DDL
-
-One could say that we should skip lame-duck mode and deliver the full vision of
-zero-downtime upgrades for all commands immediately.
-
-I think the lame-duck proposal is more feasible in the short term, and it
-directly builds toward that goal by establishing the foundation of concurrent
-`environmentd` instances. True zero-downtime upgrades including DDL require us
-to solve two additional hard engineering problems:
-- subscribing to and applying catalog changes
-- forward/backward compatibility for the catalog
-
-These are hard problems, and the lame-duck approach lets us deliver value
-incrementally while making progress on the shared foundation.
 
 ## Open Questions
 
 - How much downtime is incurred by rerouting network traffic?
+
+## Potential Incremental Step: Lame-Duck Upgrades
+
+As a potential incremental step that we can decide on taking as we develop the
+full solution, we could implement a "lame-duck" upgrade procedure that achieves
+true zero-downtime for DML and DQL queries but not DDL. This is not a detour
+from the end goal but a direct stepping stone: it requires us to build
+foundational capabilities that the full solution needs.
+
+The lame-duck approach eliminates unreachability for DML and DQL, with DDL
+seeing a brief window where it cannot proceed.
+
+The lived experience for users would be: **no perceived downtime for DQL and
+DML, and an error message about DDL not being allowed during version cutover,
+which should be on the order of 10s of seconds**.
+
+Alternative: we can think about instead delaying DDL statements, they will
+eventually be cancelled when we cut over network connections and then succeed
+on the new version.
+
+### Lame-Duck Upgrade Flow
+
+The change from the current upgrade procedure would be this flow:
+
+1. New `environmentd` starts with higher `deploy_generation`/`version`
+2. Boots in read-only mode: opens catalog in read-only mode, spawns `clusterd`
+   processes at new version, hydrates dataflows, everything is kept in
+   read-only mode
+3. Signals readiness: once clusters report hydrated and caught up
+4. Orchestrator triggers promotion: new `environmentd` opens catalog in
+   read/write mode, which writes its `deploy_generation`/`version` to the
+   catalog, **then halts and is restarted in read/write mode**
+5. Old `environmentd` notices the new version in the catalog and enters
+   **lame-duck mode**: it does not halt, and none of its cluster processes are
+   reaped, it can still serve queries but not apply writes to the catalog
+   anymore, so cannot process DDL queries
+6. New `environmentd` re-establishes connection to clusters, brings them out of
+   read-only mode
+7. Cutover: once orchestration determines that the new-version `environmentd`
+   is ready to serve queries, we update network routes
+8. Eventually: resources of old-version deployment are reaped
+
+The big difference to before is that the fenced deployment is not immediately
+halted/reaped but can still serve queries. This includes DML and DQL (so
+INSERTs and SELECTs), but not DDL.
+
+We cut over network routes once the new deployment is fully ready, so any
+residual downtime is the route change itself. During that window the old
+deployment still accepts connections but rejects DDL with an error message.
+When cutting over, we drop connections and rely on reconnects to reach the new
+version.
+
+### Lame-Duck `environmentd` at Old Version
+
+The observation that makes this work is that neither the schema nor the
+contents of user collections (so tables, sources, etc.) change between
+versions. So both the old version and the new version _should_ be able to
+collaborate in writing down source data, accepting INSERTs for tables and
+serving SELECT queries.
+
+DDL will not work because the new-version deployment will potentially have
+migrated (applied catalog migrations) the catalog and so the old version cannot
+be allowed to write to it anymore. And it wouldn't currently be able to read
+newer changes. Backward/forward compatibility for catalog changes is one of the
+things we need to get true zero-downtime working for all types of queries.
+
+Once an `environmentd` notices that there is a newer version in the catalog it
+enters lame-duck mode, where it does not allow writes to the catalog anymore
+and will serve DQL/DML workload off of the catalog snapshot that it has. An
+important detail to figure out here is what happens when the old-version
+`environmentd` process crashes while we're in a lame-duck phase. If the since
+of the catalog shard has advanced, it will not be able to restart and read the
+catalog at the old version that it understands. This may require holding back
+the since of the catalog shard during upgrades or a similar mechanism. On the
+other hand, this might be okay if we assume that the new version restarts about
+as fast as the old version, so the new version will be ready to take over about
+as fast as the old `environmentd` could restart.
+
+TODO: It could even be the case that builtin tables are compatible for writing
+between the versions, because of how persist schema backward compatibility
+works. We have to audit whether it would work for both the old and new version
+to write at the same time. This is important for builtin tables that are not
+derived from catalog state, for example `mz_sessions`, the storage-usage table,
+and probably others.
+
+TODO: Figure out if we want to allow background tasks to keep writing. This
+includes, but is not limited to storage usage collection and all the
+storage-managed collections.
