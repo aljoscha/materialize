@@ -52,7 +52,9 @@ QPS doesn't scale and latency goes up as we add more concurrent clients.
 We recently changed the batching timestamp oracle to a different
 implementation, but looks like that hasn't resolved the scaling issues. Looks
 like oracle calls to the backing crdb oracle are actually going down, with
-higher concurrency, but still latency seems to go up.
+higher concurrency, but still latency seems to go up. You can use the
+mz_ts_oracle_* metrics, with the read_ts label to look into how the timestamp
+oracle on the backend is doing. Maybe you can spot something there.
 
 Below here, I have some immediate next steps to explore. Once you feel you have
 resolved on of them, please update this prompt so that we don't consider them
