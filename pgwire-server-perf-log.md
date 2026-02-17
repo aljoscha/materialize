@@ -983,3 +983,82 @@ Potential next optimizations:
 2. Reduce Histogram::observe overhead (local accumulation or fewer observations)
 3. Reduce row encoding / BackendMessage send overhead
 4. Investigate io_uring or TCP_NODELAY tuning for network layer
+
+---
+
+## Session 48: Reduce Histogram::observe overhead on cached fast path
+
+**Goal:** Reduce `prometheus::Histogram::observe()` calls on the cached query
+fast path. At high concurrency, each `observe()` does 3+ atomic operations
+(bucket find, count increment, sum add) causing cache-line contention.
+
+### Profiling analysis (64c, pre-optimization)
+
+Profiled with `perf record -F 9000 --call-graph fp` at 64 connections.
+
+**Histogram::observe total:** 7.96B samples = 3.1% of total CPU, ~1,831
+samples/query at 64c. Scales 2.84x from 1c→64c (632→1,831/query) due to
+atomic contention.
+
+Breakdown by caller (non-overlapping, at 64c):
+| Caller | samples/query (64c) | samples/query (1c) | Scaling |
+|--------|--------------------:|--------------------:|--------:|
+| try_frontend_peek_cached | 570 | 164 | 3.48x |
+| advance_ready (message_processing) | 486 | 278 | 1.75x |
+| RowSetFinishing::finish | 271 | 54 | 5.02x |
+| one_query | 252 | 79 | 3.19x |
+| record_time_to_first_row | 249 | 57 | 4.37x |
+
+### Optimization
+
+Eliminated 3-4 redundant `Histogram::observe` calls per cached fast-path query:
+
+1. **Removed `peek_outer_histogram` observes** from `try_cached_peek_direct`
+   (frontend_peek.rs): The outer histogram ("try_frontend_peek") and inner
+   ("try_frontend_peek_cached") measure nearly identical time windows. Removed
+   the outer's 4 observe calls + `Instant::now()`.
+
+2. **Skipped `message_processing_seconds` observe** for Query messages in
+   `advance_ready` (protocol.rs): Query-level metrics already provide timing;
+   the per-message-type histogram is redundant for Query.
+
+3. **Made `RowSetFinishing::finish` histogram optional** (relation.rs +
+   callers): Cached path passes `None`, non-cached paths pass `Some(...)`.
+   For single-row results, observe overhead exceeds the measured operation.
+
+4. **Removed `frontend_peek_read_ts_seconds` observe** for inline timestamp
+   path (frontend_peek.rs): The atomic fast path takes ~0.2µs; observe
+   overhead exceeds the measured operation.
+
+### Benchmark results
+
+| Connections | Baseline QPS | After QPS | Change |
+|-------------|-------------|-----------|--------|
+| 1           | 19,483      | 19,430    | -0.3% (noise) |
+| 4           | 64,535      | 65,872    | +2.1%  |
+| 16          | 199,259     | 202,064   | +1.4%  |
+| 64          | 294,413     | 298,074   | +1.2%  |
+| 128         | 294,761     | 301,317   | +2.2%  |
+
+Modest but consistent improvement at concurrency >= 4. The 64c→128c plateau
+persists (~298K→301K), confirming the remaining bottleneck is not histogram
+atomics but something else (ReadHold clone/drop, TCP I/O, allocator).
+
+**Profiling notes for next session:**
+
+Remaining per-query costs at 64c (post-optimization estimates):
+- `try_frontend_peek_cached` (~10,500 samples/query): timestamp selection,
+  ReadHold acquire, plan execution, result encoding
+- ReadHold clone + drop (~3,200 samples/query): mpsc channel sends per query
+- `send` BackendMessage (~2,000 samples/query): TCP write + framing
+- `send_all` row encoding (~2,000 samples/query): row data encoding
+- Histogram::observe (~1,000 samples/query, reduced from ~1,800): remaining
+  observations (one_query, record_time_to_first_row, peek_cached_histogram)
+
+Potential next optimizations:
+1. Reduce ReadHold clone/drop channel overhead (investigate safe batching or
+   shared holds)
+2. Batch or eliminate remaining Histogram::observe calls
+3. Reduce row encoding / BackendMessage send overhead
+4. Investigate tokio task instrumentation overhead (~2.5% from
+   `Instrumented<F>` wrapper on all connection handlers)

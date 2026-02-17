@@ -59,17 +59,15 @@ anymore in our next sessions. Update the prompt in a separate jj change with a
 good description.
 
 Immediate next steps (handoff):
- - Run all dbbench runs with fixed pool settings to avoid churn artifacts:
-   `-max-active-conns N -max-idle-conns N -force-pre-auth` (with `N=concurrency`).
- - Profile with `perf record` at 64c and 128c to identify the next biggest
-   per-query CPU cost now that the oracle is no longer a bottleneck. Likely
-   candidates from Session 44 profiling notes:
-   - ReadHold clone + drop (~3,200 samples/query): mpsc channel sends per query
-   - Tracing overhead (~2,500-5,000 samples/query): span enter/exit checks
-   - Histogram::observe (~1,100-1,700 samples/query): 5 observations/query
-   - implement_fast_path_peek_plan (~5,000 samples/query): RowSetFinishing,
-     RowCollection allocations
- - Scaling plateau at 64c→128c (261k→264k QPS with only 2x more connections)
-   suggests a shared-resource bottleneck (TCP socket contention, tokio worker
-   saturation, or allocator contention). Use tokio runtime metrics and `perf`
-   to identify which.
+ - ReadHold clone + drop (~3,200 samples/query at 64c): mpsc channel sends per
+   query. Investigate safe batching or shared holds.
+ - Remaining Histogram::observe calls (~1,000 samples/query at 64c, down from
+   ~1,800): one_query, record_time_to_first_row, peek_cached_histogram.
+   Consider local accumulation or batched flushes.
+ - Tokio task instrumentation overhead (~2.5% from `Instrumented<F>` wrapper on
+   all connection handlers). Consider removing or making conditional.
+ - Row encoding / BackendMessage send overhead (~2,000 samples/query each at
+   64c). Investigate vectored writes or pre-encoded responses.
+ - Scaling plateau at 64c→128c (~298K→301K QPS) persists. Use `perf` to
+   identify whether it's TCP socket contention, tokio worker saturation, or
+   allocator contention.
