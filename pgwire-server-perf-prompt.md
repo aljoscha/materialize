@@ -59,15 +59,17 @@ anymore in our next sessions. Update the prompt in a separate jj change with a
 good description.
 
 Immediate next steps (handoff):
- - ReadHold clone + drop (~3,200 samples/query at 64c): mpsc channel sends per
-   query. Investigate safe batching or shared holds.
- - Remaining Histogram::observe calls (~1,000 samples/query at 64c, down from
-   ~1,800): one_query, record_time_to_first_row, peek_cached_histogram.
-   Consider local accumulation or batched flushes.
+ - Remaining Histogram::observe calls (~429 samples/query at 64c): still the
+   largest single leaf function in try_frontend_peek_cached. Consider local
+   accumulation or batched flushes.
+ - BTreeMap traversals (~700 samples/query total at 64c): oracle lookup,
+   collection state, etc. Consider caching more lookups on PeekClient.
  - Tokio task instrumentation overhead (~2.5% from `Instrumented<F>` wrapper on
    all connection handlers). Consider removing or making conditional.
  - Row encoding / BackendMessage send overhead (~2,000 samples/query each at
    64c). Investigate vectored writes or pre-encoded responses.
- - Scaling plateau at 64c→128c (~298K→301K QPS) persists. Use `perf` to
-   identify whether it's TCP socket contention, tokio worker saturation, or
-   allocator contention.
+ - Allocator contention (malloc/sdallocx/rust_alloc ~481 samples/query at 64c).
+   Consider arena allocation for single-row queries.
+ - Scaling plateau at 64c→128c (~304K→303K QPS) mostly resolved by inline hold
+   optimization. Remaining gap may be TCP socket contention or tokio worker
+   saturation.

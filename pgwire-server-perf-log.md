@@ -1062,3 +1062,115 @@ Potential next optimizations:
 3. Reduce row encoding / BackendMessage send overhead
 4. Investigate tokio task instrumentation overhead (~2.5% from
    `Instrumented<F>` wrapper on all connection handlers)
+
+---
+
+### Session 49: Eliminate per-query ReadHold channel sends via inline hold acquisition
+
+**Date:** 2026-02-17
+
+**Problem identified via profiling (perf record -F 9000, 1c vs 64c):**
+
+The `ReadHold::clone` + `ReadHold::drop` per-query overhead was the largest
+concurrency-scaling bottleneck within `try_frontend_peek_cached`. At 64c, the
+ReadHold-related operations (clone, try_downgrade, drop, channel sends)
+consumed **3,137 samples/query** — scaling 2.54x from 1c (1,234/q).
+
+The root cause: every cached fast-path query cloned the cached persistent
+ReadHold (sending +1 via `change_tx` → `command_tx` unbounded mpsc), then the
+clone was moved to `Instance::peek` which downgraded it (another channel send
+from instance task), and finally it was dropped in `finish_peek` (another
+channel send). Total: **3 channel sends per query** through the heavily
+contended `command_tx` unbounded mpsc channel.
+
+The `UnboundedSender::send` alone scaled **9.18x** from 1c→64c (72/q → 661/q)
+due to cache-line contention on the channel's internal linked list, making it
+the single worst scaling function.
+
+**Solution:**
+
+Added `Instance::peek_with_inline_hold()` and
+`InstanceClient::peek_with_inline_hold()` that acquire the ReadHold directly
+on the instance task side, eliminating all per-query ReadHold channel sends
+from the worker threads.
+
+1. The cached persistent ReadHold on `PeekClient` still prevents compaction
+   past the collection's since (no change to that mechanism).
+2. Instead of cloning the cached hold on the worker thread and sending it
+   through the channel, `peek_with_inline_hold` is a fire-and-forget command
+   that acquires the read hold internally on the instance task via
+   `lock_read_capabilities` (no cross-thread channel contention).
+3. The per-query ReadHold is created directly at the peek timestamp (no
+   downgrade needed).
+4. The ReadHold is stored in `PendingPeek` and dropped in `finish_peek` on
+   the instance task (sends via `change_tx` to itself — no cross-thread
+   contention).
+
+Also added `ReadHold::clone_at()` method that creates a hold directly at a
+target frontier with a single channel send (combining clone + downgrade).
+This is used as an intermediate step and may be useful for other callers.
+
+**Changes:**
+- `src/storage-types/src/read_holds.rs`: Added `clone_at()` method on
+  `ReadHold` that creates a new hold at a target frontier with one send.
+- `src/compute-client/src/controller/instance.rs`: Added
+  `peek_with_inline_hold()` on `Instance` that acquires the ReadHold
+  internally at the peek timestamp via `lock_read_capabilities`.
+- `src/compute-client/src/controller/instance_client.rs`: Added
+  `peek_with_inline_hold()` on `InstanceClient`, added `CollectionMissing`
+  variant to `PeekError`.
+- `src/adapter/src/frontend_peek.rs`: Changed inline timestamp path to pass
+  `None` for read hold (no clone, no channel send). Reads cached hold's
+  since by reference instead of cloning.
+- `src/adapter/src/peek_client.rs`: Updated `implement_fast_path_peek_plan`
+  to call `peek_with_inline_hold` when no external ReadHold is provided.
+- `src/adapter/src/error.rs`: Handle `CollectionMissing` PeekError variant.
+
+**Profiling results (per-query samples at 64c):**
+
+| Function | Before | After | Change |
+|---|---|---|---|
+| ReadHold total (clone+drop+channel) | 3,137/q | 150/q | -95.2% |
+| UnboundedSender::send | 662/q | 0/q | -100% |
+| ReadHold::clone | 219/q | 0/q | -100% |
+| try_frontend_peek_cached total | 9,316/q | 7,103/q | -23.8% |
+
+Prometheus `mz_frontend_peek_seconds` avg: 2.49µs (was 3.81µs, -34.6%).
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | Baseline QPS | After QPS | Change |
+|-------------|-------------|-----------|--------|
+| 1           | 19,305      | 19,860    | +2.9%  |
+| 4           | -           | 66,240    | -      |
+| 16          | -           | 206,105   | -      |
+| 64          | 303,945     | 303,836   | -0.0%  |
+| 128         | 296,729     | 302,721   | +2.0%  |
+
+The end-to-end QPS improvement is modest at 64c because the bottleneck is
+TCP I/O and tokio scheduling, not adapter processing. The 128c result
+improved +2%, partially closing the 64c→128c plateau gap. The CPU savings
+are significant: 23.8% less CPU per query in `try_frontend_peek_cached`,
+and the per-query latency dropped from 3.81µs to 2.49µs (-34.6%).
+
+**Profiling notes for next session:**
+
+Top remaining per-query costs at 64c (post-optimization):
+- `Histogram::observe`: 429/q — still the largest single leaf function.
+  5 observations per query with atomic contention.
+- BTreeMap traversals (oracle lookup, collection state, etc.): ~700/q total
+  across multiple BTreeMaps. Consider caching more lookups.
+- `RowSetFinishing::finish_inner`: 112/q — allocator contention
+- `RowCollection::new`: 83/q — allocator contention
+- `Row::clone`: 140/q
+- `IdHandle::clone`: 235/q (for peek UUID generation)
+- `malloc`/`sdallocx`/`__rust_alloc`: 280+113+88 = 481/q — general allocator
+  contention
+
+Potential next optimizations:
+1. Reduce or batch remaining Histogram::observe calls (~429/q at 64c)
+2. Cache more BTreeMap lookups (oracle, collection state) on PeekClient
+3. Reduce allocator contention (arena allocation for single-row queries)
+4. Investigate tokio task instrumentation overhead (~2.5% from
+   `Instrumented<F>` wrapper on all connection handlers)
+5. Row encoding / BackendMessage send overhead (outside try_frontend_peek_cached)
