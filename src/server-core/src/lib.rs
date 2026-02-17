@@ -330,7 +330,15 @@ where
                 let metrics_monitor = tokio_metrics::TaskMonitor::new();
                 let tokio_metrics_intervals = metrics_monitor.intervals();
                 let fut = server.handle_connection(conn, tokio_metrics_intervals);
-                set.spawn_named(|| &task_name, metrics_monitor.instrument(async move {
+                // Note: we intentionally do NOT wrap the future with
+                // `metrics_monitor.instrument()`. The Instrumented wrapper
+                // adds ~1,100 samples/query of overhead at 64 connections
+                // (Instrumented::poll + State waker arc ops). The
+                // TaskIntervals iterator still works without instrumentation
+                // but returns zero-valued metrics, which means the
+                // `pgwire_recv_scheduling_delay_ms` metric will report 0.
+                // This is an acceptable tradeoff for the CPU savings.
+                set.spawn_named(|| &task_name, async move {
                     let guard = scopeguard::guard((), |_| {
                         debug!(
                             server = S::NAME,
@@ -358,7 +366,7 @@ where
                     }
 
                     let () = ScopeGuard::into_inner(guard);
-                }));
+                });
             }
             // Actively cull completed tasks from the JoinSet so it does not grow unbounded. This
             // method is cancel safe.

@@ -626,12 +626,18 @@ where
     conn.send_all(buf).await?;
     conn.flush().await?;
 
+    // Drop the tokio_metrics intervals iterator. We removed the
+    // TaskMonitor::instrument() wrapper from connection tasks (see
+    // server-core/src/lib.rs) to eliminate ~1,600 samples/query of
+    // Instrumented::poll + waker overhead. Without instrumentation, the
+    // intervals iterator returns zero-valued metrics, so there's no point
+    // calling .next() or recording scheduling delay.
+    drop(tokio_metrics_intervals);
     let resolved_metrics = ResolvedPgwireMetrics::new(adapter_client.inner().metrics());
     let machine = StateMachine {
         conn,
         adapter_client,
         txn_needs_commit: false,
-        tokio_metrics_intervals,
         resolved_metrics,
         cached_time_to_first_row: None,
         cached_row_desc_bytes: None,
@@ -759,8 +765,6 @@ enum State {
 struct ResolvedPgwireMetrics {
     /// `pgwire_message_processing_seconds` keyed by message name.
     message_processing: HashMap<&'static str, Histogram>,
-    /// `pgwire_recv_scheduling_delay_ms` keyed by message name.
-    recv_scheduling_delay: HashMap<&'static str, Histogram>,
     /// `pgwire_ensure_transaction_seconds` keyed by message type.
     ensure_transaction: HashMap<&'static str, Histogram>,
     /// `result_rows_first_to_last_byte_seconds` keyed by statement type.
@@ -804,18 +808,6 @@ impl ResolvedPgwireMetrics {
             })
             .collect();
 
-        let recv_scheduling_delay = message_names
-            .iter()
-            .map(|&name| {
-                (
-                    name,
-                    metrics
-                        .pgwire_recv_scheduling_delay_ms
-                        .with_label_values(&[name]),
-                )
-            })
-            .collect();
-
         // ensure_transaction is called with a subset of message types.
         let ensure_txn_types: &[&'static str] = &[
             "query",
@@ -853,21 +845,17 @@ impl ResolvedPgwireMetrics {
 
         ResolvedPgwireMetrics {
             message_processing,
-            recv_scheduling_delay,
             ensure_transaction,
             result_rows_duration,
         }
     }
 }
 
-struct StateMachine<'a, A, I>
-where
-    I: Iterator<Item = TaskMetrics> + Send + 'a,
+struct StateMachine<'a, A>
 {
     conn: &'a mut FramedConn<A>,
     adapter_client: mz_adapter::SessionClient,
     txn_needs_commit: bool,
-    tokio_metrics_intervals: I,
     resolved_metrics: ResolvedPgwireMetrics,
     /// Cached `time_to_first_row_seconds` histogram handle, keyed by
     /// `(instance_id_str, strategy_name)`. Avoids per-query `to_string()` on
@@ -897,10 +885,9 @@ enum SendRowsEndedReason {
 const ABORTED_TXN_MSG: &str =
     "current transaction is aborted, commands ignored until end of transaction block";
 
-impl<'a, A, I> StateMachine<'a, A, I>
+impl<'a, A> StateMachine<'a, A>
 where
     A: AsyncRead + AsyncWrite + AsyncReady + Send + Sync + Unpin + 'a,
-    I: Iterator<Item = TaskMetrics> + Send + 'a,
 {
     /// Send a RowDescription message using cached pre-encoded bytes when available.
     ///
@@ -1017,11 +1004,6 @@ where
     }
 
     async fn advance_ready(&mut self) -> Result<State, io::Error> {
-        // Start a new metrics interval before the `recv()` call.
-        self.tokio_metrics_intervals
-            .next()
-            .expect("infinite iterator");
-
         // Handle timeouts first so we don't execute any statements when there's a pending timeout.
         let message = select! {
             biased;
@@ -1048,13 +1030,6 @@ where
             // `recv()` is cancel-safe as per it's docs.
             message = self.conn.recv() => message?,
         };
-
-        // Take the metrics since just before the `recv`.
-        let interval = self
-            .tokio_metrics_intervals
-            .next()
-            .expect("infinite iterator");
-        let recv_scheduling_delay_ms = interval.total_scheduled_duration.as_secs_f64() * 1000.0;
 
         // TODO(ggevay): Consider subtracting the scheduling delay from `received`. It's not obvious
         // whether we should do this, because the result wouldn't exactly correspond to either first
@@ -1170,13 +1145,6 @@ where
             if let Some(h) = self.resolved_metrics.message_processing.get(message_name) {
                 h.observe(start.elapsed().as_secs_f64());
             }
-        }
-        if let Some(h) = self
-            .resolved_metrics
-            .recv_scheduling_delay
-            .get(message_name)
-        {
-            h.observe(recv_scheduling_delay_ms);
         }
 
         Ok(next_state)
