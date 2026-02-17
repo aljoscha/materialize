@@ -46,44 +46,30 @@ the runtime of try_frontend_peek_cached mentioned above. These are histograms,
 so you have to look at the one with the _bucket suffix and figure out the
 histogram by yourself. Another important metric is
 mz_frontend_peek_read_ts_seconds, which covers the read_ts calls we make to the
-oracle from the frontend. Looks like this is the main culprit right now for why
-QPS doesn't scale and latency goes up as we add more concurrent clients.
+oracle from the frontend.
 
-We recently changed the batching timestamp oracle to a different
-implementation, but looks like that hasn't resolved the scaling issues. Looks
-like oracle calls to the backing crdb oracle are actually going down, with
-higher concurrency, but still latency seems to go up. You can use the
-mz_ts_oracle_* metrics, with the read_ts label to look into how the timestamp
-oracle on the backend is doing. Maybe you can spot something there.
+The oracle read_ts bottleneck has been resolved: Session 46 added a shared
+atomic `peek_read_ts_fast()` that bypasses the CRDB round-trip for 99.97%+ of
+queries. The read_ts cost is now ~0.2µs (was 374-673µs). The bottleneck has
+shifted to TCP I/O, tokio scheduling, and per-query adapter overhead.
 
 Below here, I have some immediate next steps to explore. Once you feel you have
-resolved on of them, please update this prompt so that we don't consider them
+resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate jj change with a
 good description.
 
 Immediate next steps (handoff):
  - Run all dbbench runs with fixed pool settings to avoid churn artifacts:
    `-max-active-conns N -max-idle-conns N -force-pre-auth` (with `N=concurrency`).
- - Sanity-check each run for churn:
-   `command-startup ~= N`, `command-terminate ~= N`, and `mz_append_table_duration_seconds_count` / `apply_write` should stay near the read-ts tick rate (not spike).
- - Run a concurrency sweep on the bigger machine (`1,4,16,64,128` and optionally `256`) and capture:
-   `mz_frontend_peek_seconds{kind="try_frontend_peek_cached"}`,
-   `mz_frontend_peek_read_ts_seconds`,
-   `mz_ts_oracle_batch_wait_seconds{op="read_ts"}`,
-   `mz_ts_oracle_batch_inner_read_seconds{op="read_ts"}`,
-   `mz_ts_oracle_batched_op_count{op="read_ts"}`,
-   `mz_ts_oracle_batches_count{op="read_ts"}`.
- - Use the new phase histograms to break down postgres-backed `read_ts`:
-   `mz_ts_oracle_postgres_read_ts_phase_seconds{phase="get_connection|prepare_cached|query_one"}`.
-   We already observed that 64->128 inner-read growth is almost entirely in `phase="query_one"`.
- - For each case, reset CRDB SQL stats before the run (`SELECT crdb_internal.reset_sql_stats();`) and compare CRDB statement stats for
-   `SELECT read_ts FROM timestamp_oracle WHERE timeline = $1` (`svcLat`, `runLat`, `cpuSQLNanos`, `contentionTime`)
-   against the `query_one` phase metric. This separates DB server time from envd/runtime overhead.
- - Check CPU/runtime pressure on the bigger machine using Tokio runtime metrics:
-   `mz_tokio_worker_total_busy_duration{runtime="main"}`,
-   `mz_tokio_budget_forced_yield_count{runtime="main"}`,
-   `mz_tokio_worker_poll_count{runtime="main"}`.
-   Goal: determine if we are scheduler/CPU bound vs DB-latency bound.
- - Decision after data:
-   if `query_one` rises mainly because CRDB `svcLat` rises, focus on CRDB-side causes (storage/compaction/hot-row effects);
-   if `query_one` rises much more than CRDB `svcLat`, focus on envd/runtime scheduling and oracle call path isolation.
+ - Profile with `perf record` at 64c and 128c to identify the next biggest
+   per-query CPU cost now that the oracle is no longer a bottleneck. Likely
+   candidates from Session 44 profiling notes:
+   - ReadHold clone + drop (~3,200 samples/query): mpsc channel sends per query
+   - Tracing overhead (~2,500-5,000 samples/query): span enter/exit checks
+   - Histogram::observe (~1,100-1,700 samples/query): 5 observations/query
+   - implement_fast_path_peek_plan (~5,000 samples/query): RowSetFinishing,
+     RowCollection allocations
+ - Scaling plateau at 64c→128c (261k→264k QPS with only 2x more connections)
+   suggests a shared-resource bottleneck (TCP socket contention, tokio worker
+   saturation, or allocator contention). Use tokio runtime metrics and `perf`
+   to identify which.
