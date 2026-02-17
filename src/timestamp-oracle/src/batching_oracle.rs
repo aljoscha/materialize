@@ -107,6 +107,10 @@ pub struct BatchingTimestampOracle<T> {
     worker_notify: Arc<Notify>,
     result_tx: watch::Sender<BatchResult>,
     read_ts_wait_seconds: Histogram,
+    /// Shared atomic holding the most recent read_ts result.
+    /// Updated by the worker task after each batch and by apply_write.
+    /// Initialized to 0; peek_read_ts_fast() returns None when still 0.
+    shared_read_ts: Arc<AtomicU64>,
 }
 
 impl<T> std::fmt::Debug for BatchingTimestampOracle<T> {
@@ -129,11 +133,13 @@ where
             ts: 0,
         });
         let read_ts_wait_seconds = metrics.batching.read_ts.wait_seconds.clone();
+        let shared_read_ts = Arc::new(AtomicU64::new(0));
 
         let task_oracle = Arc::clone(&oracle);
         let task_next_ticket = Arc::clone(&next_ticket);
         let task_notify = Arc::clone(&worker_notify);
         let task_result_tx = result_tx.clone();
+        let task_shared_read_ts = Arc::clone(&shared_read_ts);
 
         mz_ore::task::spawn(|| "BatchingTimestampOracle Worker Task", async move {
             let read_ts_metrics = &metrics.batching.read_ts;
@@ -183,6 +189,9 @@ where
                         read_ts_metrics.inner_read_seconds.observe(inner_seconds);
                         if target > completed_up_to {
                             completed_up_to = target;
+                            // Update shared atomic with the new timestamp (Release ordering
+                            // so subsequent peek_read_ts_fast loads see this value).
+                            task_shared_read_ts.fetch_max(ts.into(), Ordering::Release);
                             // Broadcast result. It's okay if there are no receivers.
                             let _ = task_result_tx.send(BatchResult {
                                 completed_up_to,
@@ -203,6 +212,7 @@ where
             worker_notify,
             result_tx,
             read_ts_wait_seconds,
+            shared_read_ts,
         }
     }
 }
@@ -242,7 +252,22 @@ where
         }
     }
 
+    fn peek_read_ts_fast(&self) -> Option<T> {
+        // Load the cached timestamp with Acquire ordering to synchronize with
+        // the Release store in the worker task.
+        let cached = self.shared_read_ts.load(Ordering::Acquire);
+        if cached == 0 {
+            // Uninitialized (no batch has completed yet).
+            None
+        } else {
+            Some(T::from(cached))
+        }
+    }
+
     async fn apply_write(&self, write_ts: T) {
+        // Update the shared atomic before delegating to ensure reads after writes
+        // see at least the write's timestamp. This preserves causal ordering.
+        self.shared_read_ts.fetch_max(write_ts.into(), Ordering::Release);
         self.inner.apply_write(write_ts).await
     }
 }

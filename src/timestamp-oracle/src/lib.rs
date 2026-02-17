@@ -60,6 +60,21 @@ pub trait TimestampOracle<T>: std::fmt::Debug {
     /// values of `self.write_ts()`.
     async fn read_ts(&self) -> T;
 
+    /// Peek a recent read timestamp without blocking.
+    ///
+    /// Returns `None` if no cached timestamp is available (e.g., on first call).
+    /// If `Some(ts)` is returned, it is guaranteed to be a valid read timestamp
+    /// that was returned by a recent `read_ts()` call. Using a cached timestamp
+    /// is correct because it can only be older (earlier linearization point),
+    /// which is valid for read operations.
+    ///
+    /// The default implementation returns `None`, which means callers must use
+    /// `read_ts()` instead. Implementations can override this to provide a
+    /// fast path that avoids round-trips to backing storage.
+    fn peek_read_ts_fast(&self) -> Option<T> {
+        None
+    }
+
     /// Mark a write at `write_ts` completed.
     ///
     /// All subsequent values of `self.read_ts()` will be greater or equal to

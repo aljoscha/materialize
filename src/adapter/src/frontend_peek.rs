@@ -795,7 +795,12 @@ impl PeekClient {
             Some(timeline) if needs_linearized_read_ts => {
                 let oracle = self.ensure_oracle(timeline).await?;
                 let read_ts_start = Instant::now();
-                let ts = oracle.read_ts().await;
+                // Try the fast path first (cached atomic timestamp), falling back
+                // to the full oracle round-trip only if unavailable.
+                let ts = match oracle.peek_read_ts_fast() {
+                    Some(ts) => ts,
+                    None => oracle.read_ts().await,
+                };
                 self.metrics()
                     .frontend_peek_read_ts_seconds
                     .observe(read_ts_start.elapsed().as_secs_f64());
@@ -1898,7 +1903,12 @@ impl PeekClient {
                     Some(timeline) => {
                         let oracle = self.ensure_oracle(timeline).await?;
                         let read_ts_start = Instant::now();
-                        let ts = oracle.read_ts().await;
+                        // Try the fast path first (cached atomic timestamp), falling back
+                        // to the full oracle round-trip only if unavailable.
+                        let ts = match oracle.peek_read_ts_fast() {
+                            Some(ts) => ts,
+                            None => oracle.read_ts().await,
+                        };
                         self.metrics()
                             .frontend_peek_read_ts_seconds
                             .observe(read_ts_start.elapsed().as_secs_f64());
@@ -2045,7 +2055,12 @@ impl PeekClient {
                 Some(timeline) if needs_linearized_read_ts => {
                     let oracle = self.ensure_oracle(timeline).await?;
                     let read_ts_start = Instant::now();
-                    let ts = oracle.read_ts().await;
+                    // Try the fast path first (cached atomic timestamp), falling back
+                    // to the full oracle round-trip only if unavailable.
+                    let ts = match oracle.peek_read_ts_fast() {
+                        Some(ts) => ts,
+                        None => oracle.read_ts().await,
+                    };
                     self.metrics()
                         .frontend_peek_read_ts_seconds
                         .observe(read_ts_start.elapsed().as_secs_f64());

@@ -1,0 +1,1 @@
+Running 1-connection baseline... /home/ubuntu/dbbench/dbbench -url postgres://materialize@localhost:6875/materialize  -driver postgres  -max-active-conns 1  -max-idle-conns 1  -force-pre-auth  /tmp/select_star_1.ini
