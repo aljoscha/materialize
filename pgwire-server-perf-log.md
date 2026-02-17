@@ -1168,9 +1168,135 @@ Top remaining per-query costs at 64c (post-optimization):
   contention
 
 Potential next optimizations:
-1. Reduce or batch remaining Histogram::observe calls (~429/q at 64c)
+1. Reduce or batch remaining Histogram::observe calls (~802/q at 64c)
 2. Cache more BTreeMap lookups (oracle, collection state) on PeekClient
 3. Reduce allocator contention (arena allocation for single-row queries)
-4. Investigate tokio task instrumentation overhead (~2.5% from
-   `Instrumented<F>` wrapper on all connection handlers)
+4. ~~Investigate tokio task instrumentation overhead~~ (done in Session 50)
 5. Row encoding / BackendMessage send overhead (outside try_frontend_peek_cached)
+
+---
+
+### Session 50: Remove tokio_metrics Instrumented wrapper and scheduling delay overhead
+
+**Date:** 2026-02-17
+
+**Problem identified via profiling (perf record -F 9000, 64c):**
+
+The `tokio_metrics::Instrumented` wrapper on per-connection tasks consumed
+**1,628 samples/query (2.31% of total CPU)** at 64 connections. Breakdown:
+
+| Component | samples/q (64c) | Description |
+|---|---:|---|
+| `Instrumented::poll` | 577 | Wraps every `.poll()` call on connection future |
+| `TaskIntervals::next` | 410 | Called 2x per query in `advance_ready` |
+| `State` waker ops | 641 | Arc waker clone/drop for instrumented waker |
+| **Total** | **1,628** | **2.31% of CPU** |
+
+The `Instrumented` wrapper is created by `TaskMonitor::instrument()` in
+`server-core/src/lib.rs::serve()` for every connection. It enables
+`tokio_metrics::TaskMonitor` to track per-task scheduling metrics (idle time,
+scheduled time, poll duration). The scheduling data is consumed in
+`protocol.rs::advance_ready()` via `TaskIntervals::next()` to measure
+`pgwire_recv_scheduling_delay_ms`.
+
+The overhead scales with concurrency because `Instrumented::poll` wraps
+every poll of the connection future (which occurs on every query, timeout
+check, and I/O event), and the `State` waker uses atomic Arc operations
+that contend on shared cache lines.
+
+**Solution:**
+
+Removed the `tokio_metrics` overhead from the query hot path in three parts:
+
+1. **Removed `metrics_monitor.instrument()` from connection tasks**
+   (`src/server-core/src/lib.rs`): Connection futures are no longer wrapped
+   with `Instrumented<F>`. The `TaskMonitor` is still created (to produce
+   the `intervals()` iterator required by the `Server` trait), but the
+   future runs without instrumentation. This eliminates `Instrumented::poll`
+   (577/q) and all `State` waker arc operations (641/q).
+
+2. **Removed `TaskIntervals::next()` calls from `advance_ready`**
+   (`src/pgwire/src/protocol.rs`): The two `.next()` calls that bracketed
+   `conn.recv()` to measure scheduling delay are removed. Without the
+   `instrument()` wrapper, the intervals iterator returns zero-valued
+   metrics, making these calls pure overhead. The `tokio_metrics_intervals`
+   iterator is dropped at the StateMachine construction site.
+
+3. **Removed `recv_scheduling_delay` histogram from `ResolvedPgwireMetrics`**
+   (`src/pgwire/src/protocol.rs`): The scheduling delay metric
+   (`pgwire_recv_scheduling_delay_ms`) is no longer observed. Without task
+   instrumentation, the metric would always report 0.0ms.
+
+The `StateMachine` type parameter `I` (for the intervals iterator) is
+removed from the struct, simplifying it from `StateMachine<'a, A, I>` to
+`StateMachine<'a, A>`. The `RunParams<'a, A, I>` and `run()` signatures
+still accept the iterator parameter for API compatibility with the
+`Server` trait.
+
+**Trade-off:** The `pgwire_recv_scheduling_delay_ms` metric will no longer
+report meaningful values. This metric measures tokio scheduling delay
+between receiving messages, which is useful for diagnosing task starvation.
+However, at 1,628/q (2.31% CPU), the instrumentation overhead itself was
+contributing to the scheduling delay it was measuring.
+
+**Changes:**
+- `src/server-core/src/lib.rs`: Removed `metrics_monitor.instrument()`
+  wrapper from connection task future.
+- `src/pgwire/src/protocol.rs`: Removed `tokio_metrics_intervals` field
+  from `StateMachine`, removed `I` type parameter from `StateMachine` and
+  its `impl` block, removed `TaskIntervals::next()` calls from
+  `advance_ready`, removed `recv_scheduling_delay` from
+  `ResolvedPgwireMetrics` and its construction, dropped
+  `tokio_metrics_intervals` at connection setup.
+
+**Profiling results (per-query samples at 64c):**
+
+| Function | Before | After | Change |
+|---|---|---|---|
+| `Instrumented::poll` | 577/q | 0/q | -100% |
+| `TaskIntervals::next` | 410/q | 0/q | -100% |
+| `State` waker ops | 641/q | 0/q | -100% |
+| tokio_metrics total | 1,628/q | 0/q | -100% |
+| `Histogram::observe` | 1,173/q | 802/q | -31.6% |
+| `advance_ready` self-time | 976/q | 785/q | -19.6% |
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | Baseline QPS | After QPS | Change |
+|-------------|-------------|-----------|--------|
+| 1           | 20,304      | 20,210    | -0.5% (noise) |
+| 4           | -           | 67,783    | -      |
+| 16          | -           | 209,054   | -      |
+| 64          | 301,247     | 306,579   | +1.8%  |
+| 128         | 302,721     | 306,037   | +1.1%  |
+
+Prometheus `mz_frontend_peek_seconds` avg: 2.48µs (unchanged from 2.49µs,
+as the optimization targets code outside `try_frontend_peek_cached`).
+
+The end-to-end QPS improvement is modest (+1.8% at 64c) because the
+bottleneck is TCP I/O and tokio worker scheduling, not the CPU-side
+tokio_metrics overhead. However, the optimization is significant for
+scaling: it eliminates 2.31% of total CPU, freeing cycles that would
+otherwise be wasted on instrumentation.
+
+**Profiling notes for next session:**
+
+Top remaining per-query costs at 64c (post-optimization):
+- `Histogram::observe`: 802/q — still significant, 2+ observations per
+  query (one_query timing, record_time_to_first_row)
+- `one_query` closure self-time: 1,227/q
+- `advance_ready` closure self-time: 785/q
+- `try_frontend_peek_cached` self-time: 828/q
+- malloc: 609/q
+- `get_cached_parsed_stmt`: 400/q
+- BTreeMap searches (oracle + collection): 374/q total
+- sdallocx: 335/q
+- `Codec::encode`: 361/q
+- `mpsc::Rx::pop` (timeout channel): 383/q
+
+Potential next optimizations:
+1. Reduce remaining Histogram::observe overhead (~802/q at 64c)
+2. Cache more BTreeMap lookups on PeekClient (~374/q)
+3. Reduce allocator contention (malloc 609/q + sdallocx 335/q = 944/q)
+4. Row encoding / BackendMessage send overhead
+5. Investigate `get_cached_parsed_stmt` HashMap overhead (400/q)

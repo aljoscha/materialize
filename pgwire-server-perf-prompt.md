@@ -59,17 +59,17 @@ anymore in our next sessions. Update the prompt in a separate jj change with a
 good description.
 
 Immediate next steps (handoff):
- - Remaining Histogram::observe calls (~429 samples/query at 64c): still the
-   largest single leaf function in try_frontend_peek_cached. Consider local
-   accumulation or batched flushes.
- - BTreeMap traversals (~700 samples/query total at 64c): oracle lookup,
+ - Remaining Histogram::observe calls (~802 samples/query at 64c): one_query
+   timing and record_time_to_first_row are the main remaining callers.
+   Consider local accumulation or batched flushes.
+ - BTreeMap traversals (~374 samples/query total at 64c): oracle lookup,
    collection state, etc. Consider caching more lookups on PeekClient.
- - Tokio task instrumentation overhead (~2.5% from `Instrumented<F>` wrapper on
-   all connection handlers). Consider removing or making conditional.
- - Row encoding / BackendMessage send overhead (~2,000 samples/query each at
-   64c). Investigate vectored writes or pre-encoded responses.
- - Allocator contention (malloc/sdallocx/rust_alloc ~481 samples/query at 64c).
+ - Row encoding / BackendMessage send overhead (Codec::encode ~361/q,
+   send/send_all ~500/q at 64c). Investigate vectored writes or pre-encoded
+   responses.
+ - Allocator contention (malloc 609/q + sdallocx 335/q = 944/q at 64c).
    Consider arena allocation for single-row queries.
- - Scaling plateau at 64c→128c (~304K→303K QPS) mostly resolved by inline hold
-   optimization. Remaining gap may be TCP socket contention or tokio worker
-   saturation.
+ - get_cached_parsed_stmt HashMap overhead (~400/q at 64c). Consider
+   pointer-equality fast path or per-connection LRU cache.
+ - Scaling plateau at 64c→128c (~307K→306K QPS). Remaining gap is TCP
+   socket contention or tokio worker saturation.
