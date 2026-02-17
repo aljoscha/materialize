@@ -51,6 +51,21 @@ timestamp outside its real-time bounds. A query arriving after the cached value
 was last updated would receive a stale timestamp --- one that predates its own
 start --- violating strict serializability.
 
+**Common incorrect argument to watch for:** "Using a slightly older timestamp
+just reads an earlier consistent snapshot, which is valid for linearization."
+This confuses serializability (some valid ordering exists) with *strict*
+serializability (the ordering must respect real-time). Under strict
+serializability, the linearization point must fall within the operation's
+real-time interval. A timestamp from before the query arrived places the
+linearization point before the query started --- outside its real-time bounds ---
+regardless of whether the snapshot itself is internally consistent. The
+consistency of the snapshot is not the issue; the issue is *when* it was
+determined relative to the query's arrival.
+
+This also interacts with the distributed-system invariant below: the cached
+value is local-only state, so it cannot reflect writes applied by other
+`environmentd` nodes to the shared backing oracle.
+
 ### No local-only assumptions in a distributed system
 
 Materialize is designed to run as a distributed system: multiple `environmentd`
@@ -60,3 +75,54 @@ an in-process counter and assuming no other writer exists --- is incorrect
 unless the backing store is also consulted or the invariant is otherwise
 guaranteed system-wide. Always ask: "does this still work if another node is
 running the same code against the same backing store?"
+
+### Checklist for timestamp-related changes
+
+Before modifying timestamp selection or oracle interaction, verify:
+
+1. **Real-time bounds**: Is the timestamp determined by an oracle call (or
+   equivalent) that happens *during* the query's lifetime (after arrival, before
+   response)? If the value could have been determined before the query arrived,
+   it violates strict serializability.
+
+2. **Distributed correctness**: Does this work when multiple `environmentd`
+   nodes share the same backing oracle? Any in-process cache, atomic, or counter
+   that is not synchronized through the backing store is suspect.
+
+3. **Monotonicity**: Can a caller ever observe a timestamp go backwards? Even
+   with concurrent batches or out-of-order completions?
+
+4. **Write visibility**: After `apply_write(t)` returns, will all subsequent
+   `read_ts` calls (including the fast path, if any) return `>= t`? This must
+   hold across nodes, not just within the local process.
+
+## Rejected Optimizations
+
+This section records specific optimizations that have been attempted and found
+incorrect. If you find yourself re-proposing one of these, treat it as a strong
+signal that the approach is wrong.
+
+### Shared-atomic `read_ts` cache (`peek_read_ts_fast`)
+
+**What:** Add an `Arc<AtomicU64>` to `BatchingTimestampOracle` holding the most
+recently observed `read_ts`. Return it from a new `peek_read_ts_fast()` trait
+method, bypassing the ticket/watch/CRDB round-trip for 99%+ of reads.
+
+**Why it's wrong:**
+- Violates real-time bounds (§ "Why caching an oracle result is not correct"):
+  the atomic holds a value from a *previous* oracle call. A query arriving after
+  that call completed receives a timestamp from before its own start.
+- Violates distributed correctness (§ "No local-only assumptions"): another
+  `environmentd` node can `apply_write` to CRDB, advancing the global read
+  timestamp. The local atomic has no way to learn about this, so it returns a
+  stale timestamp that predates a write already visible to other nodes.
+- The safety argument ("reading an earlier snapshot is valid for linearization")
+  confuses serializability with strict serializability. See the detailed rebuttal
+  in § "Why caching an oracle result is not correct."
+
+**Performance context:** This optimization delivered ~5x throughput improvement
+at low concurrency by eliminating oracle round-trips. The performance need is
+real, but the solution must maintain strict serializability. Correct alternatives
+might include: reducing oracle round-trip latency, colocating the oracle,
+using the batching oracle's existing mechanism to serve more callers per batch,
+or relaxing the isolation level for queries that opt in.
