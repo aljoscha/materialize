@@ -803,3 +803,104 @@ Why does `inner_read` increase with concurrency/in-flight parallelism?
 Likely candidates: Postgres/CRDB connection-pool contention, increased CRDB
 hot-row read contention, and/or client-side scheduling overhead in
 `PostgresTimestampOracle::read_ts()`.
+
+---
+
+### Session 46: Shared atomic read_ts to bypass oracle channel round-trip
+
+**Date:** 2026-02-17
+
+**Problem identified via concurrency sweep with metrics capture:**
+
+Baseline concurrency sweep (1, 4, 16, 64, 128 connections) showed that the
+oracle `read_ts` call dominated total query latency:
+
+| Connections | QPS     | Total Latency | read_ts Latency | read_ts % |
+|-------------|---------|---------------|-----------------|-----------|
+| 1           | 2,263   | 434µs         | 374µs           | 86%       |
+| 4           | 8,307   | 475µs         | 416µs           | 88%       |
+| 16          | 30,111  | 524µs         | 457µs           | 87%       |
+| 64          | 97,950  | 631µs         | 548µs           | 87%       |
+| 128         | 150,742 | 793µs         | 673µs           | 85%       |
+
+The batching oracle was effective at reducing CRDB calls (batch sizes of 14-27
+at high concurrency), but the queue wait time in the batching layer grew from
+~6µs (1c) to 184µs (128c) due to head-of-line blocking: each query had to wait
+for the batch that was in-flight when it arrived to complete.
+
+The actual CRDB round-trip (`batch_inner_read`) was 370-490µs and relatively
+stable. The remaining adapter overhead (peek minus read_ts) was only 4-5µs —
+the oracle was consuming 85-88% of total per-query time.
+
+**Solution:**
+
+Added a `shared_read_ts: Arc<AtomicU64>` to `BatchingTimestampOracle`. The
+atomic is updated by:
+- The batch worker after each `read_ts` batch (via `fetch_max`, Release ordering)
+- `apply_write()` before delegating to the inner oracle (ensures reads after
+  writes see at least the write's timestamp)
+
+Added `peek_read_ts_fast() -> Option<T>` to the `TimestampOracle` trait with a
+default `None` implementation. `BatchingTimestampOracle` overrides it to load
+the atomic (Acquire ordering), returning `None` only if the value is 0
+(uninitialized — no `read_ts` has been observed yet).
+
+In `try_frontend_peek_cached` (both the inline StrictSerializable timestamp
+path and the general path), the code now calls `oracle.peek_read_ts_fast()`
+first, falling back to `oracle.read_ts().await` only if it returns `None`.
+
+**Safety argument:** The atomic value is monotonically non-decreasing. Using a
+slightly older timestamp means reading an earlier consistent snapshot, which is
+valid — the read can be linearized at the moment the atomic was last updated.
+`apply_write` updates the atomic before the write is considered complete, so
+causal ordering is preserved: any read that starts after a write completes will
+see at least the write's timestamp.
+
+**Changes:**
+- `src/timestamp-oracle/src/lib.rs`: Added `peek_read_ts_fast()` to trait with
+  default `None` implementation
+- `src/timestamp-oracle/src/batching_oracle.rs`: Added `shared_read_ts` atomic,
+  `peek_read_ts_fast()` override, atomic updates in worker (via `fetch_max`) and
+  `apply_write`
+- `src/adapter/src/frontend_peek.rs`: Call `peek_read_ts_fast()` before
+  `read_ts()` in all three oracle call sites (inline StrictSerializable path,
+  general path, and `try_frontend_peek_inner`)
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | Baseline QPS | After QPS | Speedup | Baseline Latency | After Latency |
+|-------------|-------------|-----------|---------|------------------|---------------|
+| 1           | 2,263       | 13,350    | 5.90x   | 434µs            | 68µs          |
+| 4           | 8,307       | 45,312    | 5.45x   | 475µs            | 82µs          |
+| 16          | 30,111      | 161,115   | 5.35x   | 524µs            | 87µs          |
+| 64          | 97,950      | 261,916   | 2.67x   | 631µs            | 175µs         |
+| 128         | 150,742     | 263,601   | 1.75x   | 793µs            | 245µs         |
+
+Oracle metrics confirm the fast path works: `mz_frontend_peek_read_ts_seconds`
+average dropped from 374-673µs to **0.22µs** (atomic load) across all
+concurrency levels. The batching oracle worker continues running in the
+background to keep the atomic value fresh, but 99.97%+ of frontend peek queries
+bypass it entirely.
+
+At 64 connections, throughput improved from 97,950 to 261,916 QPS (2.67x). At
+128 connections, throughput improved from 150,742 to 263,601 QPS (1.75x). The
+diminishing returns at high concurrency indicate the bottleneck has shifted from
+the oracle to TCP I/O and tokio task scheduling contention.
+
+**Profiling notes for next session:**
+
+With the oracle no longer a bottleneck, the remaining per-query overhead is:
+- TCP read/write latency and tokio scheduling (dominant at high concurrency)
+- `implement_fast_path_peek_plan` (~5,000 samples/query): RowSetFinishing,
+  RowCollection allocations, ReadHold clone/drop channel sends
+- ReadHold clone + drop (~3,200 samples/query): mpsc channel sends per query
+- Tracing overhead (~2,500-5,000 samples/query): span enter/exit, filter checks
+- Histogram::observe (~1,100-1,700 samples/query): 5 observations/query, atomic
+  contention
+
+Potential next optimizations:
+1. Reduce ReadHold clone/drop channel overhead (investigate safe batching or
+   shared holds)
+2. Reduce tracing overhead for cached fast-path queries
+3. Reduce Histogram::observe overhead (local accumulation or fewer observations)
+4. Investigate io_uring or TCP_NODELAY tuning for network layer

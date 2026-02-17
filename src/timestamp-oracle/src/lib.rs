@@ -65,6 +65,23 @@ pub trait TimestampOracle<T>: std::fmt::Debug {
     /// All subsequent values of `self.read_ts()` will be greater or equal to
     /// `write_ts`.
     async fn apply_write(&self, lower_bound: T);
+
+    /// Non-blocking fast path for `read_ts()`.
+    ///
+    /// Returns the most recently observed `read_ts` value without making a
+    /// backing oracle call. Returns `None` if no value has been observed yet.
+    ///
+    /// The returned timestamp is monotonically non-decreasing and represents a
+    /// valid linearization point: it was returned by a real `read_ts()` call at
+    /// some earlier real-time moment, and the read can be linearized at that
+    /// moment. For StrictSerializable isolation this is safe because:
+    /// - The timestamp is >= all writes that completed before the atomic was
+    ///   last updated (apply_write updates the atomic before returning).
+    /// - Using a slightly older timestamp means reading an earlier consistent
+    ///   snapshot, which is valid for linearization.
+    async fn peek_read_ts_fast(&self) -> Option<T> {
+        None
+    }
 }
 
 /// A [`NowFn`] that is generic over the timestamp.

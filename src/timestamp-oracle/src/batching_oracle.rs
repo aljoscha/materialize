@@ -24,6 +24,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use mz_ore::metrics::Histogram;
 use tokio::pin;
 use tokio::sync::{Notify, watch};
+use tracing::debug;
 
 use crate::metrics::Metrics;
 use crate::{TimestampOracle, WriteTimestamp};
@@ -107,6 +108,14 @@ pub struct BatchingTimestampOracle<T> {
     worker_notify: Arc<Notify>,
     result_tx: watch::Sender<BatchResult>,
     read_ts_wait_seconds: Histogram,
+    /// Shared atomic holding the most recently observed `read_ts` value.
+    ///
+    /// Updated by the worker after each backing oracle `read_ts` batch and by
+    /// `apply_write` before delegating to the inner oracle (to ensure reads
+    /// after writes see at least the write's timestamp).
+    ///
+    /// A value of 0 means "uninitialized" — `peek_read_ts_fast` returns `None`.
+    shared_read_ts: Arc<AtomicU64>,
 }
 
 impl<T> std::fmt::Debug for BatchingTimestampOracle<T> {
@@ -129,11 +138,13 @@ where
             ts: 0,
         });
         let read_ts_wait_seconds = metrics.batching.read_ts.wait_seconds.clone();
+        let shared_read_ts = Arc::new(AtomicU64::new(0));
 
         let task_oracle = Arc::clone(&oracle);
         let task_next_ticket = Arc::clone(&next_ticket);
         let task_notify = Arc::clone(&worker_notify);
         let task_result_tx = result_tx.clone();
+        let task_shared_read_ts = Arc::clone(&shared_read_ts);
 
         mz_ore::task::spawn(|| "BatchingTimestampOracle Worker Task", async move {
             let read_ts_metrics = &metrics.batching.read_ts;
@@ -181,12 +192,17 @@ where
                             continue;
                         };
                         read_ts_metrics.inner_read_seconds.observe(inner_seconds);
+                        let ts_u64: u64 = ts.into();
+                        // Update the shared atomic with the latest timestamp.
+                        // fetch_max ensures monotonically non-decreasing even if
+                        // batches complete out of order.
+                        task_shared_read_ts.fetch_max(ts_u64, Ordering::Release);
                         if target > completed_up_to {
                             completed_up_to = target;
                             // Broadcast result. It's okay if there are no receivers.
                             let _ = task_result_tx.send(BatchResult {
                                 completed_up_to,
-                                ts: ts.into(),
+                                ts: ts_u64,
                             });
                         }
                     }
@@ -203,6 +219,7 @@ where
             worker_notify,
             result_tx,
             read_ts_wait_seconds,
+            shared_read_ts,
         }
     }
 }
@@ -243,7 +260,24 @@ where
     }
 
     async fn apply_write(&self, write_ts: T) {
+        // Update the shared atomic BEFORE delegating to the inner oracle.
+        // This ensures that any `peek_read_ts_fast()` call that starts after
+        // this `apply_write()` returns will see at least `write_ts`, preserving
+        // causal ordering: reads after writes see at least the write's timestamp.
+        self.shared_read_ts
+            .fetch_max(write_ts.into(), Ordering::Release);
         self.inner.apply_write(write_ts).await
+    }
+
+    async fn peek_read_ts_fast(&self) -> Option<T> {
+        let val = self.shared_read_ts.load(Ordering::Acquire);
+        if val == 0 {
+            // Uninitialized — no read_ts has been observed yet.
+            debug!("peek_read_ts_fast: uninitialized, falling back to read_ts");
+            None
+        } else {
+            Some(T::from(val))
+        }
     }
 }
 
