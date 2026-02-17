@@ -1251,6 +1251,12 @@ impl Coordinator {
                     prev.is_none(),
                     "connections should have at most one lock guard"
                 );
+                // Even if this statement ends up with no `TransactionOps` (e.g.
+                // implicit single-statement DDL), transaction end must still go
+                // through coordinator cleanup to release this lock.
+                ctx.session_mut()
+                    .transaction_mut()
+                    .require_coordinator_end();
             } else {
                 if self
                     .active_conns

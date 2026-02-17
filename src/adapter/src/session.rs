@@ -409,6 +409,7 @@ impl<T: TimestampManipulation> Session<T> {
                     write_lock_guards: None,
                     access,
                     id,
+                    requires_coordinator_end: false,
                 });
             }
             TransactionStatus::Started(mut txn)
@@ -442,6 +443,7 @@ impl<T: TimestampManipulation> Session<T> {
                 write_lock_guards: None,
                 access: None,
                 id,
+                requires_coordinator_end: false,
             };
             match stmts {
                 1 => self.transaction = TransactionStatus::Started(txn),
@@ -620,6 +622,7 @@ impl<T: TimestampManipulation> Session<T> {
                 write_lock_guards: _,
                 access: _,
                 id: _,
+                requires_coordinator_end: _,
             }) => Some(determination.clone()),
             _ => None,
         }
@@ -641,6 +644,7 @@ impl<T: TimestampManipulation> Session<T> {
                 write_lock_guards: _,
                 access: _,
                 id: _,
+                requires_coordinator_end: _,
             })
         )
     }
@@ -1190,12 +1194,25 @@ impl<T: TimestampManipulation> TransactionStatus<T> {
             TransactionStatus::Started(txn)
             | TransactionStatus::InTransaction(txn)
             | TransactionStatus::InTransactionImplicit(txn)
-            | TransactionStatus::Failed(txn) => matches!(
-                txn.ops,
-                TransactionOps::Writes(_)
-                    | TransactionOps::SingleStatement { .. }
-                    | TransactionOps::DDL { .. }
-            ),
+            | TransactionStatus::Failed(txn) => {
+                txn.requires_coordinator_end
+                    || matches!(
+                        txn.ops,
+                        TransactionOps::Writes(_)
+                            | TransactionOps::SingleStatement { .. }
+                            | TransactionOps::DDL { .. }
+                    )
+            }
+        }
+    }
+
+    /// Marks this transaction as requiring coordinator cleanup at end.
+    ///
+    /// This is used for coordinator-side state (e.g. DDL serialization lock ownership)
+    /// that is not represented in `TransactionOps`.
+    pub fn require_coordinator_end(&mut self) {
+        if let Some(txn) = self.inner_mut() {
+            txn.requires_coordinator_end = true;
         }
     }
 
@@ -1498,6 +1515,8 @@ pub struct Transaction<T> {
     write_lock_guards: Option<WriteLocks>,
     /// Access mode (read only, read write).
     access: Option<TransactionAccessMode>,
+    /// Whether ending this transaction must go through coordinator cleanup.
+    requires_coordinator_end: bool,
 }
 
 impl<T> Transaction<T> {
