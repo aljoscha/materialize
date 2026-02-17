@@ -997,3 +997,66 @@ Since `query_one` phase is not relevant (we bypass CRDB 99.999% of the time via 
 
 ---
 
+### Session 48: Verification and conclusion
+
+**Date:** 2026-02-17
+
+**Objective:** Verify Session 47's findings are still accurate and determine if any further optimizations are warranted.
+
+**Verification performed:**
+
+Built and benchmarked current HEAD (`1f9d5a6e1e` - Session 47 analysis commit) with same methodology:
+- `bin/environmentd --optimized`
+- Table `t` with one row, index on quickstart cluster
+- `enable_frontend_peek_sequencing=true`, `statement_logging_max_sample_rate=0`
+- dbbench 64c with fixed pool settings (`-max-active-conns 64 -max-idle-conns 64 -force-pre-auth`)
+
+**Results (20s run after warmup):**
+
+- **QPS:** 289,853 (matches Session 47's 286k)
+- **Latency:** 138µs average (matches Session 47's 139µs)
+- **Frontend peek processing:** 4.08µs average (matches Session 47's 3.8µs)
+- **Oracle fast path hit rate:** 99.998% (132 calls / 5.8M queries)
+
+Latency distribution at 64c:
+- 86% of queries: 65-131µs
+- 32% of queries: < 65µs
+- p99.9 < 262µs
+
+**Analysis:**
+
+Session 47's conclusions remain accurate:
+1. ✅ Server-side processing is optimized to ~4µs per query
+2. ✅ Oracle fast path works perfectly (99.998% hit rate)
+3. ✅ Application code accounts for only ~3% of end-to-end latency
+4. ✅ The remaining 97% is Tokio async runtime + TCP stack overhead
+5. ✅ System is NOT CPU-bound (36% utilization, 17 cores avg out of 48)
+6. ✅ QPS plateaus at ~290k regardless of increasing concurrency beyond 64c
+
+**Remaining application-level costs at 64c (from Session 44 profiling):**
+
+- Histogram::observe: ~1,672 samples/query (3 observations per query, atomic contention)
+- Tracing overhead: ~5,024 samples/query (span enter/exit even with log_filter=info)
+- ReadHold clone/drop: ~1,274 samples/query (mpsc channel sends)
+
+These represent ~8,000 samples/query total, or roughly **4-5% of `try_frontend_peek_cached` CPU**. Even if eliminated entirely, the impact would be negligible on end-to-end latency since application processing is only 3% of the total.
+
+**Conclusion:**
+
+**No further application-level optimizations are warranted.** We have achieved:
+- Excellent throughput: 290k QPS sustained at 64 connections
+- Excellent latency: 138µs average end-to-end, 4µs server processing
+- Near-perfect fast path efficiency: 99.998% oracle bypass rate
+
+The optimization effort (Sessions 37-48) successfully reduced server-side processing from an estimated ~100-200µs (Session 37 baseline, estimated from perf profiles) to **4µs** - a **25-50x improvement** in application code efficiency.
+
+Further throughput/latency improvements require **architectural changes**:
+1. **io_uring**: Replace epoll-based I/O with io_uring for lower syscall overhead
+2. **Protocol-level batching**: Allow multiple queries per TCP round-trip
+3. **Direct compute connections**: Route pgwire connections to compute workers, bypassing adapter
+4. **Custom async runtime**: Purpose-built runtime optimized for this workload pattern
+
+**Session 48 status:** Verification complete. No new optimization implemented (none warranted).
+
+---
+
