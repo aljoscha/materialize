@@ -27,8 +27,8 @@ use mz_adapter::session::{
 };
 use mz_adapter::statement_logging::{StatementEndedExecutionReason, StatementExecutionStrategy};
 use mz_adapter::{
-    AdapterError, AdapterNotice, ExecuteContextGuard, ExecuteResponse, PeekResponseUnary, metrics,
-    verify_datum_desc,
+    AdapterError, AdapterNotice, ExecuteContextGuard, ExecuteResponse, PeekResponseUnary,
+    PlanCacheEntry, metrics, verify_datum_desc,
 };
 use mz_auth::password::Password;
 use mz_authenticator::Authenticator;
@@ -1171,6 +1171,7 @@ where
         stmt: Arc<Statement<Raw>>,
         sql: String,
         lifecycle_timestamps: LifecycleTimestamps,
+        cached_entry: Option<Arc<PlanCacheEntry>>,
     ) -> Result<State, io::Error> {
         // Fast path: for plan-cached queries, bypass declare/portal/remove_portal
         // entirely and go directly to the cached peek execution. This avoids
@@ -1178,7 +1179,7 @@ where
         // overhead, and catalog_snapshot_local per query.
         match self
             .adapter_client
-            .try_cached_peek_direct(&sql, &stmt, lifecycle_timestamps.clone())
+            .try_cached_peek_direct(&sql, &stmt, lifecycle_timestamps.clone(), cached_entry)
             .await
         {
             Ok(Some((response, relation_desc))) => {
@@ -1416,10 +1417,13 @@ where
         // Fast path: if the plan cache has this SQL, skip parsing entirely
         // and reuse the cached parsed statement as Arc to avoid deep-cloning
         // the AST. On cache miss, wrap freshly parsed stmts in Arc (once).
-        let cached_stmt = self.adapter_client.get_cached_parsed_stmt(&sql);
+        // We fetch the full PlanCacheEntry so we can pass it to one_query(),
+        // avoiding a second HashMap lookup in try_cached_peek_direct().
+        let cached_entry = self.adapter_client.get_cached_plan_entry(&sql);
 
-        let (num_stmts, stmt_sql_pairs) = if let Some(stmt) = cached_stmt {
-            (1, vec![(stmt, sql)])
+        let (num_stmts, stmt_sql_pairs, cached_entry) = if let Some(entry) = cached_entry {
+            let stmt = Arc::clone(&entry.parsed_stmt);
+            (1, vec![(stmt, sql)], Some(entry))
         } else {
             // Parse first before doing any transaction checking.
             match self.parse_sql(&sql) {
@@ -1429,7 +1433,7 @@ where
                         .into_iter()
                         .map(|r| (Arc::new(r.ast), r.sql.to_string()))
                         .collect::<Vec<_>>();
-                    (num, pairs)
+                    (num, pairs, None)
                 }
                 Err(err) => {
                     self.error(err).await?;
@@ -1456,7 +1460,7 @@ where
             self.ensure_transaction(num_stmts, "query").await?;
 
             match self
-                .one_query(stmt, sql, LifecycleTimestamps { received })
+                .one_query(stmt, sql, LifecycleTimestamps { received }, cached_entry.clone())
                 .await?
             {
                 State::Ready => (),

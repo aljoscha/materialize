@@ -67,7 +67,10 @@ use crate::session::{
 use crate::statement_logging::{StatementEndedExecutionReason, StatementExecutionStrategy};
 use crate::telemetry::{self, EventDetails, SegmentClientExt, StatementFailureType};
 use crate::webhook::AppendWebhookResponse;
-use crate::{AdapterNotice, AppendWebhookError, PeekClient, PeekResponseUnary, StartupResponse};
+use crate::{
+    AdapterNotice, AppendWebhookError, PeekClient, PeekResponseUnary, PlanCacheEntry,
+    StartupResponse,
+};
 
 /// A handle to a running coordinator.
 ///
@@ -1200,13 +1203,14 @@ impl SessionClient {
         &mut self.peek_client
     }
 
-    /// Returns the cached parsed statement for the given SQL, if it exists in the plan cache.
-    /// Used by the pgwire layer to skip SQL parsing on plan cache hits.
-    pub fn get_cached_parsed_stmt(&self, sql: &str) -> Option<Arc<Statement<Raw>>> {
+    /// Returns the cached plan entry for the given SQL, if it exists in the plan cache.
+    /// Used by the pgwire layer to skip SQL parsing on plan cache hits and to pass
+    /// the entry through to `try_cached_peek_direct` to avoid a second HashMap lookup.
+    pub fn get_cached_plan_entry(&self, sql: &str) -> Option<Arc<PlanCacheEntry>> {
         self.peek_client
             .plan_cache
             .get(sql as &str)
-            .map(|entry| Arc::clone(&entry.parsed_stmt))
+            .map(|entry| Arc::clone(entry))
     }
 
     /// Fast path for plan-cached queries that bypasses declare/set_portal/remove_portal.
@@ -1215,20 +1219,28 @@ impl SessionClient {
     /// (which clones StatementDesc, inserts into BTreeMap portal, mints logging, etc.) and
     /// go directly to the cached peek execution.
     ///
+    /// If `cached_entry` is provided, skips the HashMap lookup (already done by the caller).
+    ///
     /// Returns `Ok(Some((response, relation_desc)))` if handled, `Ok(None)` to fall back.
     pub async fn try_cached_peek_direct(
         &mut self,
         sql: &str,
         stmt: &Arc<Statement<Raw>>,
         lifecycle_timestamps: LifecycleTimestamps,
+        cached_entry: Option<Arc<PlanCacheEntry>>,
     ) -> Result<Option<(ExecuteResponse, Option<Arc<RelationDesc>>)>, AdapterError> {
         if !self.enable_frontend_peek_sequencing {
             return Ok(None);
         }
-        let sql_key: Arc<str> = Arc::from(sql);
-        let cached = match self.peek_client.plan_cache.get(&sql_key) {
-            Some(cached) => Arc::clone(&cached),
-            None => return Ok(None),
+        let cached = match cached_entry {
+            Some(entry) => entry,
+            None => {
+                // Fallback: look up the plan cache if no pre-fetched entry was provided.
+                match self.peek_client.plan_cache.get(sql as &str) {
+                    Some(cached) => Arc::clone(cached),
+                    None => return Ok(None),
+                }
+            }
         };
         // Use Arc::clone instead of deep-cloning the RelationDesc.
         // The desc is only used by reference downstream (RowDescription encoding,
