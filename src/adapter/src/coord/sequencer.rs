@@ -919,7 +919,7 @@ impl Coordinator {
                 RowCollection::new(plan.returning, &finishing.order_by),
                 plan.max_result_size,
                 Some(max_returned_query_size),
-                duration_histogram,
+                Some(duration_histogram),
             ) {
                 Ok((rows, _size_bytes)) => Ok(Self::send_immediate_rows(rows)),
                 Err(e) => Err(AdapterError::ResultSize(e)),

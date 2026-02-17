@@ -128,25 +128,24 @@ impl PeekClient {
             }
         };
 
-        let peek_start = Instant::now();
-
         let result = self
             .try_frontend_peek_cached(session, catalog, cached, statement_logging_id)
             .await;
 
         // Log end of execution (mirrors try_frontend_peek).
+        // Note: we skip the peek_outer_histogram observe here because
+        // try_frontend_peek_cached already observes peek_cached_histogram,
+        // which covers the same timing window. The outer observe was
+        // redundant and its atomic contention cost (~570 samples/query at
+        // 64c) exceeded its diagnostic value.
         if let Some(logging_id) = statement_logging_id {
             let reason = match &result {
                 Ok(Some(ExecuteResponse::SendingRowsStreaming { .. })) => {
-                    self.peek_outer_histogram()
-                        .observe(peek_start.elapsed().as_secs_f64());
                     return result;
                 }
                 Ok(Some(resp @ ExecuteResponse::CopyTo { resp: inner, .. })) => {
                     match inner.as_ref() {
                         ExecuteResponse::SendingRowsStreaming { .. } => {
-                            self.peek_outer_histogram()
-                                .observe(peek_start.elapsed().as_secs_f64());
                             return result;
                         }
                         _ => resp.into(),
@@ -163,8 +162,6 @@ impl PeekClient {
                                 .to_string(),
                         },
                     );
-                    self.peek_outer_histogram()
-                        .observe(peek_start.elapsed().as_secs_f64());
                     return result;
                 }
                 Ok(Some(resp)) => resp.into(),
@@ -175,8 +172,6 @@ impl PeekClient {
             self.log_ended_execution(logging_id, reason);
         }
 
-        self.peek_outer_histogram()
-            .observe(peek_start.elapsed().as_secs_f64());
         result
     }
 
@@ -1520,7 +1515,7 @@ impl PeekClient {
                             result_desc,
                             max_result_size,
                             max_query_result_size,
-                            row_set_finishing_seconds,
+                            Some(row_set_finishing_seconds),
                             target_hold,
                             peek_stash_read_batch_size_bytes,
                             peek_stash_read_memory_budget_bytes,
@@ -1899,7 +1894,6 @@ impl PeekClient {
                 match timeline {
                     Some(timeline) => {
                         let oracle = self.ensure_oracle(timeline).await?;
-                        let read_ts_start = Instant::now();
                         // Fast path: read the shared atomic timestamp.
                         // This avoids the ticket/watch/CRDB round-trip entirely.
                         // Falls back to the full read_ts() if uninitialized.
@@ -1907,9 +1901,11 @@ impl PeekClient {
                             Some(ts) => ts,
                             None => oracle.read_ts().await,
                         };
-                        self.metrics()
-                            .frontend_peek_read_ts_seconds
-                            .observe(read_ts_start.elapsed().as_secs_f64());
+                        // Skip frontend_peek_read_ts_seconds observe: the atomic
+                        // fast path takes ~0.2µs, making the histogram observe
+                        // overhead (3 atomic ops) more expensive than the operation
+                        // it measures. The metric remains populated by the fallback
+                        // path and the non-cached code paths.
                         Some(ts)
                     }
                     None => None,
@@ -2194,12 +2190,13 @@ impl PeekClient {
                     }
                 }
 
-                let row_set_finishing_seconds =
-                    session.metrics().row_set_finishing_seconds().clone();
-
                 let (peek_stash_read_batch_size_bytes, peek_stash_read_memory_budget_bytes) =
                     self.peek_stash_handles(catalog.system_config().dyncfgs());
 
+                // Skip row_set_finishing_seconds observe on the cached fast
+                // path: for single-row results the histogram observe overhead
+                // (3 atomic ops) exceeds the finishing work itself. The
+                // peek_cached_histogram already captures end-to-end timing.
                 self.implement_fast_path_peek_plan(
                     fast_path_plan,
                     determination.timestamp_context.timestamp_or_default(),
@@ -2209,7 +2206,7 @@ impl PeekClient {
                     result_desc,
                     max_result_size,
                     max_query_result_size,
-                    row_set_finishing_seconds,
+                    None, // skip row_set_finishing_seconds observe
                     target_read_hold,
                     peek_stash_read_batch_size_bytes,
                     peek_stash_read_memory_budget_bytes,

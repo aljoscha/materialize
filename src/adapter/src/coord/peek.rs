@@ -680,7 +680,7 @@ impl crate::coord::Coordinator {
                 row_collection,
                 max_result_size,
                 max_returned_query_size,
-                &duration_histogram,
+                Some(&duration_histogram),
             ) {
                 Ok((rows, row_size_bytes)) => {
                     let result_size = u64::cast_from(row_size_bytes);
@@ -874,7 +874,7 @@ impl crate::coord::Coordinator {
             finishing,
             max_result_size,
             max_returned_query_size,
-            duration_histogram,
+            Some(duration_histogram),
             persist_client,
             peek_stash_read_batch_size_bytes,
             peek_stash_read_memory_budget_bytes,
@@ -896,7 +896,7 @@ impl crate::coord::Coordinator {
         finishing: RowSetFinishing,
         max_result_size: u64,
         max_returned_query_size: Option<u64>,
-        duration_histogram: prometheus::Histogram,
+        duration_histogram: Option<prometheus::Histogram>,
         mut persist_client: mz_persist_client::PersistClient,
         peek_stash_read_batch_size_bytes: usize,
         peek_stash_read_memory_budget_bytes: usize,
@@ -918,7 +918,7 @@ impl crate::coord::Coordinator {
                         rows,
                         max_result_size,
                         max_returned_query_size,
-                        &duration_histogram,
+                        duration_histogram.as_ref(),
                     ) {
                         Ok((rows, _size_bytes)) => yield PeekResponseUnary::Rows(Box::new(rows)),
                         Err(e) => yield PeekResponseUnary::Error(e),
@@ -1071,7 +1071,7 @@ impl crate::coord::Coordinator {
                         let result_rows = incremental_finishing.finish_incremental(
                             rows,
                             max_result_size,
-                            &duration_histogram,
+                            duration_histogram.as_ref(),
                         );
 
                         match result_rows {

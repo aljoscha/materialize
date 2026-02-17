@@ -1068,7 +1068,17 @@ where
         // only a few message types seem useful.
         let message_name = message.as_ref().map(|m| m.name()).unwrap_or_default();
 
-        let start = message.as_ref().map(|_| Instant::now());
+        // Skip Instant::now() for Query messages: query-level metrics
+        // (frontend_peek_seconds, parse_seconds) already provide timing.
+        // The message_processing_seconds observe costs ~486 samples/query
+        // at 64c due to atomic contention, which is pure overhead for
+        // queries that have their own dedicated timing.
+        let is_query_message = matches!(message, Some(FrontendMessage::Query { .. }));
+        let start = if is_query_message {
+            None
+        } else {
+            message.as_ref().map(|_| Instant::now())
+        };
         let next_state = match message {
             Some(FrontendMessage::Query { sql }) => {
                 self.query(sql, received).await?

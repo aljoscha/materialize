@@ -468,7 +468,7 @@ impl PeekClient {
         result_desc: Arc<RelationDesc>,
         max_result_size: u64,
         max_returned_query_size: Option<u64>,
-        row_set_finishing_seconds: Histogram,
+        row_set_finishing_seconds: Option<Histogram>,
         target_read_hold: Option<ReadHold<Timestamp>>,
         peek_stash_read_batch_size_bytes: usize,
         peek_stash_read_memory_budget_bytes: usize,
@@ -522,7 +522,7 @@ impl PeekClient {
                 row_collection,
                 max_result_size,
                 max_returned_query_size,
-                &row_set_finishing_seconds,
+                row_set_finishing_seconds.as_ref(),
             ) {
                 Ok((rows, _bytes)) => Ok(Coordinator::send_immediate_rows(rows)),
                 // TODO(peek-seq): make this a structured error. (also in the old sequencing)
@@ -544,7 +544,7 @@ impl PeekClient {
                     row_collection,
                     max_result_size,
                     max_returned_query_size,
-                    &row_set_finishing_seconds,
+                    row_set_finishing_seconds.as_ref(),
                 ) {
                     Ok((rows, _bytes)) => {
                         let row_iter = Box::new(mz_repr::IntoRowIterator::into_row_iter(rows));

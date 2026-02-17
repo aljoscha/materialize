@@ -3692,14 +3692,16 @@ impl RowSetFinishing {
         rows: RowCollection,
         max_result_size: u64,
         max_returned_query_size: Option<u64>,
-        duration_histogram: &Histogram,
+        duration_histogram: Option<&Histogram>,
     ) -> Result<(SortedRowCollectionIter, usize), String> {
-        let now = Instant::now();
-        let result = self.finish_inner(rows, max_result_size, max_returned_query_size);
-        let duration = now.elapsed();
-        duration_histogram.observe(duration.as_secs_f64());
-
-        result
+        if let Some(h) = duration_histogram {
+            let now = Instant::now();
+            let result = self.finish_inner(rows, max_result_size, max_returned_query_size);
+            h.observe(now.elapsed().as_secs_f64());
+            result
+        } else {
+            self.finish_inner(rows, max_result_size, max_returned_query_size)
+        }
     }
 
     /// Implementation for [`RowSetFinishing::finish`].
@@ -3826,14 +3828,16 @@ impl RowSetFinishingIncremental {
         &mut self,
         rows: RowCollection,
         max_result_size: u64,
-        duration_histogram: &Histogram,
+        duration_histogram: Option<&Histogram>,
     ) -> Result<SortedRowCollectionIter, String> {
-        let now = Instant::now();
-        let result = self.finish_incremental_inner(rows, max_result_size);
-        let duration = now.elapsed();
-        duration_histogram.observe(duration.as_secs_f64());
-
-        result
+        if let Some(h) = duration_histogram {
+            let now = Instant::now();
+            let result = self.finish_incremental_inner(rows, max_result_size);
+            h.observe(now.elapsed().as_secs_f64());
+            result
+        } else {
+            self.finish_incremental_inner(rows, max_result_size)
+        }
     }
 
     fn finish_incremental_inner(
