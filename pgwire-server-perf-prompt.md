@@ -69,7 +69,5 @@ Immediate next steps (handoff):
    responses.
  - Allocator contention (malloc 609/q + sdallocx 335/q = 944/q at 64c).
    Consider arena allocation for single-row queries.
- - get_cached_parsed_stmt HashMap overhead (~400/q at 64c). Consider
-   pointer-equality fast path or per-connection LRU cache.
  - Scaling plateau at 64c→128c (~307K→306K QPS). Remaining gap is TCP
    socket contention or tokio worker saturation.

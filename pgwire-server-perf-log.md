@@ -1300,3 +1300,74 @@ Potential next optimizations:
 3. Reduce allocator contention (malloc 609/q + sdallocx 335/q = 944/q)
 4. Row encoding / BackendMessage send overhead
 5. Investigate `get_cached_parsed_stmt` HashMap overhead (400/q)
+
+## Session 49: Eliminate duplicate plan cache HashMap lookup
+
+**Goal:** Remove the redundant second plan cache `HashMap::get` per query.
+On the cached query fast path, two separate HashMap lookups were performed
+for the same SQL key:
+
+1. `get_cached_parsed_stmt(&sql)` in `query()` — to skip SQL parsing
+2. `plan_cache.get(&sql_key)` in `try_cached_peek_direct()` — to get the
+   full `PlanCacheEntry` for execution
+
+Additionally, the second lookup allocated `Arc::from(sql)` to create the
+HashMap key, which is an unnecessary heap allocation + memcpy.
+
+### Changes
+
+- Renamed `get_cached_parsed_stmt` → `get_cached_plan_entry` to return
+  the full `Arc<PlanCacheEntry>` instead of just the parsed statement.
+- Added `cached_entry: Option<Arc<PlanCacheEntry>>` parameter to
+  `try_cached_peek_direct()` so the caller can pass the pre-fetched entry.
+- Updated `query()` to extract `parsed_stmt` from the entry and pass the
+  entry through to `one_query()` → `try_cached_peek_direct()`.
+- When `cached_entry` is `Some`, the second HashMap lookup and
+  `Arc::from(sql)` allocation are skipped entirely.
+
+**Files changed:**
+- `src/adapter/src/client.rs` — `get_cached_plan_entry()`, `try_cached_peek_direct()`
+- `src/pgwire/src/protocol.rs` — `query()`, `one_query()` signatures and call sites
+
+### Profiling results
+
+CPU proportion comparison (perf at 64c, `--call-graph fp`):
+
+| Function | Before | After | Change |
+|---|---|---|---|
+| `get_cached_parsed_stmt` / `get_cached_plan_entry` (leaf) | 0.601% | 0.399% | -33.6% |
+| `try_cached_peek_direct` (leaf) | 0.102% | 0.105% | ~unchanged |
+| `one_query` (inclusive) | 26.145% | 25.503% | -0.642% |
+
+### Results (dbbench, SELECT * FROM t, 20s duration)
+
+| Connections | Baseline QPS | After QPS | Change |
+|-------------|-------------|-----------|--------|
+| 1           | 20,210      | 20,469    | +1.3% (noise) |
+| 64          | 306,579     | ~305,000  | ~0% (noise) |
+| 128         | 306,037     | 302,726   | ~0% (noise) |
+
+The optimization saves ~0.2% of total CPU by eliminating one HashMap
+hash+compare and one `Arc::from(sql)` heap allocation per query. The QPS
+impact is within measurement noise at current bottleneck levels (TCP I/O,
+tokio scheduling). The change is a clean code improvement that reduces
+redundant work on the hot path.
+
+**Profiling notes for next session:**
+
+Top remaining per-query costs at 64c (post-optimization, unchanged):
+- `Histogram::observe`: 802/q
+- `one_query` closure self-time: 1,227/q
+- `advance_ready` closure self-time: 785/q
+- `try_frontend_peek_cached` self-time: 828/q
+- malloc: 609/q
+- BTreeMap searches (oracle + collection): 374/q total
+- sdallocx: 335/q
+- `Codec::encode`: 361/q
+- `mpsc::Rx::pop` (timeout channel): 383/q
+
+Potential next optimizations:
+1. Reduce remaining Histogram::observe overhead (~802/q at 64c)
+2. Cache more BTreeMap lookups on PeekClient (~374/q)
+3. Reduce allocator contention (malloc 609/q + sdallocx 335/q = 944/q)
+4. Row encoding / BackendMessage send overhead
