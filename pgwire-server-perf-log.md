@@ -1060,3 +1060,69 @@ Further throughput/latency improvements require **architectural changes**:
 
 ---
 
+## Summary and Conclusion
+
+**Optimization Journey (Sessions 37-48):**
+
+The optimization effort successfully reduced server-side processing from ~100-200µs (estimated from Session 37 perf profiles) down to **~4µs per query** - a **25-50x improvement** in application code efficiency.
+
+**Key optimizations implemented:**
+
+1. **Session 37**: Cached persistent ReadHold per collection to avoid mutex contention
+2. **Session 38**: Cached histogram handles to avoid per-query label formatting/HashMap lookups
+3. **Session 40**: Pre-extracted single_compute_collection_ids to avoid BTreeMap traversal
+4. **Session 41**: Skipped declare/set_portal for plan-cached queries (+20-27% QPS improvement)
+5. **Session 42**: Shared atomic read_ts fast path (Session 46 final implementation)
+6. **Session 43**: Cached RowDescription and encode state (marginal improvement, within noise)
+7. **Session 44**: Wrapped RelationDesc in Arc to avoid per-query BTreeMap clones
+8. **Session 45**: Parallelized batching oracle with tuned max_in_flight=3
+9. **Session 46**: Implemented shared atomic read_ts fast path (99.999% hit rate, 2.8x QPS at 64c)
+10. **Session 47**: Completed handoff tasks, identified performance ceiling
+11. **Session 48**: Verified findings, confirmed no further app-level optimizations warranted
+
+**Final performance (verified Session 48, Feb 2026):**
+
+| Metric | Value |
+|--------|-------|
+| QPS at 64c | ~290k |
+| Avg latency at 64c | ~140µs |
+| Server processing time | ~4µs (3% of total) |
+| Oracle fast path hit rate | 99.998% |
+| CPU utilization | 36% (NOT CPU-bound) |
+| p99.9 latency | < 262µs |
+
+**Bottleneck analysis:**
+
+- **Application code**: 4µs (3% of latency) - ✅ **fully optimized**
+- **Tokio/TCP overhead**: 135µs (97% of latency) - fundamental runtime/network ceiling
+
+The system has reached the **performance ceiling of the Tokio async runtime and Linux TCP stack** for the single-query-per-round-trip workload pattern.
+
+**What's left in application code (Session 44 profiling, ~8k samples/query total at 64c):**
+
+- Histogram::observe: ~1,672 samples/query (atomic contention, 3-5 observations per query)
+- Tracing overhead: ~5,024 samples/query (span enter/exit even with log_filter=info)
+- ReadHold clone/drop: ~1,274 samples/query (mpsc channel sends)
+
+These represent ~4-5% of `try_frontend_peek_cached` CPU, but only **~0.15% of total end-to-end latency**. Eliminating them would have negligible impact.
+
+**Decision: Application-level optimization complete.**
+
+Further throughput/latency improvements require **architectural changes** beyond code optimization:
+
+1. **io_uring**: Replace epoll-based I/O with io_uring for lower syscall overhead
+2. **Protocol-level batching**: Send multiple queries per TCP round-trip
+3. **Direct compute connections**: Route pgwire to compute workers, bypass adapter entirely
+4. **Custom async runtime**: Purpose-built runtime optimized for this workload
+
+**Handoff tasks status (from Session 47):**
+
+✅ All tasks completed in Sessions 47-48:
+- Concurrency sweep with fixed pool settings (1c, 4c, 16c, 64c, 128c)
+- Verified low churn (command-startup, command-terminate, apply_write metrics)
+- Captured all oracle and batching metrics
+- Analyzed Tokio runtime pressure (not CPU-bound, 36% utilization)
+- Determined bottleneck: Tokio/TCP overhead, NOT application code or CRDB
+
+---
+
