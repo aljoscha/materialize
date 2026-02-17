@@ -1016,7 +1016,6 @@ where
         }
     }
 
-    #[instrument(level = "debug")]
     async fn advance_ready(&mut self) -> Result<State, io::Error> {
         // Start a new metrics interval before the `recv()` call.
         self.tokio_metrics_intervals
@@ -1072,12 +1071,7 @@ where
         let start = message.as_ref().map(|_| Instant::now());
         let next_state = match message {
             Some(FrontendMessage::Query { sql }) => {
-                let query_root_span =
-                    tracing::info_span!(parent: None, "advance_ready", otel.name = message_name);
-                query_root_span.follows_from(tracing::Span::current());
-                self.query(sql, received)
-                    .instrument(query_root_span)
-                    .await?
+                self.query(sql, received).await?
             }
             Some(FrontendMessage::Parse {
                 name,
@@ -1194,7 +1188,6 @@ where
     /// Note that `lifecycle_timestamps` belongs to the whole "Simple Query", because the whole
     /// Simple Query is received and parsed together. This means that if there are multiple
     /// statements in a Simple Query, then all of them have the same `lifecycle_timestamps`.
-    #[instrument(level = "debug")]
     async fn one_query(
         &mut self,
         stmt: Arc<Statement<Raw>>,
@@ -1441,7 +1434,6 @@ where
     /// <https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SIMPLE-QUERY>
     ///
     /// For implicit transaction handling, see "Multiple Statements in a Simple Query" in the above.
-    #[instrument(level = "debug")]
     async fn query(&mut self, sql: String, received: EpochMillis) -> Result<State, io::Error> {
         // Fast path: if the plan cache has this SQL, skip parsing entirely
         // and reuse the cached parsed statement as Arc to avoid deep-cloning
@@ -2124,7 +2116,6 @@ where
     ///
     /// The message is only sent if its severity is above the severity set
     /// in the session, with the default value being NOTICE.
-    #[instrument(level = "debug")]
     async fn send<M>(&mut self, message: M) -> Result<(), io::Error>
     where
         M: Into<BackendMessage>,
@@ -2148,7 +2139,6 @@ where
         Ok(())
     }
 
-    #[instrument(level = "debug")]
     pub async fn send_all(
         &mut self,
         messages: impl IntoIterator<Item = BackendMessage>,
@@ -2185,7 +2175,6 @@ where
         self.ready().await
     }
 
-    #[instrument(level = "debug")]
     async fn ready(&mut self) -> Result<State, io::Error> {
         let txn_state = self.adapter_client.session().transaction().into();
         self.send(BackendMessage::ReadyForQuery(txn_state)).await?;
@@ -3284,7 +3273,6 @@ where
         Ok(State::Ready)
     }
 
-    #[instrument(level = "debug")]
     async fn send_pending_notices(&mut self) -> Result<(), io::Error> {
         // Fast path: skip drain_notices() entirely when the channel is empty.
         // This avoids a Vec allocation, try_recv loop, and send_all overhead

@@ -904,3 +904,82 @@ Potential next optimizations:
 2. Reduce tracing overhead for cached fast-path queries
 3. Reduce Histogram::observe overhead (local accumulation or fewer observations)
 4. Investigate io_uring or TCP_NODELAY tuning for network layer
+
+### Session 47: Remove tracing overhead from pgwire/adapter hot path
+
+**Date:** 2026-02-17
+
+**Problem identified via profiling:**
+
+After Session 46 removed the oracle bottleneck, profiling at 64c with `perf
+record -F 9000 --call-graph fp` showed tracing was the next biggest CPU cost:
+
+- `tracing_subscriber` filter checks and span operations consumed **12.2%** of
+  total CPU samples
+- `advance_ready` non-query overhead was 53,005 samples/query (67.5% of total
+  78,533 samples/query) — almost entirely tracing: `info_span!` creation,
+  `follows_from`, `Instrumented` future wrapping
+- Even with the `EnvFilter` set to `info` level, `#[instrument(level =
+  "debug")]` still hit the filter's `RwLock::read` + `BTreeMap` lookup on every
+  call to determine whether the span should be created
+
+The overhead came from two sources:
+1. `info_span!` in the Query message arm of `advance_ready` — creates a
+   detached root span with `follows_from` link for every query
+2. `#[instrument(level = "debug")]` on 8 hot-path async functions: wraps each
+   in an `Instrumented` future, paying filter-check cost even when filtered out
+
+**Solution:**
+
+Removed tracing instrumentation from the pgwire/adapter query fast path:
+
+- `src/pgwire/src/protocol.rs`:
+  - Removed `#[instrument(level = "debug")]` from `advance_ready`, `query`,
+    `one_query`, `send`, `send_all`, `ready`, `send_pending_notices`
+  - Replaced the `info_span!(parent: None, "advance_ready") + follows_from +
+    .instrument()` wrapper around `self.query()` with a direct `await` call
+- `src/adapter/src/frontend_peek.rs`:
+  - Removed `#[mz_ore::instrument(level = "debug")]` from
+    `try_frontend_peek_cached`
+
+These spans provide no value on the fast path: they're filtered out at `info`
+level, but still pay the per-call cost of checking the filter. The functions
+remain traceable via higher-level spans and structured logging.
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | Baseline QPS | After QPS | Speedup | Baseline Latency | After Latency |
+|-------------|-------------|-----------|---------|------------------|---------------|
+| 1           | 13,350      | 19,471    | 1.46x   | 68µs             | 44.5µs        |
+| 4           | 45,312      | 64,556    | 1.42x   | 82µs             | 56.0µs        |
+| 16          | 161,115     | 199,606   | 1.24x   | 87µs             | 65.9µs        |
+| 64          | 261,916     | 298,769   | 1.14x   | 175µs            | 122.5µs       |
+| 128         | 263,601     | 297,665   | 1.13x   | 245µs            | 141.9µs       |
+
+Prometheus metrics confirm `try_frontend_peek_cached` average latency dropped
+to **3.81µs** per query (from ~4.29µs overall for `try_frontend_peek`).
+
+At 1c the improvement is 1.46x (tracing per-call overhead is a larger fraction
+of single-threaded query time). At 64c/128c the improvement is ~14%, moving
+throughput from ~262K to ~299K QPS. The 64c→128c plateau persists (298K vs
+298K), confirming the remaining bottleneck is not CPU-side tracing but
+contention elsewhere (ReadHold clone/drop, Histogram::observe, TCP I/O).
+
+**Profiling notes for next session:**
+
+Remaining per-query costs at 64c (approximate from pre-optimization profile,
+now without the 53K tracing overhead):
+- `try_frontend_peek_cached` (~10,500 samples/query): timestamp selection,
+  ReadHold acquire, plan execution, result encoding
+- ReadHold clone + drop (~3,200 samples/query): mpsc channel sends per query
+- `send` BackendMessage (~2,000 samples/query): TCP write + framing
+- `send_all` row encoding (~2,000 samples/query): row data encoding
+- Histogram::observe (~1,600 samples/query): 5 observations/query with atomic
+  contention
+
+Potential next optimizations:
+1. Reduce ReadHold clone/drop channel overhead (investigate safe batching or
+   shared holds)
+2. Reduce Histogram::observe overhead (local accumulation or fewer observations)
+3. Reduce row encoding / BackendMessage send overhead
+4. Investigate io_uring or TCP_NODELAY tuning for network layer

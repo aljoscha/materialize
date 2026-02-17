@@ -1824,7 +1824,6 @@ impl PeekClient {
     /// planning, optimization, RBAC, and cluster resolution. Only performs the
     /// per-query work that must happen on every execution: timestamp determination,
     /// read holds, and peek execution.
-    #[mz_ore::instrument(level = "debug")]
     async fn try_frontend_peek_cached(
         &mut self,
         session: &mut Session,
