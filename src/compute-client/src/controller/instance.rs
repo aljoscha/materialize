@@ -1840,6 +1840,84 @@ where
         Ok(())
     }
 
+    /// Like [`Instance::peek`], but acquires the read hold internally at the
+    /// given `timestamp`, avoiding the need for the caller to create and send
+    /// a `ReadHold` through the channel. This eliminates one channel send per
+    /// query on the hot path (the caller's `clone_at` + change_tx send).
+    ///
+    /// The read hold is acquired directly via `lock_read_capabilities` on the
+    /// instance task, with no cross-thread channel contention.
+    pub fn peek_with_inline_hold(
+        &mut self,
+        peek_target: PeekTarget,
+        literal_constraints: Option<Vec<Row>>,
+        uuid: Uuid,
+        timestamp: T,
+        result_desc: RelationDesc,
+        finishing: RowSetFinishing,
+        map_filter_project: mz_expr::SafeMfpPlan,
+        target_replica: Option<ReplicaId>,
+        peek_response_tx: oneshot::Sender<PeekResponse>,
+    ) -> Result<(), PeekError> {
+        use PeekError::*;
+
+        let target_id = peek_target.id();
+
+        // Acquire a read hold directly at the peek timestamp.
+        let collection = self.collection(target_id).map_err(|_| CollectionMissing(target_id))?;
+        let since = collection.shared.lock_read_capabilities(|caps| {
+            let since = caps.frontier().to_owned();
+            // Verify the timestamp is >= since before acquiring.
+            if !timely::PartialOrder::less_equal(&since, &Antichain::from_elem(timestamp.clone())) {
+                return Err(ReadHoldInsufficient(target_id));
+            }
+            // Acquire hold directly at the peek timestamp.
+            caps.update_iter(std::iter::once((timestamp.clone(), 1)));
+            Ok(since)
+        })?;
+        let _ = since; // The since value is not needed; we hold at `timestamp`.
+        let read_hold = ReadHold::new(
+            target_id,
+            Antichain::from_elem(timestamp.clone()),
+            Arc::clone(&self.read_hold_tx),
+        );
+
+        if let Some(target) = target_replica {
+            if !self.replica_exists(target) {
+                return Err(ReplicaMissing(target));
+            }
+        }
+
+        let otel_ctx = OpenTelemetryContext::obtain();
+
+        self.peeks.insert(
+            uuid,
+            PendingPeek {
+                target_replica,
+                otel_ctx: otel_ctx.clone(),
+                requested_at: Instant::now(),
+                read_hold,
+                peek_response_tx,
+                limit: finishing.limit.map(usize::cast_from),
+                offset: finishing.offset,
+            },
+        );
+
+        let peek = Peek {
+            literal_constraints,
+            uuid,
+            timestamp,
+            finishing,
+            map_filter_project,
+            otel_ctx,
+            target: peek_target,
+            result_desc,
+        };
+        self.send(ComputeCommand::Peek(Box::new(peek)));
+
+        Ok(())
+    }
+
     /// Cancels an existing peek request.
     #[mz_ore::instrument(level = "debug")]
     pub fn cancel_peek(&mut self, uuid: Uuid, reason: PeekResponse) {

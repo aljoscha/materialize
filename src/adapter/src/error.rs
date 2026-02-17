@@ -783,6 +783,7 @@ impl AdapterError {
             },
             e @ ReadHoldIdMismatch(_) => AdapterError::internal("instance peek error", e),
             e @ ReadHoldInsufficient(_) => AdapterError::internal("instance peek error", e),
+            e @ CollectionMissing(_) => AdapterError::internal("instance peek error", e),
         }
     }
 

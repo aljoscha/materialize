@@ -162,6 +162,45 @@ impl<T: TimelyTimestamp> ReadHold<T> {
         self.try_downgrade(Antichain::new())
             .expect("known to succeed");
     }
+
+    /// Creates a new `ReadHold` at the given `frontier` based on this hold,
+    /// with a single channel send (instead of clone + downgrade which requires
+    /// two sends). The frontier must be >= this hold's since.
+    ///
+    /// This is equivalent to `clone()` followed by `try_downgrade(frontier)`,
+    /// but combines both into a single `ChangeBatch` message.
+    pub fn clone_at(
+        &self,
+        frontier: Antichain<T>,
+    ) -> Result<Self, ReadHoldDowngradeError<T>> {
+        if PartialOrder::less_than(&frontier, &self.since) {
+            return Err(ReadHoldDowngradeError::SinceViolation {
+                frontier,
+                since: self.since.clone(),
+            });
+        }
+
+        // Send +1 at the target frontier directly.
+        // This combines clone's (+1 at since) and downgrade's (-1 at since, +1 at frontier)
+        // into a single message: just +1 at frontier.
+        let mut changes = ChangeBatch::new();
+        changes.extend(frontier.iter().map(|t| (t.clone(), 1)));
+
+        if !changes.is_empty() {
+            match (self.change_tx)(self.id.clone(), changes) {
+                Ok(_) => (),
+                Err(e) => {
+                    panic!("cannot clone_at ReadHold: {}", e);
+                }
+            }
+        }
+
+        Ok(Self {
+            id: self.id.clone(),
+            since: frontier,
+            change_tx: Arc::clone(&self.change_tx),
+        })
+    }
 }
 
 impl<T: TimelyTimestamp> Clone for ReadHold<T> {

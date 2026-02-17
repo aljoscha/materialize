@@ -1938,13 +1938,11 @@ impl PeekClient {
             // this mutex becomes a serialization bottleneck (~13% of function time).
             //
             // Instead, we keep a persistent ReadHold per (instance, collection)
-            // on the PeekClient. For each query, we clone the cached hold:
-            // `ReadHold::clone()` sends +1 through an async mpsc channel (no mutex),
-            // and the corresponding drop sends -1 (also no mutex). The cached hold
-            // prevents compaction at the collection's since, so the clone's since
-            // is always valid.
+            // on the PeekClient. For each query, we use `clone_at(chosen_ts)` to
+            // create a hold directly at the peek timestamp (1 channel send),
+            // instead of clone at since + downgrade to peek_ts (2 channel sends).
+            // The cached hold prevents compaction at the collection's since.
             let mut chosen_ts = Timestamp::minimum();
-            let mut target_read_hold = None;
 
             for &id in collection_ids {
                 let key = (instance_id, id);
@@ -1963,7 +1961,7 @@ impl PeekClient {
 
                 // Ensure we have a cached persistent read hold for this collection.
                 // The persistent hold is acquired once (via the mutex) and kept alive
-                // across queries. Per-query holds are then cloned from it (no mutex).
+                // across queries. Per-query holds are then created from it via clone_at.
                 if !self.cached_read_holds.contains_key(&key) {
                     let shared = self
                         .shared_collection_states
@@ -1974,11 +1972,8 @@ impl PeekClient {
                     self.cached_read_holds.insert(key, hold);
                 }
 
-                // Clone the cached hold — sends +1 via async channel, no mutex.
-                let read_hold = self.cached_read_holds[&key].clone();
-
-                // Use the cached hold's since as a lower bound for chosen_ts.
-                if let Some(since_ts) = read_hold.since().as_option() {
+                // Read the cached hold's since by reference (no clone, no channel send).
+                if let Some(since_ts) = self.cached_read_holds[&key].since().as_option() {
                     chosen_ts = std::cmp::max(chosen_ts, *since_ts);
                 }
 
@@ -2000,13 +1995,19 @@ impl PeekClient {
                     }
                 }
 
-                target_read_hold = Some(read_hold);
             }
 
             // For StrictSerializable, advance to the oracle timestamp.
             if let Some(oracle_ts) = &oracle_read_ts {
                 chosen_ts = std::cmp::max(chosen_ts, *oracle_ts);
             }
+
+            // Pass None for the read hold — the instance task will acquire
+            // the hold internally via peek_with_inline_hold, eliminating the
+            // per-query clone_at channel send from the worker thread.
+            // The cached persistent hold on PeekClient prevents compaction
+            // past the collection's since, and chosen_ts >= since.
+            let target_read_hold = None;
 
             // Build the TimestampContext directly.
             let timestamp_context = match &cached.timeline_context {

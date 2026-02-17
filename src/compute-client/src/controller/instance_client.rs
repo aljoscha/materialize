@@ -61,6 +61,9 @@ pub enum PeekError {
     /// The read hold that was passed in is for a later time than the peek's timestamp.
     #[error("insufficient read hold provided: {0}")]
     ReadHoldInsufficient(GlobalId),
+    /// The target collection does not exist.
+    #[error("collection does not exist: {0}")]
+    CollectionMissing(GlobalId),
     /// The peek's target instance has shut down.
     #[error("the instance has shut down")]
     InstanceShutDown,
@@ -261,6 +264,40 @@ impl<T: ComputeControllerTimestamp> InstanceClient<T> {
                 // On error, Instance::peek did not consume peek_response_tx, so
                 // the receiver gets RecvError and the caller handles it.
                 tracing::warn!("fire-and-forget peek failed: {err}");
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Like [`InstanceClient::peek`], but acquires the read hold on the instance
+    /// task side, eliminating the need for the caller to create a `ReadHold` and
+    /// send it through the channel. This reduces per-query channel sends from 3
+    /// (clone_at + peek + drop) to 2 (peek_with_inline_hold + drop on instance).
+    pub fn peek_with_inline_hold(
+        &self,
+        peek_target: PeekTarget,
+        literal_constraints: Option<Vec<Row>>,
+        uuid: Uuid,
+        timestamp: T,
+        result_desc: RelationDesc,
+        finishing: RowSetFinishing,
+        map_filter_project: mz_expr::SafeMfpPlan,
+        target_replica: Option<ReplicaId>,
+        peek_response_tx: oneshot::Sender<PeekResponse>,
+    ) -> Result<(), PeekError> {
+        self.call(move |i| {
+            if let Err(err) = i.peek_with_inline_hold(
+                peek_target,
+                literal_constraints,
+                uuid,
+                timestamp,
+                result_desc,
+                finishing,
+                map_filter_project,
+                target_replica,
+                peek_response_tx,
+            ) {
+                tracing::warn!("fire-and-forget peek_with_inline_hold failed: {err}");
             }
         })?;
         Ok(())

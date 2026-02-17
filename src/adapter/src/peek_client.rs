@@ -562,19 +562,11 @@ impl PeekClient {
             }
         }
 
-        let (peek_target, target_read_hold, literal_constraints, mfp, strategy) = match fast_path {
+        let (peek_target, literal_constraints, mfp, strategy) = match fast_path {
             FastPathPlan::PeekExisting(_coll_id, idx_id, literal_constraints, mfp) => {
                 let peek_target = PeekTarget::Index { id: idx_id };
-                let target_read_hold =
-                    target_read_hold.expect("missing read hold for PeekExisting peek target");
                 let strategy = statement_logging::StatementExecutionStrategy::FastPath;
-                (
-                    peek_target,
-                    target_read_hold,
-                    literal_constraints,
-                    mfp,
-                    strategy,
-                )
+                (peek_target, literal_constraints, mfp, strategy)
             }
             FastPathPlan::PeekPersist(coll_id, literal_constraint, mfp) => {
                 let literal_constraints = literal_constraint.map(|r| vec![r]);
@@ -587,16 +579,8 @@ impl PeekClient {
                     id: coll_id,
                     metadata,
                 };
-                let target_read_hold =
-                    target_read_hold.expect("missing read hold for PeekPersist peek target");
                 let strategy = statement_logging::StatementExecutionStrategy::PersistFastPath;
-                (
-                    peek_target,
-                    target_read_hold,
-                    literal_constraints,
-                    mfp,
-                    strategy,
-                )
+                (peek_target, literal_constraints, mfp, strategy)
             }
             _ => {
                 // FastPathPlan::Constant handled above.
@@ -636,18 +620,35 @@ impl PeekClient {
         // is serialized and sent to the compute worker. However, for Constant
         // fast-path peeks (handled above), the Arc avoids the clone entirely.
         let result_desc_owned = Arc::unwrap_or_clone(result_desc);
-        let peek_result = self.compute_instances[&compute_instance].peek(
-            peek_target,
-            literal_constraints,
-            uuid,
-            timestamp,
-            result_desc_owned,
-            finishing_for_instance,
-            mfp,
-            target_read_hold,
-            target_replica,
-            rows_tx,
-        );
+        let peek_result = if let Some(read_hold) = target_read_hold {
+            // Normal path: caller provides a pre-created ReadHold.
+            self.compute_instances[&compute_instance].peek(
+                peek_target,
+                literal_constraints,
+                uuid,
+                timestamp,
+                result_desc_owned,
+                finishing_for_instance,
+                mfp,
+                read_hold,
+                target_replica,
+                rows_tx,
+            )
+        } else {
+            // Inline hold path: the instance task acquires the ReadHold
+            // internally, eliminating one channel send from the caller.
+            self.compute_instances[&compute_instance].peek_with_inline_hold(
+                peek_target,
+                literal_constraints,
+                uuid,
+                timestamp,
+                result_desc_owned,
+                finishing_for_instance,
+                mfp,
+                target_replica,
+                rows_tx,
+            )
+        };
 
         if let Err(err) = peek_result {
             // Clean up the registered peek since the peek failed to issue (fire-and-forget).
