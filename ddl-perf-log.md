@@ -344,3 +344,59 @@ verify) across both call sites accounts for ~30% of DDL time.
 single largest O(n) source at 31.2% of DDL time. The most promising approach is
 to use `Arc` or persistent data structures for the large maps inside
 CatalogState so that `Cow::to_mut` becomes O(1) instead of O(n).
+
+### Session 5: Skip preliminary_state clone for last/only op (2026-02-18)
+
+**Goal:** Eliminate one of the two Cow\<CatalogState\> deep clones that happen
+on every DDL transaction.
+
+**Analysis:** `transact_inner` (`src/adapter/src/catalog/transact.rs`) creates
+two `Cow::Borrowed(state)` references:
+- `preliminary_state` — accumulates intermediate state between ops in a loop
+- `state` — used for the final consolidated apply
+
+For each op in the loop, `preliminary_state.to_mut().apply_updates()` is called
+to make subsequent ops see the effects of earlier ones. But on the **last op**,
+there's no subsequent op — the intermediate state is discarded and the final
+`state` Cow redoes the consolidated apply. This means the `preliminary_state`
+clone is completely wasted for single-op DDL (which is the common case for
+individual CREATE TABLE, DROP, etc.).
+
+**Approach:** Skip the `preliminary_state.to_mut().apply_updates()` call on the
+last iteration of the ops loop. This avoids the O(n) CatalogState deep clone
+when there's only one op (or on the last op of a multi-op transaction).
+
+**Code change:**
+- `src/adapter/src/catalog/transact.rs` — changed `for op in ops` to
+  `for (op_index, op) in ops.into_iter().enumerate()`, added `is_last_op`
+  check to skip the `preliminary_state` apply on the final iteration.
+
+**Results (median of 5 samples, debug build):**
+
+| User Objects | Session 1 (baseline) | Session 3 (incr check) | Session 5 (skip clone) | S5 vs S3 | S5 vs S1 |
+|-------------|---------------------|----------------------|----------------------|----------|----------|
+| 0           | 225 ms              | 183 ms               | 163 ms               | 11%      | 28%      |
+| ~116        | 250 ms              | 200 ms               | 176 ms               | 12%      | 30%      |
+| ~531        | 337 ms              | 254 ms               | 226 ms               | 11%      | 33%      |
+| ~1046       | 426 ms              | 330 ms               | 280 ms               | 15%      | 34%      |
+| ~2061       | 700 ms              | 443 ms               | 399 ms               | 10%      | 43%      |
+| ~3076       | 1034 ms             | 600 ms               | 513 ms               | 14%      | 50%      |
+
+**Key observations:**
+- ~14% improvement over Session 3 across all scales, consistent with eliminating
+  one of the two CatalogState clones (~half of the 31.2% Cow overhead).
+- Scaling slope improved from ~136ms to ~114ms per 1000 objects (16% reduction).
+- At 3000 tables, CREATE TABLE: 1034ms → 513ms total improvement (**50% faster**
+  than original baseline).
+- The remaining Cow clone (the `state` Cow) still accounts for ~16% of DDL time.
+  Eliminating it would require restructuring `transact_inner` to mutate in place
+  or using persistent data structures.
+
+**Next step:** The remaining O(n) sources are:
+1. The `state` Cow clone+drop (~16% of DDL time) — harder to eliminate without
+   restructuring transact_inner
+2. Durable catalog snapshot rebuild (~30%) — with_snapshot, TableTransaction
+3. Remaining check_consistency sub-checks (~6%)
+
+The durable catalog snapshot rebuild (~30%) is the next largest target. It
+requires making `with_snapshot` incremental or caching the snapshot.

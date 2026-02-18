@@ -600,7 +600,8 @@ impl Catalog {
 
         let mut updates = Vec::new();
 
-        for op in ops {
+        let num_ops = ops.len();
+        for (op_index, op) in ops.into_iter().enumerate() {
             let (weird_builtin_table_update, temporary_item_updates) = Self::transact_op(
                 oracle_write_ts,
                 session,
@@ -643,7 +644,13 @@ impl Catalog {
 
             let mut op_updates: Vec<_> = tx.get_and_commit_op_updates();
             op_updates.extend(temporary_item_updates);
-            if !op_updates.is_empty() {
+            // Only apply updates to preliminary_state if there are more ops after
+            // this one. The preliminary_state exists so that subsequent ops can see
+            // the effects of earlier ops. On the last op, there's no subsequent op,
+            // so applying here just wastes a full CatalogState clone (O(n) with
+            // catalog size). The final `state` Cow handles the consolidated apply.
+            let is_last_op = op_index + 1 >= num_ops;
+            if !op_updates.is_empty() && !is_last_op {
                 // Clone the cache so each apply_updates call has access to cached expressions.
                 // The cache uses `remove` semantics, so we need a fresh clone for each call.
                 let mut local_expr_cache = LocalExpressionCache::new(cached_exprs.clone());
