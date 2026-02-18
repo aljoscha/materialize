@@ -63,32 +63,39 @@ good description.
 
 Immediate next steps (handoff):
 
-**Critical context from Session 46:** The `peek_read_ts_fast` optimization
-(Session 42) was removed for correctness reasons. Without it, `oracle.read_ts()`
-is called on every StrictSerializable query and dominates latency at ~483µs
-(~97% of per-query time). The true baseline is ~2,500 QPS at 1c and ~103K at
-64c. BTreeMap lookup caching was attempted and found to save only ~2-3µs per
-query — negligible. Any future optimization must reduce oracle call frequency
-or latency.
+**Critical context from Sessions 46-47:** The `peek_read_ts_fast` optimization
+(Session 42) was removed for correctness reasons. The system is I/O-bound on
+CRDB round-trips (~362µs per `read_ts` call). CPU-side optimizations (spin
+polling, parallelism tuning, metrics/tracing stripping) have no measurable
+effect on throughput. The true baseline is ~2,500 QPS at 1c and ~103K at 64c.
+
+**Completed (remove from consideration):**
+- ~~Break down oracle read_ts latency~~: Done in Session 47. CRDB query_one
+  dominates at >95%. get_connection ~4µs, prepare_cached ~0.5µs.
+- ~~CPU-side oracle optimizations~~: Exhaustively tested (yield_now spin,
+  max_in_flight tuning, metrics/tracing stripping). All neutral or regressive.
+
+**Remaining directions:**
 
 - **Explore correctness-preserving oracle call batching/sharing.** The batching
-  oracle already batches calls from the backing store side, but each frontend
-  query still does its own `read_ts().await` through the batching channel. Could
-  we coalesce multiple frontend queries into a single oracle round-trip? The key
-  correctness constraint is that each query must get a timestamp >= the latest
-  write_ts at the time the query arrived (strict serializability). A shared
-  "current read_ts" that is refreshed periodically (e.g., every write_ts bump)
-  might work if queries only use it when it's known to be >= their arrival time.
-  Read GUIDE.md carefully before attempting this.
+  oracle already coalesces calls from the backing store side (8.67x ratio at
+  64c), but the CRDB round-trip is irreducible. Could we reduce the number of
+  CRDB calls further? The key correctness constraint is strict serializability:
+  each query must get a timestamp >= the latest write_ts at the time the query
+  arrived. Read GUIDE.md carefully before attempting any caching. The batching
+  oracle's ticketed design is correct; the question is whether CRDB can be
+  called less often while still respecting real-time bounds.
 
 - **Benchmark Serializable vs StrictSerializable.** Serializable queries skip
   the oracle entirely and use the write frontier. This would confirm the oracle
-  is truly the bottleneck and establish an upper bound for optimization.
+  is truly the bottleneck and establish an upper bound for non-oracle
+  optimization.
 
-- **Break down oracle read_ts latency.** Use phase histograms
-  (`mz_ts_oracle_postgres_read_ts_phase_seconds`) to identify which part of
-  the oracle round-trip is slowest: connection acquisition, prepared statement,
-  or CRDB query execution. Compare against CRDB's own statement stats.
+- **Reduce CRDB round-trip latency.** The ~362µs per CRDB call is the
+  bottleneck. Options: colocate the timestamp oracle in-process (avoid network
+  hop), use a lighter backing store, optimize the CRDB query, or use CRDB
+  follower reads with bounded staleness (correctness implications — see
+  GUIDE.md).
 
 - **Fix statement_logging crash.** `end_statement_execution` panics when
   frontend peek sequencing is active with statement logging enabled. The
