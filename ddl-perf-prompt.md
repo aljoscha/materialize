@@ -55,6 +55,11 @@ good description.
 
 Immediate next steps (handoff):
 
+- **Use --optimized after all.** If we think that debug build might be to
+  different to an optimized build, we might have to update our instructions to
+  use --optimized builds and continue with that. The consistency check thing
+  was already a red herring.
+
 - **Reproduce the problem.** Start environmentd with `--reset`, create
   increasing numbers of objects (tables with default indexes, views, etc.) and
   measure how long DDL statements take at each scale. Find the threshold where
