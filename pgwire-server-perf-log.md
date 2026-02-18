@@ -878,3 +878,81 @@ Possible approaches for future sessions:
 4. **Serializable default:** If queries use Serializable instead of
    StrictSerializable, the oracle call is skipped entirely (timestamp comes from
    the write frontier). This is a semantic change but worth benchmarking.
+
+### Session 47: Strip metrics/tracing overhead from inner oracle read_ts path
+
+**Date:** 2026-02-18
+
+**Problem:**
+
+Profiling from previous sessions confirmed that `oracle.read_ts()` dominates
+per-query latency (~362-483µs, ~97% of per-query time at 1c). The system is
+I/O-bound on CRDB round-trips. CPU-side optimizations in the batching oracle
+(yield_now spin polling, increased max_in_flight) were tried and found
+ineffective or regressive:
+
+- **yield_now spin-polling** (replace Notify with `tokio::task::yield_now()`
+  spin loop): 64c QPS dropped from 101K to 67K — 64 spinning callers starved
+  the worker task that makes CRDB calls.
+- **max_in_flight=6** (up from 3): No improvement — CRDB latency increased
+  from 375µs to 408µs due to contention, offsetting the parallelism gain.
+- **Hybrid spin+Notify** (32 spin-yields then Notify fallback): Abandoned
+  before testing — worst of both worlds (spin overhead + Notify overhead).
+
+**Optimization attempted:**
+
+Reduce per-batch-call CPU overhead in the inner oracle path. Each CRDB batch
+call previously had:
+
+1. **`#[instrument]` tracing span** on `read_ts()` trait impl
+2. **`retry_fallible` wrapper** — `SystemTime::now()` + Retry stream on every call
+3. **`run_op` metrics wrapper** — `Instant::now()` + counter inc + elapsed
+4. **`#[mz_ore::instrument]` tracing span** on `fallible_read_ts()`
+5. **3× `Instant::now()` + `Histogram::observe()`** for phase breakdown
+6. **`debug!()` log** per call
+
+Total estimated overhead: ~15µs CPU per batch call (on top of ~362µs CRDB
+round-trip).
+
+Changes:
+- `src/timestamp-oracle/src/postgres_oracle.rs`: Stripped `fallible_read_ts()`
+  to bare connection/query/parse (no tracing, no phase histograms, no debug
+  log). Replaced `read_ts()` trait impl with simple retry loop (no tracing
+  span, no `retry_fallible`, no `run_op` wrapper).
+- `src/timestamp-oracle/src/batching_oracle.rs`: Removed per-caller
+  `Instant::now()` + `Histogram::observe()` from `read_ts()` callers (the
+  `wait_seconds` metric). Kept the worker's `inner_read_seconds` observation.
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | Baseline QPS (S46) | After QPS | Change |
+|-------------|---------------------|-----------|--------|
+| 1           | 2,491               | 2,431     | -2.4%  |
+| 64          | 103,414             | 102,392   | -1.0%  |
+
+All results within noise. The optimization eliminates ~15µs of CPU per batch
+call, but since the system is I/O-bound on the ~362µs CRDB round-trip, this
+has no measurable effect on throughput.
+
+**Oracle metrics confirm the stripping:**
+- `postgres_read_ts_phase_seconds` (get_connection, prepare_cached, query_one):
+  all show count=0 (was ~247K in baseline)
+- `retry_finished_count{op="read_ts"}`: 0 (bypassed `retry_fallible`)
+- Inner read avg: 362µs (vs ~375µs baseline — within CRDB variance)
+- Batching ratio at 64c: 8.67x (2.15M queries → 248K CRDB calls)
+
+**Conclusion:**
+
+The CRDB round-trip (~362µs) is the irreducible bottleneck for
+StrictSerializable queries. CPU-side optimizations in the oracle path —
+whether in the batching layer (spin-polling, parallelism tuning) or the
+inner oracle (metrics/tracing stripping) — do not improve throughput because
+the system is I/O-bound, not CPU-bound.
+
+The only paths to meaningful improvement are:
+1. **Reduce CRDB round-trip latency** (e.g., colocate oracle, use faster
+   backing store, optimize CRDB query execution)
+2. **Skip the oracle entirely** (Serializable isolation — skips oracle, uses
+   write frontier; requires semantic change)
+3. **Correctness-preserving oracle caching** (if one can be found — see
+   GUIDE.md for why previous attempts were incorrect)

@@ -12,8 +12,7 @@
 //!
 //! Uses a ticketed approach: callers take a monotonically increasing ticket
 //! number (atomic fetch_add), and a worker task batches oracle calls. Results
-//! are broadcast via a `tokio::sync::watch` channel. This eliminates per-call
-//! `oneshot::channel()` allocations and `mpsc` sends from the hot path.
+//! are published via shared atomics and a `Notify` broadcast.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,9 +20,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use mz_ore::metrics::Histogram;
 use tokio::pin;
-use tokio::sync::{Notify, watch};
+use tokio::sync::Notify;
 
 use crate::metrics::Metrics;
 use crate::{TimestampOracle, WriteTimestamp};
@@ -62,15 +60,21 @@ fn max_in_flight_read_ts_batches() -> usize {
     }
 }
 
-/// The state broadcast by the worker task to waiting callers.
+/// Shared state between the worker task and callers.
 ///
-/// `completed_up_to` means all tickets with number < `completed_up_to` have
-/// been served. `ts` is the timestamp returned by the backing oracle for the
-/// most recent batch.
-#[derive(Clone, Copy, Debug)]
-struct BatchResult {
-    completed_up_to: u64,
-    ts: u64,
+/// The worker writes `latest_ts` first (Release), then `completed_up_to`
+/// (Release). Callers read `completed_up_to` first (Acquire), then
+/// `latest_ts` (Acquire). The Release on `completed_up_to` ensures that
+/// any thread observing the new `completed_up_to` also sees the preceding
+/// `latest_ts` write. This is guaranteed by the Release/Acquire pairing
+/// on `completed_up_to`.
+struct SharedState {
+    /// All tickets with number < `completed_up_to` have been served.
+    completed_up_to: AtomicU64,
+    /// The timestamp returned by the backing oracle for the most recent batch.
+    latest_ts: AtomicU64,
+    /// Notifies all waiting callers when a batch completes.
+    caller_notify: Notify,
 }
 
 /// A batching [`TimestampOracle`] backed by a [`TimestampOracle`]
@@ -89,9 +93,10 @@ struct BatchResult {
 /// The ticketed approach works as follows:
 /// 1. Each caller atomically increments `next_ticket` to take a ticket number.
 /// 2. The worker task snapshots `next_ticket`, calls `inner.read_ts()` in up
-///    to `MAX_IN_FLIGHT_READ_TS_BATCHES` in-flight batches, and broadcasts the
-///    highest completed snapshot via a `watch` channel.
-/// 3. Callers subscribe to the watch and wait until `completed_up_to > my_ticket`.
+///    to `MAX_IN_FLIGHT_READ_TS_BATCHES` in-flight batches, and publishes the
+///    result via shared atomics + `Notify`.
+/// 3. Callers check the atomic `completed_up_to` and wait on the `Notify` if
+///    their ticket hasn't been served yet.
 ///
 /// Correctness: the worker snapshots `next_ticket = N` after tickets 0..N-1
 /// were taken (i.e., after those callers arrived). The oracle call happens after
@@ -105,8 +110,7 @@ pub struct BatchingTimestampOracle<T> {
     inner: Arc<dyn TimestampOracle<T> + Send + Sync>,
     next_ticket: Arc<AtomicU64>,
     worker_notify: Arc<Notify>,
-    result_tx: watch::Sender<BatchResult>,
-    read_ts_wait_seconds: Histogram,
+    shared: Arc<SharedState>,
 }
 
 impl<T> std::fmt::Debug for BatchingTimestampOracle<T> {
@@ -124,16 +128,16 @@ where
         let max_in_flight = max_in_flight_read_ts_batches();
         let next_ticket = Arc::new(AtomicU64::new(0));
         let worker_notify = Arc::new(Notify::new());
-        let (result_tx, _) = watch::channel(BatchResult {
-            completed_up_to: 0,
-            ts: 0,
+        let shared = Arc::new(SharedState {
+            completed_up_to: AtomicU64::new(0),
+            latest_ts: AtomicU64::new(0),
+            caller_notify: Notify::new(),
         });
-        let read_ts_wait_seconds = metrics.batching.read_ts.wait_seconds.clone();
 
         let task_oracle = Arc::clone(&oracle);
         let task_next_ticket = Arc::clone(&next_ticket);
         let task_notify = Arc::clone(&worker_notify);
-        let task_result_tx = result_tx.clone();
+        let task_shared = Arc::clone(&shared);
 
         mz_ore::task::spawn(|| "BatchingTimestampOracle Worker Task", async move {
             let read_ts_metrics = &metrics.batching.read_ts;
@@ -183,11 +187,16 @@ where
                         read_ts_metrics.inner_read_seconds.observe(inner_seconds);
                         if target > completed_up_to {
                             completed_up_to = target;
-                            // Broadcast result. It's okay if there are no receivers.
-                            let _ = task_result_tx.send(BatchResult {
-                                completed_up_to,
-                                ts: ts.into(),
-                            });
+                            // Publish result via atomics. Write `latest_ts`
+                            // first (Release), then `completed_up_to`
+                            // (Release). The Release on `completed_up_to`
+                            // ensures callers who Acquire-load it also see
+                            // the `latest_ts` write.
+                            task_shared.latest_ts.store(ts.into(), Ordering::Release);
+                            task_shared
+                                .completed_up_to
+                                .store(completed_up_to, Ordering::Release);
+                            task_shared.caller_notify.notify_waiters();
                         }
                     }
                     // New callers arrived; loop around so we can schedule
@@ -201,8 +210,7 @@ where
             inner: oracle,
             next_ticket,
             worker_notify,
-            result_tx,
-            read_ts_wait_seconds,
+            shared,
         }
     }
 }
@@ -221,24 +229,28 @@ where
     }
 
     async fn read_ts(&self) -> T {
-        let wait_start = Instant::now();
         let my_ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         self.worker_notify.notify_one();
 
-        // Subscribe to the watch channel and wait for our ticket to be served.
-        let mut rx = self.result_tx.subscribe();
+        // Fast path: check if already completed before registering for notification.
+        if self.shared.completed_up_to.load(Ordering::Acquire) > my_ticket {
+            return T::from(self.shared.latest_ts.load(Ordering::Acquire));
+        }
+
         loop {
-            {
-                let state = rx.borrow_and_update();
-                if state.completed_up_to > my_ticket {
-                    self.read_ts_wait_seconds
-                        .observe(wait_start.elapsed().as_secs_f64());
-                    return T::from(state.ts);
-                }
+            // Register for notification BEFORE re-checking the condition.
+            // This ensures we don't miss a notify_waiters() that fires
+            // between our check and our sleep.
+            let notified = self.shared.caller_notify.notified();
+            pin!(notified);
+            notified.as_mut().enable();
+
+            // Re-check after registration to avoid missed-wakeup race.
+            if self.shared.completed_up_to.load(Ordering::Acquire) > my_ticket {
+                return T::from(self.shared.latest_ts.load(Ordering::Acquire));
             }
-            rx.changed()
-                .await
-                .expect("worker task cannot stop while there are outstanding callers");
+
+            notified.await;
         }
     }
 
