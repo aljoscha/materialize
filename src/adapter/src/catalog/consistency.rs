@@ -12,6 +12,8 @@
 //! Note: the implementation of consistency checks should favor simplicity over performance, to
 //! make it as easy as possible to understand what a given check is doing.
 
+use std::collections::BTreeSet;
+
 use mz_controller_types::{ClusterId, ReplicaId};
 use mz_repr::role_id::RoleId;
 use mz_repr::{CatalogItemId, GlobalId};
@@ -76,6 +78,43 @@ impl CatalogState {
             inconsistencies.object_dependencies = dependencies;
         }
         if let Err(items) = self.check_items() {
+            inconsistencies.items = items;
+        }
+
+        if inconsistencies.is_empty() {
+            Ok(())
+        } else {
+            Err(Box::new(inconsistencies))
+        }
+    }
+
+    /// Checks consistency only for the specified catalog item IDs and their
+    /// immediate dependency neighbors. This is much cheaper than the full
+    /// `check_consistency` when only a few items have changed, because the
+    /// expensive O(n) sub-checks (`check_object_dependencies` and
+    /// `check_items`) are scoped to only the affected items.
+    ///
+    /// The cheap sub-checks (internal_fields, roles, comments) are still run
+    /// in full since they are fast.
+    pub fn check_consistency_for_ids(
+        &self,
+        changed_ids: &BTreeSet<CatalogItemId>,
+    ) -> Result<(), Box<CatalogInconsistencies>> {
+        let mut inconsistencies = CatalogInconsistencies::default();
+
+        if let Err(internal_fields) = self.check_internal_fields() {
+            inconsistencies.internal_fields = internal_fields;
+        }
+        if let Err(roles) = self.check_roles() {
+            inconsistencies.roles = roles;
+        }
+        if let Err(comments) = self.check_comments() {
+            inconsistencies.comments = comments;
+        }
+        if let Err(dependencies) = self.check_object_dependencies_for_ids(changed_ids) {
+            inconsistencies.object_dependencies = dependencies;
+        }
+        if let Err(items) = self.check_items_for_ids(changed_ids) {
             inconsistencies.items = items;
         }
 
@@ -459,6 +498,116 @@ impl CatalogState {
         }
     }
 
+    /// Same invariants as [`Self::check_object_dependencies`], but only checks the specified
+    /// item IDs and their immediate dependency neighbors.
+    fn check_object_dependencies_for_ids(
+        &self,
+        ids: &BTreeSet<CatalogItemId>,
+    ) -> Result<(), Vec<ObjectDependencyInconsistency>> {
+        // Collect the IDs we need to check: the changed items plus their
+        // immediate dependency neighbors (anything they reference or are
+        // referenced by). This ensures we catch any broken bidirectional links
+        // involving the changed items.
+        let mut ids_to_check = ids.clone();
+        for id in ids {
+            if let Some(entry) = self.entry_by_id.get(id) {
+                ids_to_check.extend(entry.references().items().copied());
+                ids_to_check.extend(entry.uses());
+                ids_to_check.extend(entry.referenced_by().iter().copied());
+                ids_to_check.extend(entry.used_by().iter().copied());
+            }
+        }
+
+        let mut dependency_inconsistencies = vec![];
+
+        for id in &ids_to_check {
+            let Some(entry) = self.entry_by_id.get(id) else {
+                // Item was dropped — that's fine, the drop itself is the
+                // change we're validating.
+                continue;
+            };
+            for referenced_id in entry.references().items() {
+                let Some(referenced_entry) = self.entry_by_id.get(referenced_id) else {
+                    dependency_inconsistencies.push(ObjectDependencyInconsistency::MissingUses {
+                        object_a: *id,
+                        object_b: *referenced_id,
+                    });
+                    continue;
+                };
+                if !referenced_entry.referenced_by().contains(id)
+                    && (referenced_entry.id() != *id && !referenced_entry.is_continual_task())
+                {
+                    dependency_inconsistencies.push(
+                        ObjectDependencyInconsistency::InconsistentUsedBy {
+                            object_a: *id,
+                            object_b: *referenced_id,
+                        },
+                    );
+                }
+            }
+            for used_id in entry.uses() {
+                let Some(used_entry) = self.entry_by_id.get(&used_id) else {
+                    dependency_inconsistencies.push(ObjectDependencyInconsistency::MissingUses {
+                        object_a: *id,
+                        object_b: used_id,
+                    });
+                    continue;
+                };
+                if !used_entry.used_by().contains(id)
+                    && (used_entry.id() != *id && !used_entry.is_continual_task())
+                {
+                    dependency_inconsistencies.push(
+                        ObjectDependencyInconsistency::InconsistentUsedBy {
+                            object_a: *id,
+                            object_b: used_id,
+                        },
+                    );
+                }
+            }
+
+            for referenced_by in entry.referenced_by() {
+                let Some(referenced_by_entry) = self.entry_by_id.get(referenced_by) else {
+                    dependency_inconsistencies.push(ObjectDependencyInconsistency::MissingUsedBy {
+                        object_a: *id,
+                        object_b: *referenced_by,
+                    });
+                    continue;
+                };
+                if !referenced_by_entry.references().contains_item(id) {
+                    dependency_inconsistencies.push(
+                        ObjectDependencyInconsistency::InconsistentUses {
+                            object_a: *id,
+                            object_b: *referenced_by,
+                        },
+                    );
+                }
+            }
+            for used_by in entry.used_by() {
+                let Some(used_by_entry) = self.entry_by_id.get(used_by) else {
+                    dependency_inconsistencies.push(ObjectDependencyInconsistency::MissingUsedBy {
+                        object_a: *id,
+                        object_b: *used_by,
+                    });
+                    continue;
+                };
+                if !used_by_entry.uses().contains(id) {
+                    dependency_inconsistencies.push(
+                        ObjectDependencyInconsistency::InconsistentUses {
+                            object_a: *id,
+                            object_b: *used_by,
+                        },
+                    );
+                }
+            }
+        }
+
+        if dependency_inconsistencies.is_empty() {
+            Ok(())
+        } else {
+            Err(dependency_inconsistencies)
+        }
+    }
+
     /// # Invariants
     ///
     /// * Every schema that exists in the `schemas_by_name` map, also exists in `schemas_by_id`.
@@ -507,6 +656,179 @@ impl CatalogState {
                             entry_name: entry.name().clone(),
                         });
                     }
+                    let statement = match mz_sql::parse::parse(entry.create_sql()) {
+                        Ok(mut statements) if statements.len() == 1 => {
+                            let statement = statements.pop().expect("checked length");
+                            statement.ast
+                        }
+                        Ok(_) => {
+                            item_inconsistencies.push(ItemInconsistency::MultiCreateStatement {
+                                create_sql: entry.create_sql().to_string(),
+                            });
+                            continue;
+                        }
+                        Err(e) => {
+                            item_inconsistencies.push(ItemInconsistency::StatementParseFailure {
+                                create_sql: entry.create_sql().to_string(),
+                                e,
+                            });
+                            continue;
+                        }
+                    };
+                    match statement {
+                        Statement::CreateConnection(ast::CreateConnectionStatement {
+                            name,
+                            ..
+                        })
+                        | Statement::CreateWebhookSource(ast::CreateWebhookSourceStatement {
+                            name,
+                            ..
+                        })
+                        | Statement::CreateSource(ast::CreateSourceStatement { name, .. })
+                        | Statement::CreateSubsource(ast::CreateSubsourceStatement {
+                            name, ..
+                        })
+                        | Statement::CreateSink(ast::CreateSinkStatement {
+                            name: Some(name),
+                            ..
+                        })
+                        | Statement::CreateView(ast::CreateViewStatement {
+                            definition: ast::ViewDefinition { name, .. },
+                            ..
+                        })
+                        | Statement::CreateMaterializedView(
+                            ast::CreateMaterializedViewStatement { name, .. },
+                        )
+                        | Statement::CreateTable(ast::CreateTableStatement { name, .. })
+                        | Statement::CreateType(ast::CreateTypeStatement { name, .. })
+                        | Statement::CreateSecret(ast::CreateSecretStatement { name, .. }) => {
+                            let [db_component, schema_component, item_component] = &name.0[..]
+                            else {
+                                let name =
+                                    name.0.into_iter().map(|ident| ident.to_string()).collect();
+                                item_inconsistencies.push(
+                                    ItemInconsistency::NonFullyQualifiedItemName {
+                                        create_sql: entry.create_sql().to_string(),
+                                        name,
+                                    },
+                                );
+                                continue;
+                            };
+                            if db_component.as_str() != &db.name
+                                || schema_component.as_str() != &schema.name.schema
+                                || item_component.as_str() != &entry.name().item
+                            {
+                                item_inconsistencies.push(
+                                    ItemInconsistency::CreateSqlItemNameMismatch {
+                                        item_name: vec![
+                                            db.name.clone(),
+                                            schema.name.schema.clone(),
+                                            entry.name().item.clone(),
+                                        ],
+                                        create_sql: entry.create_sql().to_string(),
+                                    },
+                                );
+                            }
+                        }
+                        Statement::CreateSchema(ast::CreateSchemaStatement { name, .. }) => {
+                            let [db_component, schema_component] = &name.0[..] else {
+                                let name =
+                                    name.0.into_iter().map(|ident| ident.to_string()).collect();
+                                item_inconsistencies.push(
+                                    ItemInconsistency::NonFullyQualifiedSchemaName {
+                                        create_sql: entry.create_sql().to_string(),
+                                        name,
+                                    },
+                                );
+                                continue;
+                            };
+                            if db_component.as_str() != &db.name
+                                || schema_component.as_str() != &schema.name.schema
+                            {
+                                item_inconsistencies.push(
+                                    ItemInconsistency::CreateSqlSchemaNameMismatch {
+                                        schema_name: vec![
+                                            db.name.clone(),
+                                            schema.name.schema.clone(),
+                                        ],
+                                        create_sql: entry.create_sql().to_string(),
+                                    },
+                                );
+                            }
+                        }
+                        Statement::CreateDatabase(ast::CreateDatabaseStatement {
+                            name, ..
+                        }) => {
+                            if db.name != name.0.as_str() {
+                                item_inconsistencies.push(
+                                    ItemInconsistency::CreateSqlDatabaseNameMismatch {
+                                        database_name: db.name.clone(),
+                                        create_sql: entry.create_sql().to_string(),
+                                    },
+                                );
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+            }
+        }
+
+        if item_inconsistencies.is_empty() {
+            Ok(())
+        } else {
+            Err(item_inconsistencies)
+        }
+    }
+
+    /// Same invariants as [`Self::check_items`], but only performs the expensive SQL parse
+    /// for items in the specified set. Schema/item existence and name-match checks are still
+    /// done for all items (they are cheap map lookups).
+    fn check_items_for_ids(
+        &self,
+        ids: &BTreeSet<CatalogItemId>,
+    ) -> Result<(), Vec<ItemInconsistency>> {
+        let mut item_inconsistencies = vec![];
+
+        for (db_id, db) in &self.database_by_id {
+            for (schema_name, schema_id) in &db.schemas_by_name {
+                let Some(schema) = db.schemas_by_id.get(schema_id) else {
+                    item_inconsistencies.push(ItemInconsistency::MissingSchema {
+                        db_id: *db_id,
+                        schema_name: schema_name.clone(),
+                    });
+                    continue;
+                };
+                if schema_name != &schema.name.schema {
+                    item_inconsistencies.push(ItemInconsistency::KeyedName {
+                        db_schema_by_name: schema_name.clone(),
+                        struct_name: schema.name.schema.clone(),
+                    });
+                }
+
+                for (item_name, item_id) in &schema.items {
+                    let Some(entry) = self.entry_by_id.get(item_id) else {
+                        item_inconsistencies.push(ItemInconsistency::NonExistentItem {
+                            db_id: *db_id,
+                            schema_id: schema.id,
+                            item_id: *item_id,
+                        });
+                        continue;
+                    };
+                    if item_name != &entry.name().item {
+                        item_inconsistencies.push(ItemInconsistency::ItemNameMismatch {
+                            item_id: *item_id,
+                            map_name: item_name.clone(),
+                            entry_name: entry.name().clone(),
+                        });
+                    }
+
+                    // Only parse create_sql for items that were changed — this
+                    // is the expensive part that makes the full check O(n).
+                    if !ids.contains(item_id) {
+                        continue;
+                    }
+
                     let statement = match mz_sql::parse::parse(entry.create_sql()) {
                         Ok(mut statements) if statements.len() == 1 => {
                             let statement = statements.pop().expect("checked length");

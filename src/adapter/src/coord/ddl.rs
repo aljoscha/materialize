@@ -102,6 +102,11 @@ impl Coordinator {
     {
         let start = Instant::now();
 
+        // Capture affected item IDs before ops are consumed, so the
+        // post-transaction consistency check can be scoped to only the
+        // changed items instead of scanning the entire catalog.
+        let changed_ids = Self::affected_item_ids(&ops);
+
         let (table_updates, catalog_updates) = self
             .catalog_transact_inner(ctx.as_ref().map(|ctx| ctx.session().conn_id()), ops)
             .await?;
@@ -118,9 +123,11 @@ impl Coordinator {
         apply_implications_res.expect("cannot fail to apply catalog update implications");
 
         // Note: It's important that we keep the function call inside macro, this way we only run
-        // the consistency checks if soft assertions are enabled.
+        // the consistency checks if soft assertions are enabled. The targeted
+        // check only validates the items affected by `ops` and their immediate
+        // dependency neighbors, avoiding O(n) scaling on large catalogs.
         mz_ore::soft_assert_eq_no_log!(
-            self.check_consistency(),
+            self.check_consistency_for_ids(&changed_ids),
             Ok(()),
             "coordinator inconsistency detected"
         );
@@ -162,6 +169,9 @@ impl Coordinator {
     ) -> Result<(), AdapterError> {
         let start = Instant::now();
 
+        // Capture affected item IDs before ops are consumed.
+        let changed_ids = Self::affected_item_ids(&ops);
+
         let conn_id = conn_id.or_else(|| ctx.as_ref().map(|ctx| ctx.session().conn_id()));
 
         let (table_updates, catalog_updates) = self.catalog_transact_inner(conn_id, ops).await?;
@@ -187,7 +197,7 @@ impl Coordinator {
         // Note: It's important that we keep the function call inside macro, this way we only run
         // the consistency checks if soft assertions are enabled.
         mz_ore::soft_assert_eq_no_log!(
-            self.check_consistency(),
+            self.check_consistency_for_ids(&changed_ids),
             Ok(()),
             "coordinator inconsistency detected"
         );

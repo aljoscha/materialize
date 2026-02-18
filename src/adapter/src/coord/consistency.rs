@@ -9,8 +9,11 @@
 
 //! Internal consistency checks that validate invariants of [`Coordinator`].
 
+use std::collections::BTreeSet;
+
 use super::Coordinator;
 use crate::catalog::consistency::CatalogInconsistencies;
+use crate::catalog::{self, DropObjectInfo};
 use mz_adapter_types::connection::ConnectionIdType;
 use mz_catalog::memory::objects::{CatalogItem, DataSourceDesc, Source, Table, TableDataSource};
 use mz_controller_types::{ClusterId, ReplicaId};
@@ -67,6 +70,103 @@ impl Coordinator {
         } else {
             Err(inconsistencies)
         }
+    }
+
+    /// Same as [`Self::check_consistency`] but scopes the expensive catalog
+    /// checks to only the specified item IDs and their immediate dependency
+    /// neighbors. This avoids O(n) scaling when the catalog is large but only
+    /// a few items changed.
+    pub fn check_consistency_for_ids(
+        &self,
+        changed_ids: &BTreeSet<CatalogItemId>,
+    ) -> Result<(), CoordinatorInconsistencies> {
+        let mut inconsistencies = CoordinatorInconsistencies::default();
+
+        if let Err(catalog_inconsistencies) = self
+            .catalog()
+            .state()
+            .check_consistency_for_ids(changed_ids)
+        {
+            inconsistencies.catalog_inconsistencies = catalog_inconsistencies;
+        }
+
+        if let Err(read_holds) = self.check_read_holds() {
+            inconsistencies.read_holds = read_holds;
+        }
+
+        if let Err(active_webhooks) = self.check_active_webhooks() {
+            inconsistencies.active_webhooks = active_webhooks;
+        }
+
+        if let Err(cluster_statuses) = self.check_cluster_statuses() {
+            inconsistencies.cluster_statuses = cluster_statuses;
+        }
+
+        if inconsistencies.is_empty() {
+            Ok(())
+        } else {
+            Err(inconsistencies)
+        }
+    }
+
+    /// Extracts the set of [`CatalogItemId`]s that are affected by the given
+    /// catalog operations.
+    pub(crate) fn affected_item_ids(ops: &[catalog::Op]) -> BTreeSet<CatalogItemId> {
+        let mut ids = BTreeSet::new();
+        for op in ops {
+            match op {
+                catalog::Op::CreateItem { id, .. } => {
+                    ids.insert(*id);
+                }
+                catalog::Op::DropObjects(drop_infos) => {
+                    for info in drop_infos {
+                        if let DropObjectInfo::Item(id) = info {
+                            ids.insert(*id);
+                        }
+                    }
+                }
+                catalog::Op::AlterRetainHistory { id, .. }
+                | catalog::Op::AlterAddColumn { id, .. }
+                | catalog::Op::RenameItem { id, .. }
+                | catalog::Op::UpdateItem { id, .. }
+                | catalog::Op::UpdateSourceReferences { source_id: id, .. } => {
+                    ids.insert(*id);
+                }
+                catalog::Op::AlterMaterializedViewApplyReplacement {
+                    id,
+                    replacement_id,
+                } => {
+                    ids.insert(*id);
+                    ids.insert(*replacement_id);
+                }
+                // Non-item ops don't affect catalog item consistency.
+                catalog::Op::AlterRole { .. }
+                | catalog::Op::AlterNetworkPolicy { .. }
+                | catalog::Op::CreateDatabase { .. }
+                | catalog::Op::CreateSchema { .. }
+                | catalog::Op::CreateRole { .. }
+                | catalog::Op::CreateCluster { .. }
+                | catalog::Op::CreateClusterReplica { .. }
+                | catalog::Op::CreateNetworkPolicy { .. }
+                | catalog::Op::Comment { .. }
+                | catalog::Op::GrantRole { .. }
+                | catalog::Op::RenameCluster { .. }
+                | catalog::Op::RenameClusterReplica { .. }
+                | catalog::Op::RenameSchema { .. }
+                | catalog::Op::UpdateOwner { .. }
+                | catalog::Op::UpdatePrivilege { .. }
+                | catalog::Op::UpdateDefaultPrivilege { .. }
+                | catalog::Op::RevokeRole { .. }
+                | catalog::Op::UpdateClusterConfig { .. }
+                | catalog::Op::UpdateClusterReplicaConfig { .. }
+                | catalog::Op::UpdateSystemConfiguration { .. }
+                | catalog::Op::ResetSystemConfiguration { .. }
+                | catalog::Op::ResetAllSystemConfiguration
+                | catalog::Op::WeirdStorageUsageUpdates { .. }
+                | catalog::Op::TransactionDryRun => {}
+            }
+        }
+        ids
     }
 
     /// # Invariants:

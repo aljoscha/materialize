@@ -185,3 +185,59 @@ Options:
 3. Optimize the sub-checks: replace `check_items`'s full SQL re-parse with a
    cheaper validation, and optimize `check_object_dependencies`'s contains()
    lookups.
+
+### Session 3: Make check_consistency incremental (2026-02-18)
+
+**Goal:** Eliminate the O(n) scaling from `check_consistency` by making the two
+expensive sub-checks (`check_object_dependencies` and `check_items`) only
+examine the items affected by the current DDL operation.
+
+**Approach:** Added targeted consistency check methods that scope the expensive
+work to only the changed items:
+- `check_object_dependencies_for_ids`: only checks dependency bidirectionality
+  for the changed items and their immediate dependency neighbors
+- `check_items_for_ids`: still iterates schema/item maps (cheap lookups) but
+  only re-parses `create_sql` for the changed items
+- `check_consistency_for_ids`: replaces the full check in DDL transaction paths
+
+In `coord/ddl.rs`, the two catalog_transact methods now extract affected item
+IDs from the ops list before consuming them, then pass those IDs to the targeted
+check instead of calling the full `check_consistency()`.
+
+The full `check_consistency()` is preserved for the explicit API endpoint and
+other callers — only the DDL hot path uses the incremental version.
+
+**Code changes:**
+- `src/adapter/src/catalog/consistency.rs` — added `check_consistency_for_ids`,
+  `check_object_dependencies_for_ids`, `check_items_for_ids`
+- `src/adapter/src/coord/consistency.rs` — added `check_consistency_for_ids`,
+  `affected_item_ids`
+- `src/adapter/src/coord/ddl.rs` — modified `catalog_transact_with_side_effects`
+  and `catalog_transact_with_context` to use targeted checks
+
+**Results (median of 5 samples, debug build):**
+
+| User Objects | Before (Session 1) | After (Session 3) | Improvement |
+|-------------|--------------------|--------------------|-------------|
+| 0           | 225 ms             | 183 ms             | 19%         |
+| ~116        | 250 ms             | 200 ms             | 20%         |
+| ~531        | 337 ms             | 254 ms             | 25%         |
+| ~1046       | 426 ms             | 330 ms             | 23%         |
+| ~2061       | 700 ms             | 443 ms             | 37%         |
+| ~3076       | 1034 ms            | 600 ms             | 42%         |
+
+**Key observations:**
+- The O(n) scaling slope improved from ~270ms/1000 objects to ~140ms/1000
+  objects — roughly a **2x improvement in scaling**.
+- At 3000 tables, CREATE TABLE went from ~1034ms to ~600ms (42% faster).
+- The improvement grows with scale (19% at baseline → 42% at 3000 tables),
+  confirming we eliminated a significant O(n) component.
+- There is still O(n) scaling at ~140ms/1000 objects — this comes from the
+  remaining cheap sub-checks (check_internal_fields, check_roles, check_comments
+  etc.) which still iterate all objects, plus some O(n) cost in the catalog
+  transaction path itself (e.g. builtin table updates, clones, etc.).
+
+**Next step:** Profile again at ~3000 tables to identify the remaining O(n)
+sources. The remaining ~140ms/1000 objects is split between the cheap
+consistency sub-checks (which could also be made incremental) and the actual
+catalog transaction overhead.
