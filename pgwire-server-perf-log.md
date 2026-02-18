@@ -803,3 +803,78 @@ Why does `inner_read` increase with concurrency/in-flight parallelism?
 Likely candidates: Postgres/CRDB connection-pool contention, increased CRDB
 hot-row read contention, and/or client-side scheduling overhead in
 `PostgresTimestampOracle::read_ts()`.
+
+### Session 46: Baseline recalibration after peek_read_ts_fast removal
+
+**Discovery:** The baselines from Sessions 37-45 were measured with binaries
+that still had `peek_read_ts_fast` (the shared-atomic oracle fast path from
+Session 42). This was later documented as rejected in GUIDE.md for violating
+strict serializability, but the code was still present in the built binaries.
+
+The `peek_read_ts_fast` optimization let ~99.99% of queries skip the oracle
+`read_ts()` round-trip entirely by reading a cached atomic timestamp value.
+Without it, every StrictSerializable query must call `oracle.read_ts().await`,
+which goes through the batching oracle channel to CRDB at ~400-500µs per call.
+
+**True baseline (HEAD without `peek_read_ts_fast`, optimized build):**
+
+| connections | QPS       | latency    |
+|-------------|-----------|------------|
+| 1           | 2,491     | 394µs      |
+| 16          | 32,406    | 486µs      |
+| 64          | 103,414   | 593µs      |
+
+Compared to Session 44 baselines (with `peek_read_ts_fast`):
+
+| connections | QPS (with fast) | QPS (without) | ratio  |
+|-------------|-----------------|---------------|--------|
+| 1           | 18,205          | 2,491         | 7.3x   |
+| 16          | N/A             | 32,406        | N/A    |
+| 64          | 183,380         | 103,414       | 1.8x   |
+
+**Attempted optimization: BTreeMap lookup caching on PeekClient**
+
+Profiling (perf record) of the old baseline showed ~9 BTreeMap lookups per
+query in the inline timestamp + implement_fast_path_peek_plan path, scaling
+4-10x under concurrency due to CPU cache pressure. Implemented a
+`CachedInlineState` struct on `PeekClient` to cache the oracle, shared
+collection state, and read hold for the most recently used
+(instance, collection) pair, eliminating BTreeMap traversals.
+
+Result: **neutral** — the ~2-3µs savings are negligible against the ~400µs
+oracle `read_ts()` per-query cost. Changes reverted.
+
+| connections | baseline QPS | optimized QPS | delta  |
+|-------------|-------------|---------------|--------|
+| 1           | 2,491       | 2,241         | -10%   |
+| 16          | 32,406      | 31,538        | -3%    |
+| 64          | 103,414     | 105,372       | +2%    |
+
+**Key metric:** `oracle.read_ts().await` average = **483µs** (measured from
+`mz_frontend_peek_read_ts_seconds_sum / _count`), which is ~97% of total
+per-query latency at 1c.
+
+**Additional bug found:** `statement_logging` panics in the coordinator thread
+when frontend peek sequencing is enabled with statement logging active. The
+`end_statement_execution` call can't find the matching `begin` record. The
+workaround is `statement_logging_max_sample_rate=0` (already in our setup).
+
+**Conclusion:**
+
+The oracle `read_ts()` round-trip is the dominant bottleneck. Any optimization
+that does not reduce oracle call frequency or latency will be negligible.
+Possible approaches for future sessions:
+
+1. **Correctness-preserving oracle fast path:** Re-examine whether a
+   variant of `peek_read_ts_fast` can be made correct. The GUIDE.md documents
+   why the original was incorrect (violates real-time bounds, violates
+   distributed correctness). Could we use a bounded staleness approach (e.g.,
+   read_ts is valid for queries arriving within some epsilon of wall-clock time)?
+2. **Reduce oracle latency:** Optimize the CRDB `read_ts` query itself,
+   or use a different backing store for the timestamp oracle.
+3. **Batch oracle calls across queries:** Instead of one `read_ts()` per query,
+   have the frontend tasks share a single in-flight oracle call and all use the
+   same timestamp. This is essentially what `peek_read_ts_fast` did atomically.
+4. **Serializable default:** If queries use Serializable instead of
+   StrictSerializable, the oracle call is skipped entirely (timestamp comes from
+   the write frontier). This is a semantic change but worth benchmarking.
