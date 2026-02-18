@@ -23,6 +23,8 @@ use mz_repr::Timestamp;
 use crate::TimestampOracle;
 #[cfg(feature = "foundationdb")]
 use crate::foundationdb_oracle::{FdbTimestampOracle, FdbTimestampOracleConfig};
+#[cfg(feature = "grpc")]
+use crate::grpc_oracle::{GrpcTimestampOracle, GrpcTimestampOracleConfig};
 use crate::metrics::Metrics;
 use crate::postgres_oracle::{
     PostgresTimestampOracle, PostgresTimestampOracleConfig, TimestampOracleParameters,
@@ -39,6 +41,9 @@ pub enum TimestampOracleConfig {
     /// Use a FoundationDB-backed timestamp oracle.
     #[cfg(feature = "foundationdb")]
     Fdb(FdbTimestampOracleConfig),
+    /// Use a gRPC-backed timestamp oracle (tsoracled).
+    #[cfg(feature = "grpc")]
+    Grpc(GrpcTimestampOracleConfig),
 }
 
 impl TimestampOracleConfig {
@@ -83,12 +88,20 @@ impl TimestampOracleConfig {
         TimestampOracleConfig::Fdb(FdbTimestampOracleConfig::new(url, metrics_registry))
     }
 
+    /// Create a new gRPC-backed timestamp oracle configuration.
+    #[cfg(feature = "grpc")]
+    pub fn new_grpc(url: &str, metrics_registry: &MetricsRegistry) -> Self {
+        TimestampOracleConfig::Grpc(GrpcTimestampOracleConfig::new(url, metrics_registry))
+    }
+
     /// Returns the metrics for this configuration.
     pub fn metrics(&self) -> Arc<Metrics> {
         match self {
             TimestampOracleConfig::Postgres(config) => Arc::clone(config.metrics()),
             #[cfg(feature = "foundationdb")]
             TimestampOracleConfig::Fdb(config) => Arc::clone(config.metrics()),
+            #[cfg(feature = "grpc")]
+            TimestampOracleConfig::Grpc(config) => Arc::clone(config.metrics()),
         }
     }
 
@@ -124,6 +137,17 @@ impl TimestampOracleConfig {
                 .expect("failed to open FdbTimestampOracle");
                 Arc::new(fdb_oracle)
             }
+            #[cfg(feature = "grpc")]
+            TimestampOracleConfig::Grpc(config) => Arc::new(
+                GrpcTimestampOracle::open(
+                    config.clone(),
+                    timeline,
+                    initially,
+                    now_fn.clone(),
+                    read_only,
+                )
+                .await,
+            ),
         }
     }
 
@@ -139,6 +163,10 @@ impl TimestampOracleConfig {
             TimestampOracleConfig::Fdb(config) => {
                 FdbTimestampOracle::<NowFn>::get_all_timelines(config.clone()).await
             }
+            #[cfg(feature = "grpc")]
+            TimestampOracleConfig::Grpc(config) => {
+                GrpcTimestampOracle::get_all_timelines(config.clone()).await
+            }
         }
     }
 
@@ -147,7 +175,6 @@ impl TimestampOracleConfig {
     /// This is a no-op for non-Postgres backends.
     pub fn apply_parameters(&self, params: TimestampOracleParameters) {
         // Only the Postgres oracle supports parameters for now.
-        #[allow(irrefutable_let_patterns)]
         if let TimestampOracleConfig::Postgres(pg_config) = self {
             params.apply(pg_config)
         }

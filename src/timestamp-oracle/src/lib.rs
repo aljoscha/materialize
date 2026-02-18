@@ -21,9 +21,15 @@ pub mod batching_oracle;
 pub mod config;
 #[cfg(feature = "foundationdb")]
 pub mod foundationdb_oracle;
+#[cfg(feature = "grpc")]
+pub mod grpc_oracle;
+#[cfg(feature = "grpc")]
+pub mod grpc_server;
 pub mod metrics;
 pub mod postgres_oracle;
 pub mod retry;
+#[cfg(feature = "grpc")]
+pub mod service;
 
 pub use config::TimestampOracleConfig;
 

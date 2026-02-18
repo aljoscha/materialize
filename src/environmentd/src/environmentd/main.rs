@@ -405,6 +405,10 @@ pub struct Args {
     /// The PostgreSQL URL for the Postgres-backed timestamp oracle.
     #[clap(long, env = "TIMESTAMP_ORACLE_URL", value_name = "POSTGRES_URL")]
     timestamp_oracle_url: Option<SensitiveUrl>,
+    /// URL of the tsoracled gRPC service for timestamp oracle.
+    /// If set, uses the gRPC timestamp oracle instead of direct Postgres.
+    #[clap(long, env = "TSORACLED_URL")]
+    tsoracled_url: Option<String>,
     /// Availability zones in which storage and compute resources may be
     /// deployed.
     #[clap(long, env = "AVAILABILITY_ZONE", use_value_delimiter = true)]
@@ -1117,6 +1121,7 @@ fn run(mut args: Args) -> Result<(), anyhow::Error> {
                 availability_zones: args.availability_zone,
                 cluster_replica_sizes,
                 timestamp_oracle_url,
+                tsoracled_url: args.tsoracled_url,
                 segment_api_key: args.segment_api_key,
                 segment_client_side: args.segment_client_side,
                 test_only_dummy_segment_client: args.test_only_dummy_segment_client,

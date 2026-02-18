@@ -148,6 +148,9 @@ pub struct Config {
     pub cluster_replica_sizes: ClusterReplicaSizeMap,
     /// The PostgreSQL URL for the Postgres-backed timestamp oracle.
     pub timestamp_oracle_url: Option<SensitiveUrl>,
+    /// URL of the tsoracled gRPC service. If set, uses the gRPC timestamp
+    /// oracle instead of direct Postgres.
+    pub tsoracled_url: Option<String>,
     /// An API key for Segment. Enables export of audit events to Segment.
     pub segment_api_key: Option<String>,
     /// Whether the Segment client is being used on the client side
@@ -774,6 +777,7 @@ impl Listeners {
             storage: adapter_storage,
             audit_logs_iterator,
             timestamp_oracle_url: config.timestamp_oracle_url,
+            tsoracled_url: config.tsoracled_url,
             unsafe_mode: config.unsafe_mode,
             all_features: config.all_features,
             build_info: &BUILD_INFO,

@@ -1077,6 +1077,9 @@ pub struct Config {
     pub storage: Box<dyn mz_catalog::durable::DurableCatalogState>,
     pub audit_logs_iterator: AuditLogIterator,
     pub timestamp_oracle_url: Option<SensitiveUrl>,
+    /// URL of the tsoracled gRPC service. If set, uses the gRPC timestamp
+    /// oracle instead of direct Postgres.
+    pub tsoracled_url: Option<String>,
     pub unsafe_mode: bool,
     pub all_features: bool,
     pub build_info: &'static BuildInfo,
@@ -4132,6 +4135,7 @@ pub fn serve(
         mut storage,
         audit_logs_iterator,
         timestamp_oracle_url,
+        tsoracled_url,
         unsafe_mode,
         all_features,
         build_info,
@@ -4212,6 +4216,36 @@ pub fn serve(
 
         let pg_timestamp_oracle_config = timestamp_oracle_url
             .map(|pg_url| PostgresTimestampOracleConfig::new(&pg_url, &metrics_registry));
+
+        // Determine which oracle config to use: gRPC (tsoracled) or Postgres.
+        let timestamp_oracle_config: Option<TimestampOracleConfig> = {
+            #[cfg(feature = "grpc")]
+            {
+                if let Some(ref url) = tsoracled_url {
+                    info!("using gRPC timestamp oracle at {}", url);
+                    // Reuse the metrics already registered by the pg config to avoid
+                    // double-registration panics in the prometheus registry.
+                    let metrics = pg_timestamp_oracle_config
+                        .as_ref()
+                        .map(|c| Arc::clone(c.metrics()))
+                        .unwrap_or_else(|| Arc::new(mz_timestamp_oracle::metrics::Metrics::new(&metrics_registry)));
+                    Some(TimestampOracleConfig::Grpc(
+                        mz_timestamp_oracle::grpc_oracle::GrpcTimestampOracleConfig {
+                            url: url.clone(),
+                            metrics,
+                        },
+                    ))
+                } else {
+                    pg_timestamp_oracle_config.clone().map(TimestampOracleConfig::Postgres)
+                }
+            }
+            #[cfg(not(feature = "grpc"))]
+            {
+                let _ = &tsoracled_url;
+                pg_timestamp_oracle_config.clone().map(TimestampOracleConfig::Postgres)
+            }
+        };
+
         let mut initial_timestamps =
             get_initial_oracle_timestamps(&pg_timestamp_oracle_config).await?;
 
@@ -4227,7 +4261,7 @@ pub fn serve(
                 &timeline,
                 initial_timestamp,
                 now.clone(),
-                pg_timestamp_oracle_config.clone().map(TimestampOracleConfig::Postgres),
+                timestamp_oracle_config.clone(),
                 &mut timestamp_oracles,
                 read_only_controllers,
             )

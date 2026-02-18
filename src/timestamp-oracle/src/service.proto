@@ -1,0 +1,60 @@
+// Copyright Materialize, Inc. and contributors. All rights reserved.
+//
+// Use of this software is governed by the Business Source License
+// included in the LICENSE file.
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0.
+
+syntax = "proto3";
+
+package mz_timestamp_oracle.service;
+
+message ProtoTimeline {
+    string timeline = 1;
+}
+
+message ProtoWriteTimestamp {
+    uint64 timestamp = 1;
+    uint64 advance_to = 2;
+}
+
+message ProtoTimestamp {
+    uint64 timestamp = 1;
+}
+
+message ProtoApplyWriteRequest {
+    string timeline = 1;
+    uint64 lower_bound = 2;
+}
+
+message ProtoOpenTimelineRequest {
+    string timeline = 1;
+    uint64 initially = 2;
+    bool read_only = 3;
+}
+
+message ProtoOpenTimelineResponse {}
+
+message ProtoGetAllTimelinesRequest {}
+
+message ProtoTimelineTimestamp {
+    string timeline = 1;
+    uint64 timestamp = 2;
+}
+
+message ProtoGetAllTimelinesResponse {
+    repeated ProtoTimelineTimestamp timelines = 1;
+}
+
+message ProtoEmpty {}
+
+service ProtoTsOracle {
+    rpc WriteTs(ProtoTimeline) returns (ProtoWriteTimestamp);
+    rpc PeekWriteTs(ProtoTimeline) returns (ProtoTimestamp);
+    rpc ReadTs(ProtoTimeline) returns (ProtoTimestamp);
+    rpc ApplyWrite(ProtoApplyWriteRequest) returns (ProtoEmpty);
+    rpc OpenTimeline(ProtoOpenTimelineRequest) returns (ProtoOpenTimelineResponse);
+    rpc GetAllTimelines(ProtoGetAllTimelinesRequest) returns (ProtoGetAllTimelinesResponse);
+}

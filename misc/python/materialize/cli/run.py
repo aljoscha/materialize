@@ -38,7 +38,7 @@ from materialize.ui import UIError
 from materialize.xcompile import Arch
 
 KNOWN_PROGRAMS = ["environmentd", "sqllogictest"]
-REQUIRED_SERVICES = ["clusterd"]
+REQUIRED_SERVICES = ["clusterd", "tsoracled"]
 
 SANITIZER_TARGET = (
     f"{Arch.host()}-unknown-linux-gnu"
@@ -412,6 +412,23 @@ def main() -> int:
     # Then, spawn the desired command.
     print(f"$ {' '.join(command)}")
     if args.program == "environmentd":
+        # Start tsoracled as a sibling process before environmentd.
+        tsoracled_binary = binaries_dir / "tsoracled"
+        tsoracled_url = None
+        if tsoracled_binary.exists():
+            tsoracled_cmd = [
+                str(tsoracled_binary),
+                f"--timestamp-oracle-url={args.postgres}?options=--search_path=tsoracle",
+                "--listen-addr=127.0.0.1:6880",
+            ]
+            print(f"$ {' '.join(tsoracled_cmd)}")
+            tsoracled_proc = subprocess.Popen(tsoracled_cmd, env=env)
+            atexit.register(lambda: tsoracled_proc.terminate())
+            tsoracled_url = "http://127.0.0.1:6880"
+            time.sleep(0.5)  # Brief wait for tsoracled to start listening
+        if tsoracled_url:
+            command.append(f"--tsoracled-url={tsoracled_url}")
+
         # Automatically restart `environmentd` after it halts, but not more than
         # once every 5s to prevent hot loops. This simulates what happens when
         # running in Kubernetes, which restarts failed `environmentd` process
@@ -471,6 +488,8 @@ def _cargo_build(
         )
     if args.foundationdb:
         features.append("foundationdb")
+    # Enable gRPC timestamp oracle support so environmentd can talk to tsoracled.
+    features.append("grpc")
     if args.features:
         features.extend(args.features.split(","))
     if features:
