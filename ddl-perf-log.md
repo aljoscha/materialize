@@ -112,3 +112,76 @@ connection → execute DDL → close.
 **Next step:** Profile the slow path with `perf record` at ~3000 tables to
 identify which functions dominate the per-statement cost and where the O(n)
 scaling lives.
+
+### Session 2: Profiling — found check_consistency as dominant bottleneck (2026-02-18)
+
+**Goal:** Profile DDL at ~3000 tables to identify where the O(n) scaling lives.
+
+**Setup:** Same debug build. environmentd running with ~3091 user objects (3000+
+tables from Session 1). Ran `perf record -F 99 --call-graph fp` during 20
+CREATE TABLE statements, processed with `inferno-collapse-perf`.
+
+**Results — Coordinator time breakdown during CREATE TABLE at ~3000 objects:**
+
+| Component | % of coordinator time | Description |
+|-----------|----------------------|-------------|
+| `check_consistency` | **52.4%** | O(n) consistency check running on EVERY DDL |
+| `catalog_transact_inner` (excl check) | 24.5% | Actual catalog mutation + persist writes |
+| persist/durable writes | ~17% | Writing to CockroachDB (within transact_inner) |
+| `apply_catalog_implications` | 1.5% | Applying side effects (compute/storage) |
+| Other coordinator overhead | ~4% | Message handling, sequencing, etc. |
+
+**Inside `check_consistency` breakdown:**
+
+| Sub-check | % of check_consistency | What it does |
+|-----------|----------------------|--------------|
+| `check_object_dependencies` | **56.1%** | Iterates ALL objects, checks bidirectional dependency consistency |
+| `check_items` | **39.7%** | Iterates ALL objects, **re-parses every object's CREATE SQL** |
+| `check_internal_fields` | 1.4% | |
+| `check_read_holds` | 1.4% | |
+| `check_comments` | 0.5% | |
+| `check_roles` | 0.4% | |
+
+**Root cause:** `check_consistency()` is called from `catalog_transact_with_side_effects`
+and `catalog_transact_with_context` (the two DDL transaction paths) via
+`mz_ore::soft_assert_eq_no_log!`. This macro checks `soft_assertions_enabled()`
+which returns **true in debug builds** (`cfg!(debug_assertions)`). So every single
+DDL statement triggers a full consistency check that iterates over every object in
+the catalog.
+
+The two dominant sub-checks are:
+1. **`check_object_dependencies`** (56% of check): Iterates all entries in
+   `entry_by_id`, for each checks `references()`, `uses()`, `referenced_by()`,
+   `used_by()` — verifying bidirectional consistency. O(n × m) where m is avg
+   dependencies per object.
+2. **`check_items`** (40% of check): Iterates all database → schema → item
+   entries and **re-parses the `create_sql` string** for every single object via
+   `mz_sql::parse::parse()`. This is the most wasteful — SQL parsing is expensive
+   and done for ALL objects on every DDL statement.
+
+**Code locations:**
+- `src/adapter/src/coord/ddl.rs:122-126` — soft_assert calling check_consistency
+- `src/adapter/src/coord/ddl.rs:189-193` — same in catalog_transact_with_context
+- `src/adapter/src/coord/consistency.rs:46` — Coordinator::check_consistency
+- `src/adapter/src/catalog/consistency.rs:63` — CatalogState::check_consistency
+- `src/ore/src/assert.rs:62` — soft assertions enabled by default in debug builds
+
+**Implications:**
+- In **production (release) builds**, `check_consistency` does NOT run (soft
+  assertions are disabled), so this bottleneck doesn't affect production.
+- In **debug builds** (used for development, testing), this creates severe O(n)
+  DDL degradation. This is the entirety of the O(n) scaling we measured in
+  Session 1.
+- Once we eliminate check_consistency from the hot path, the remaining
+  catalog_transact time (~17% persist writes + ~7% in-memory catalog work) may
+  reveal a second layer of scaling, but it should be much smaller.
+
+**Next step:** Disable or optimize the consistency check in the DDL hot path.
+Options:
+1. Skip `check_consistency` entirely during normal DDL in debug builds (only
+   run on explicit API call or periodically).
+2. Make `check_consistency` incremental — only check the objects that were
+   actually modified by the current DDL operation.
+3. Optimize the sub-checks: replace `check_items`'s full SQL re-parse with a
+   cheaper validation, and optimize `check_object_dependencies`'s contains()
+   lookups.
