@@ -62,28 +62,35 @@ anymore in our next sessions. Update the prompt in a separate jj change with a
 good description.
 
 Immediate next steps (handoff):
- - Run all dbbench runs with fixed pool settings to avoid churn artifacts:
-   `-max-active-conns N -max-idle-conns N -force-pre-auth` (with `N=concurrency`).
- - Sanity-check each run for churn:
-   `command-startup ~= N`, `command-terminate ~= N`, and `mz_append_table_duration_seconds_count` / `apply_write` should stay near the read-ts tick rate (not spike).
- - Run a concurrency sweep on the bigger machine (`1,4,16,64,128` and optionally `256`) and capture:
-   `mz_frontend_peek_seconds{kind="try_frontend_peek_cached"}`,
-   `mz_frontend_peek_read_ts_seconds`,
-   `mz_ts_oracle_batch_wait_seconds{op="read_ts"}`,
-   `mz_ts_oracle_batch_inner_read_seconds{op="read_ts"}`,
-   `mz_ts_oracle_batched_op_count{op="read_ts"}`,
-   `mz_ts_oracle_batches_count{op="read_ts"}`.
- - Use the new phase histograms to break down postgres-backed `read_ts`:
-   `mz_ts_oracle_postgres_read_ts_phase_seconds{phase="get_connection|prepare_cached|query_one"}`.
-   We already observed that 64->128 inner-read growth is almost entirely in `phase="query_one"`.
- - For each case, reset CRDB SQL stats before the run (`SELECT crdb_internal.reset_sql_stats();`) and compare CRDB statement stats for
-   `SELECT read_ts FROM timestamp_oracle WHERE timeline = $1` (`svcLat`, `runLat`, `cpuSQLNanos`, `contentionTime`)
-   against the `query_one` phase metric. This separates DB server time from envd/runtime overhead.
- - Check CPU/runtime pressure on the bigger machine using Tokio runtime metrics:
-   `mz_tokio_worker_total_busy_duration{runtime="main"}`,
-   `mz_tokio_budget_forced_yield_count{runtime="main"}`,
-   `mz_tokio_worker_poll_count{runtime="main"}`.
-   Goal: determine if we are scheduler/CPU bound vs DB-latency bound.
- - Decision after data:
-   if `query_one` rises mainly because CRDB `svcLat` rises, focus on CRDB-side causes (storage/compaction/hot-row effects);
-   if `query_one` rises much more than CRDB `svcLat`, focus on envd/runtime scheduling and oracle call path isolation.
+
+**Critical context from Session 46:** The `peek_read_ts_fast` optimization
+(Session 42) was removed for correctness reasons. Without it, `oracle.read_ts()`
+is called on every StrictSerializable query and dominates latency at ~483µs
+(~97% of per-query time). The true baseline is ~2,500 QPS at 1c and ~103K at
+64c. BTreeMap lookup caching was attempted and found to save only ~2-3µs per
+query — negligible. Any future optimization must reduce oracle call frequency
+or latency.
+
+- **Explore correctness-preserving oracle call batching/sharing.** The batching
+  oracle already batches calls from the backing store side, but each frontend
+  query still does its own `read_ts().await` through the batching channel. Could
+  we coalesce multiple frontend queries into a single oracle round-trip? The key
+  correctness constraint is that each query must get a timestamp >= the latest
+  write_ts at the time the query arrived (strict serializability). A shared
+  "current read_ts" that is refreshed periodically (e.g., every write_ts bump)
+  might work if queries only use it when it's known to be >= their arrival time.
+  Read GUIDE.md carefully before attempting this.
+
+- **Benchmark Serializable vs StrictSerializable.** Serializable queries skip
+  the oracle entirely and use the write frontier. This would confirm the oracle
+  is truly the bottleneck and establish an upper bound for optimization.
+
+- **Break down oracle read_ts latency.** Use phase histograms
+  (`mz_ts_oracle_postgres_read_ts_phase_seconds`) to identify which part of
+  the oracle round-trip is slowest: connection acquisition, prepared statement,
+  or CRDB query execution. Compare against CRDB's own statement stats.
+
+- **Fix statement_logging crash.** `end_statement_execution` panics when
+  frontend peek sequencing is active with statement logging enabled. The
+  coordinator's `executions_begun` map doesn't have the UUID. Workaround:
+  `statement_logging_max_sample_rate=0`.
