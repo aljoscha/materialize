@@ -1060,3 +1060,37 @@ server-side processing. Further improvements would require:
 2. Batch multiple oracle calls per gRPC round-trip
 3. io_uring or other kernel-bypass for TCP I/O
 4. Consider in-process tsoracled mode (skip gRPC entirely for single-node)
+
+**Experiment: skip batching oracle for gRPC backend**
+
+Hypothesis: since tsoracled serves `read_ts` from memory, the client-side
+`BatchingTimestampOracle` might add unnecessary channel overhead (oneshot
+creation, mpsc send/recv) without reducing actual I/O. Skipping it could
+reduce per-query latency.
+
+Change: In `timeline.rs`, conditionally skip wrapping in
+`BatchingTimestampOracle` when `oracle_config.is_grpc()`. Added
+`is_grpc()` method to `TimestampOracleConfig`.
+
+| Connections | With batching | Without batching | Change |
+|-------------|--------------|------------------|--------|
+| 1           | 6,071        | 5,466            | -10%   |
+| 16          | 51,042       | 32,928           | -35%   |
+| 64          | 135,789      | 38,776           | -71%   |
+
+**Result: the batching oracle is critical, even with tsoracled.** Without
+batching at 64c, QPS dropped 3.5x and latency jumped from 433µs to 1.64ms.
+
+Why: even though tsoracled `read_ts` is a memory read, the gRPC loopback
+round-trip is ~30-50µs per call. Without batching, 64 concurrent queries
+each make their own gRPC call. The batching oracle collapses these into
+far fewer gRPC calls per batch, dramatically reducing total gRPC overhead
+under concurrency. At 1c there's no batching benefit (only one caller at a
+time), and the extra channel hop adds ~10% overhead — but that's a worthwhile
+tradeoff for the 3.5x improvement at 64c.
+
+**Conclusion:** Keep the batching oracle for gRPC. Reverted the `is_grpc()`
+bypass. The batching layer serves a different role for gRPC vs Postgres: for
+Postgres it reduces expensive CRDB round-trips; for gRPC it reduces cheap
+but non-free loopback gRPC round-trips. In both cases the amortization is
+essential at high concurrency.
