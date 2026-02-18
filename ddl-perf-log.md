@@ -241,3 +241,106 @@ other callers — only the DDL hot path uses the incremental version.
 sources. The remaining ~140ms/1000 objects is split between the cheap
 consistency sub-checks (which could also be made incremental) and the actual
 catalog transaction overhead.
+
+### Session 4: Second profiling — identified multiple O(n) layers (2026-02-18)
+
+**Goal:** Profile DDL again after Session 3's incremental check_consistency fix
+to identify the remaining O(n) sources behind ~140ms/1000 objects scaling.
+
+**Setup:** Debug build with Session 3 changes applied. environmentd running with
+~3091 user objects (~3031 tables). Ran `perf record -F 99 --call-graph fp`
+during 30 CREATE TABLE statements (took 17.7s total, ~590ms/DDL — consistent
+with Session 3 measurements).
+
+**Results — Full DDL time breakdown (`sequence_create_table` at ~3000 tables):**
+
+| Component | % of DDL time | O(n)? | Description |
+|-----------|--------------|-------|-------------|
+| **Cow\<CatalogState\>::to_mut** | **16.1%** | **YES** | Clones ENTIRE CatalogState on every DDL |
+| **drop(CatalogState clone)** | **15.1%** | **YES** | Drops the full clone after transaction |
+| check_consistency_for_ids | 17.6% | partial | Incremental, but sub-checks still iterate all |
+| allocate_user_id | 16.9% | YES | Allocates IDs via persist snapshot (see below) |
+| with_snapshot (persist trace replay) | 11.5% | YES | Replays ALL trace entries into BTreeMaps |
+| TableTransaction::verify | 11.4% | YES | Iterates all items checking uniqueness |
+| TableTransaction::new | 6.7% | YES | Converts ALL snapshot entries proto→Rust |
+| Persist actual writes | 7.7% | no | O(1) writes for the DDL operation |
+| apply_updates | 5.0% | no | In-memory catalog state update |
+| apply_catalog_implications | 3.9% | no | Compute/storage side effects |
+
+**Inside `check_consistency_for_ids` (17.6% of total):**
+
+| Sub-check | % of check_consistency | Still O(n)? |
+|-----------|----------------------|-------------|
+| check_object_dependencies_for_ids | 59.6% | Small n (only changed items + neighbors) |
+| check_internal_fields | 14.2% | YES — iterates entry_by_id, entry_by_global_id |
+| check_read_holds | 11.6% | Unknown |
+| check_items_for_ids | 5.5% | No — only re-parses changed items |
+| check_comments | 5.5% | YES — iterates all comments |
+| check_roles | 2.8% | YES — iterates entry_by_id |
+
+**Key finding #1: Cow\<CatalogState\> clone+drop = 31.2% of DDL time**
+
+The `transact_inner` function (`src/adapter/src/catalog/transact.rs:576-579`)
+creates two `Cow::Borrowed(state)` references:
+- `preliminary_state` — tracks intermediate state between ops in the loop
+- `state` — the final result
+
+Each calls `.to_mut()` which clones the **entire CatalogState** including:
+- `entry_by_id`: BTreeMap\<CatalogItemId, CatalogEntry\> — **13.8% alone** (cloning ~6000 entries)
+- `entry_by_global_id`: BTreeMap\<GlobalId, CatalogItemId\> — 0.5%
+- All other maps (databases, schemas, clusters, roles, etc.)
+
+After the transaction, both clones are dropped (15.1% of DDL time). Together,
+clone+drop accounts for **31.2%** of DDL time and scales O(n) with catalog size.
+
+**Key finding #2: Durable catalog snapshot is rebuilt from scratch every DDL**
+
+The persist-backed durable catalog uses `with_snapshot()` to replay the entire
+consolidated trace into BTreeMaps for every transaction. This happens in two
+separate paths per CREATE TABLE:
+- `allocate_user_id` — allocates new CatalogItemId + GlobalId (14.1% via snapshot)
+- `catalog_transact_inner` — the main transaction (11.5% via snapshot)
+
+The `Snapshot` is then wrapped in `TableTransaction` objects:
+- `TableTransaction::new` converts all proto entries to Rust types (6.7%)
+- `TableTransaction::verify` checks uniqueness of all items (11.4%)
+
+Together, the durable catalog path (with_snapshot + TableTransaction::new +
+verify) across both call sites accounts for ~30% of DDL time.
+
+**Summary of O(n) scaling sources:**
+
+| Source | DDL % | Scaling |
+|--------|-------|---------|
+| Cow\<CatalogState\> clone | 16.1% | O(n) — clones all catalog entries |
+| Cow\<CatalogState\> drop | 15.1% | O(n) — drops the clone |
+| with_snapshot (2 calls) | 11.5% | O(n) — replays entire persist trace |
+| TableTransaction::verify | 11.4% | O(n) — checks all items for uniqueness |
+| check_consistency sub-checks | ~6% | O(n) — check_internal_fields, check_roles, etc. |
+| TableTransaction::new | 6.7% | O(n) — converts all entries |
+| **Total O(n)** | **~67%** | |
+
+**Possible optimizations (ranked by impact):**
+
+1. **Eliminate Cow\<CatalogState\> deep clone (31.2%)** — The biggest single win.
+   Options:
+   - Use `Arc` fields inside CatalogState so clone is O(1) (clone-on-write at
+     field level rather than full struct clone)
+   - Restructure `transact_inner` to mutate in place with rollback capability
+   - Use persistent/immutable data structures (e.g., `im` crate) for the large
+     BTreeMaps
+
+2. **Cache or incrementally update the durable catalog snapshot (~30%)** — Instead
+   of replaying the entire trace on every transaction, maintain a cached Snapshot
+   and apply only the deltas from the latest transaction. This would make
+   `with_snapshot`, `TableTransaction::new`, and `TableTransaction::verify` all
+   O(delta) instead of O(n).
+
+3. **Make remaining check_consistency sub-checks incremental (~6%)** — Same
+   approach as Session 3 but for `check_internal_fields`, `check_roles`,
+   `check_comments`, and `check_read_holds`.
+
+**Next step:** Tackle optimization #1 (Cow clone elimination) as it's the
+single largest O(n) source at 31.2% of DDL time. The most promising approach is
+to use `Arc` or persistent data structures for the large maps inside
+CatalogState so that `Cow::to_mut` becomes O(1) instead of O(n).
