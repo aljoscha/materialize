@@ -92,7 +92,10 @@ impl GrpcTimestampOracle {
             {
                 Ok(channel) => break channel,
                 Err(err) => {
-                    warn!("failed to connect to tsoracled at {}, retrying: {err}", config.url);
+                    warn!(
+                        "failed to connect to tsoracled at {}, retrying: {err}",
+                        config.url
+                    );
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }

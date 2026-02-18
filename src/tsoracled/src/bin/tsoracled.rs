@@ -15,6 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::Parser;
 use mz_build_info::{BuildInfo, build_info};
@@ -51,33 +52,48 @@ struct Args {
     window_size: u64,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+fn main() -> Result<(), anyhow::Error> {
     let args: Args = cli::parse_args(CliConfig {
         env_prefix: Some("MZ_"),
         enable_version_flag: true,
     });
 
-    // Set up basic tracing.
-    tracing_subscriber::fmt::init();
+    // Build a tokio runtime with an explicit thread stack size to prevent
+    // stack overflows in debug builds. The tonic server + postgres oracle
+    // call chain can be deep. Match environmentd's stack size.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(8 * 1024 * 1024) // 8 MiB
+        .thread_name_fn(|| {
+            static ATOMIC_ID: AtomicUsize = AtomicUsize::new(0);
+            let id = ATOMIC_ID.fetch_add(1, Ordering::Relaxed);
+            format!("tsoracled:work-{}", id)
+        })
+        .enable_all()
+        .build()?;
 
-    info!(
-        "tsoracled {} starting",
-        BUILD_INFO.human_version(None::<String>)
-    );
+    runtime.block_on(async {
+        // Set up basic tracing.
+        tracing_subscriber::fmt::init();
 
-    let metrics_registry = MetricsRegistry::new();
-    let pg_config = PostgresTimestampOracleConfig::new(&args.timestamp_oracle_url, &metrics_registry);
-    let now_fn = SYSTEM_TIME.clone();
+        info!(
+            "tsoracled {} starting",
+            BUILD_INFO.human_version(None::<String>)
+        );
 
-    let server = TsoracledServer::new(pg_config, now_fn, args.window_size).await?;
+        let metrics_registry = MetricsRegistry::new();
+        let pg_config =
+            PostgresTimestampOracleConfig::new(&args.timestamp_oracle_url, &metrics_registry);
+        let now_fn = SYSTEM_TIME.clone();
 
-    info!("listening on {} for gRPC connections", args.listen_addr);
+        let server = TsoracledServer::new(pg_config, now_fn, args.window_size).await?;
 
-    tonic::transport::Server::builder()
-        .add_service(ProtoTsOracleServer::new(server))
-        .serve(args.listen_addr)
-        .await?;
+        info!("listening on {} for gRPC connections", args.listen_addr);
 
-    Ok(())
+        tonic::transport::Server::builder()
+            .add_service(ProtoTsOracleServer::new(server))
+            .serve(args.listen_addr)
+            .await?;
+
+        Ok(())
+    })
 }
