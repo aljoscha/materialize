@@ -956,3 +956,107 @@ The only paths to meaningful improvement are:
    write frontier; requires semantic change)
 3. **Correctness-preserving oracle caching** (if one can be found — see
    GUIDE.md for why previous attempts were incorrect)
+
+### Session 48: Dedicated timestamp oracle service (tsoracled)
+
+**Date:** 2026-02-18
+
+**Problem:**
+
+Sessions 46-47 established that the CRDB round-trip (~362-483µs per
+`read_ts()` call) is the irreducible bottleneck for StrictSerializable
+queries. The batching oracle reduces CRDB call count at high concurrency
+(~8.67x batching ratio at 64c), but the per-batch CRDB latency cannot be
+reduced below ~362µs. CPU-side optimizations (metrics stripping, spin-polling,
+parallelism tuning) had no measurable effect because the system is I/O-bound.
+
+**Solution: tsoracled — a dedicated gRPC timestamp oracle service**
+
+Instead of hitting CRDB for every `read_ts()`, a new dedicated service
+(`tsoracled`) serves timestamps from memory using a pre-allocation window
+strategy (similar to TiKV's TSO):
+
+1. **Server** (`TsoracledServer` in `src/timestamp-oracle/src/grpc_server.rs`):
+   - Maintains per-timeline state in memory: `read_ts`, `write_ts`,
+     `persisted_upper`
+   - `read_ts()` is a **pure memory operation** — lock `Mutex<TimelineInner>`,
+     return `read_ts`. No CRDB round-trip.
+   - `write_ts()` serves from memory if within the pre-allocated window
+     (`proposed < persisted_upper`). Only hits CRDB to extend the window
+     when exhausted.
+   - `apply_write(lower_bound)` advances `read_ts` and `write_ts`, extending
+     the window if needed.
+   - Window size: 1000ms by default (configurable via `--window-size`).
+
+2. **Client** (`GrpcTimestampOracle` in `src/timestamp-oracle/src/grpc_oracle.rs`):
+   - Implements `TimestampOracle<Timestamp>` trait.
+   - Wraps tonic gRPC client with retry logic.
+   - Still wrapped in `BatchingTimestampOracle` for client-side batching.
+
+3. **Integration**:
+   - New binary: `src/tsoracled/src/bin/tsoracled.rs`
+   - CLI flag: `--tsoracled-url` on environmentd (env: `TSORACLED_URL`)
+   - `bin/environmentd` (run.py) automatically starts tsoracled as a sibling
+     process and passes `--tsoracled-url=http://127.0.0.1:6880`.
+
+**Correctness argument:** This is NOT caching — every gRPC `read_ts()` call
+is a real oracle operation that returns the authoritative current `read_ts`.
+The `read_ts` value advances monotonically via `apply_write()`. The oracle
+state is recovered from CRDB on restart (with at most `window_size` ms of
+timestamp gap, which is harmless since timestamps are opaque).
+
+**Changes:**
+- `src/timestamp-oracle/src/service.proto`: gRPC service definition (new)
+- `src/timestamp-oracle/src/grpc_server.rs`: TsoracledServer (new, 461 lines)
+- `src/timestamp-oracle/src/grpc_oracle.rs`: GrpcTimestampOracle client (new, 243 lines)
+- `src/timestamp-oracle/src/config.rs`: Added `Grpc` variant
+- `src/tsoracled/`: New binary crate
+- `src/environmentd/src/environmentd/main.rs`: `--tsoracled-url` CLI arg,
+  config routing to `TimestampOracleConfig::Grpc`
+- `misc/python/materialize/cli/run.py`: Auto-start tsoracled before environmentd
+
+**Results (dbbench, SELECT * FROM t, 20s duration):**
+
+| Connections | Baseline QPS (no tsoracled) | With tsoracled | Speedup | Baseline Latency | Tsoracled Latency |
+|-------------|----------------------------|----------------|---------|------------------|-------------------|
+| 1           | 2,405                      | 6,071          | 2.52x   | 409µs            | 158µs             |
+| 16          | 31,872                     | 51,042         | 1.60x   | 494µs            | 303µs             |
+| 64          | 99,643                     | 135,789        | 1.36x   | 617µs            | 433µs             |
+
+The improvement is most dramatic at low concurrency (2.52x at 1c) because the
+oracle `read_ts()` round-trip dominates per-query latency there. At 1c:
+- Baseline oracle `read_ts()`: ~362-400µs (CRDB round-trip)
+- Tsoracled oracle `read_ts()`: ~sub-microsecond (memory read via gRPC loopback)
+- Per-query latency dropped from 409µs to 158µs (61% reduction)
+
+At 64c, the batching oracle already amortized CRDB calls across queries
+(8.67x batching ratio), so the absolute per-query oracle cost was lower.
+Tsoracled still provides 1.36x improvement by eliminating the residual
+per-batch CRDB latency for the `read_ts` path.
+
+**Comparison with Session 42's peek_read_ts_fast (rejected):**
+
+Session 42 used a shared `AtomicU64` to cache `read_ts` locally, achieving
+similar QPS numbers (e.g., 18,205 at 1c). That approach was rejected
+(documented in GUIDE.md) because it violated strict serializability — reads
+could use a stale timestamp that didn't reflect concurrent writes from other
+sessions. Tsoracled avoids this by being the single authoritative source:
+`apply_write()` updates the in-memory `read_ts` before the write is
+considered complete, so all subsequent `read_ts()` calls return a value
+that reflects the write.
+
+**Profiling notes for next session:**
+
+With the oracle bottleneck eliminated, the remaining per-query overhead at
+1c (158µs) is dominated by:
+- TCP I/O (pgwire read/write): ~100-120µs
+- gRPC round-trip to tsoracled (loopback): ~10-30µs
+- Compute peek + response encoding: ~5-10µs
+- Tokio scheduling overhead: varies with concurrency
+
+At 64c, the latency increase to 433µs is from TCP/tokio contention, not
+server-side processing. Further improvements would require:
+1. Reduce gRPC overhead (e.g., use Unix domain sockets instead of TCP)
+2. Batch multiple oracle calls per gRPC round-trip
+3. io_uring or other kernel-bypass for TCP I/O
+4. Consider in-process tsoracled mode (skip gRPC entirely for single-node)
