@@ -612,3 +612,93 @@ the pre-built Snapshot.
 - **Make Transaction::new lazy (~16%)** — Only deserialize the collections that
   are actually accessed during the transaction (e.g., `allocate_user_id` only
   needs `id_allocator`, not all 20 collections).
+
+### Session 8: Lightweight allocate_id — skip full Transaction for ID allocation (2026-02-19)
+
+**Goal:** Eliminate the expensive full `Transaction` construction from the
+`allocate_id` path. In Session 6's profiling, `allocate_user_id` accounted for
+24.9% of DDL time despite only needing the `id_allocator` collection (~5
+entries). The default `allocate_id` implementation opens a full `Transaction`
+which deserializes all 20 catalog collections (50k+ items) to Rust types.
+
+**Analysis:** The `allocate_id` method on the `DurableCatalogState` trait has
+a default implementation that:
+1. Calls `self.transaction()` — builds full `Snapshot` (21 BTreeMaps, now cached)
+   and constructs `Transaction::new` which deserializes all 20 collections from
+   proto to Rust types, each with uniqueness verification
+2. Calls `txn.get_and_increment_id_by()` — reads one entry from `id_allocator`
+3. Calls `txn.commit_internal()` — serializes pending changes back to proto,
+   consolidates all 20 (mostly empty) collection diffs, commits to persist
+
+The bottleneck is step 1: even with the cached snapshot (Session 7),
+`Transaction::new` still deserializes ~50k items from proto BTreeMaps into Rust
+BTreeMaps, and runs uniqueness verification on each. The `allocate_id` path
+only touches 1 of the 20 collections, yet pays full O(n) deserialization cost.
+
+**Approach:** Override `allocate_id` in `impl DurableCatalogState for
+PersistCatalogState` with a lightweight path:
+
+1. Added `snapshot_id_allocator()` method on `PersistHandle<StateUpdateKind, U>`
+   that extracts only the `id_allocator` BTreeMap from the cached snapshot
+   (cloning ~5 entries instead of all 21 BTreeMaps). Falls back to scanning the
+   trace for `IdAllocator` entries if no cache exists.
+
+2. The override:
+   - Calls `snapshot_id_allocator()` to get just the ~5-entry `id_allocator` map
+   - Does the get-and-increment logic directly on proto types (no Rust
+     deserialization needed)
+   - Builds a `TransactionBatch` with all 20 collection diff vectors empty
+     except `id_allocator` (which has the 2-entry retract/insert diff)
+   - Commits via the existing `commit_transaction` path
+
+This makes `allocate_id` O(1) regardless of catalog size — it never touches
+the 50k items, schemas, comments, etc.
+
+**Code changes:**
+- `src/catalog/src/durable/persist.rs` — added `snapshot_id_allocator()` method
+  on `PersistHandle`, added `allocate_id` override in `impl DurableCatalogState
+  for PersistCatalogState`
+
+**Results (median of 7 samples, optimized build, ~50k user objects):**
+
+| DDL Type     | Session 6 (baseline) | Session 7 (cached) | Session 8 (lightweight alloc) | S8 vs S7 | S8 vs S6 |
+|-------------|---------------------|-------------------|-------------------------------|----------|----------|
+| CREATE TABLE | 444 ms              | 387 ms            | 320 ms                        | **17%**  | **28%**  |
+| CREATE VIEW  | 436 ms              | 368 ms            | 295 ms                        | **20%**  | **32%**  |
+| DROP TABLE   | 311 ms              | 295 ms            | 282 ms                        | **4%**   | **9%**   |
+| DROP VIEW    | —                   | —                 | 278 ms                        | —        | —        |
+
+**allocate_id Prometheus histogram (50k calls during bulk creation):**
+- p50: 4-8ms
+- p99: 16-32ms
+- Average: 8.2ms
+- Pre-optimization estimate (from Session 6 profiling): ~110ms
+
+This is a **~14x improvement** in the `allocate_id` path itself.
+
+**Key observations:**
+- CREATE TABLE/VIEW improved 17-20% over Session 7, consistent with eliminating
+  the O(n) deserialization in `allocate_id` (~16% of total DDL time from
+  Transaction::new proto→Rust conversion in the allocate path).
+- DROP TABLE/VIEW improved only ~4%, as expected — DROP doesn't need to allocate
+  new IDs, so `allocate_id` is not in the DROP path.
+- Cumulative improvement from Session 6 baseline: CREATE TABLE 28% faster,
+  CREATE VIEW 32% faster.
+- The allocate_id path itself went from ~110ms (estimated) to ~8ms average —
+  effectively constant time regardless of catalog size.
+
+**Remaining O(n) sources in production (optimized build, estimated):**
+1. **Cow\<CatalogState\> clone+drop (~30%)** — Still the largest single O(n) cost
+2. **Transaction::new proto→Rust in catalog_transact (~8%)** — The main
+   transaction still deserializes all 20 collections; only the allocate_id path
+   was optimized
+3. **Snapshot clone in with_snapshot (~12%)** — Cached but still O(n) to clone
+4. **Persist consolidation (~3.5%)** — Consolidating the trace after updates
+
+**Next step:** The next biggest targets are:
+- **Eliminate the Cow\<CatalogState\> clone+drop (~30%)** — Use `Arc` fields,
+  persistent data structures, or restructure `transact_inner` for in-place
+  mutation with rollback. This is the single largest remaining O(n) cost.
+- **Make Transaction::new lazy for catalog_transact (~8%)** — The main
+  transaction path still deserializes all 20 collections. Could lazily
+  deserialize only accessed collections.
