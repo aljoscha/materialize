@@ -61,10 +61,9 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 11): At ~28k objects (optimized build), DDL
-latency is CREATE TABLE ~131ms, CREATE VIEW ~96ms, DROP TABLE ~97ms, DROP VIEW
-~86ms. That's down from 444ms/436ms/311ms at the Session 6 baseline (70-78%
-improvement for creates, 59-69% for drops).
+Current status (after Session 12): At ~28k objects (optimized build), DDL
+latency is CREATE TABLE ~111ms (profiling run), ~131ms (clean benchmark). That's
+down from 444ms at the Session 6 baseline (~70% cumulative improvement).
 
 Completed optimizations (Sessions 7-9, 11):
 - Cached Snapshot in PersistHandle (Session 7)
@@ -75,24 +74,31 @@ Completed optimizations (Sessions 7-9, 11):
   the 23% cost of iterating all tables on every DDL. Txn-wal protocol already
   handles logical frontier advancement for all registered shards.
 
-Completed diagnostics (Session 10):
-- Profiled post-Session 9 optimized build at ~10k objects
-- Full cost breakdown in ddl-perf-log.md Session 10
+Completed diagnostics (Sessions 10, 12):
+- Profiled post-Session 9 optimized build at ~10k objects (Session 10)
+- Profiled post-Session 11 optimized build at ~28k objects (Session 12)
+- Full cost breakdowns in ddl-perf-log.md
 
-Immediate next steps:
+Immediate next steps (ranked by impact from Session 12 profiling):
 
-- **Profile post-Session 11 to identify next bottleneck.** The cost breakdown
-  has shifted significantly again. Profile to get the new breakdown.
+- **Make Transaction::new lazy (~26% of catalog_transact, ~20ms).** The main
+  DDL transaction calls `TableTransaction::new` for ALL 20 collections,
+  converting every entry from proto to Rust types. The `items` collection alone
+  costs 16% of catalog_transact. Most DDL operations only access 1-2 collections.
+  Lazily initialize each `TableTransaction` on first access.
 
-- **Make Transaction::new lazy for catalog_transact (~20-25%).** The main DDL
-  transaction still deserializes all 20 collections from proto to Rust types.
-  Most DDL operations only access a few collections. Could lazily deserialize
-  only accessed collections.
+- **Reduce consolidation cost (~24% of catalog_transact, ~19ms).** The
+  `consolidate` function sorts the entire StateUpdate trace with
+  `sort_unstable` (O(n log n)) on every DDL. This is called inside
+  `commit_transaction` -> `apply_updates`. Options: maintain trace in sorted
+  order, use incremental consolidation, or keep separate sorted buffer.
 
-- **Reduce Snapshot clone cost (~20-25%).** The cached Snapshot still needs to be
-  fully cloned for each transaction. Could use `Arc<BTreeMap>` for the large
-  maps (items, comments) so clone shares data.
+- **Reduce Snapshot clone cost (~12% of catalog_transact, ~9ms).** The cached
+  Snapshot's BTreeMaps (especially `items` at 8% and `storage_collection_metadata`
+  at 3%) are fully cloned each transaction. Wrap in `Arc` so clone is O(1) and
+  use clone-on-write semantics. If lazy Transaction::new is implemented, the
+  Snapshot clone may become partly unnecessary too.
 
-- **Reduce apply_updates consolidation cost (~12-15%).** `apply_updates` is
-  dominated by sort_unstable on the full StateUpdate trace (O(n log n)).
-  Could maintain the trace in sorted order or use incremental consolidation.
+- **Reduce apply_catalog_implications (~13% of catalog_transact, ~10ms).**
+  Includes `create_table_collections` and read hold management. May be harder
+  to optimize as it's real work for each DDL.
