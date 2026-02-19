@@ -702,3 +702,100 @@ This is a **~14x improvement** in the `allocate_id` path itself.
 - **Make Transaction::new lazy for catalog_transact (~8%)** — The main
   transaction path still deserializes all 20 collections. Could lazily
   deserialize only accessed collections.
+
+### Session 9: Benchmark persistent CatalogState (imbl::OrdMap + Arc) (2026-02-19)
+
+**Goal:** Benchmark the persistent/immutable data structure change to CatalogState
+(commit `b463a07f80`) against the Session 6/8 baselines. This change was designed
+to eliminate the ~30% Cow\<CatalogState\> clone+drop cost by making
+`CatalogState::clone()` effectively O(1).
+
+**Changes being benchmarked** (commits `5a1d9b3056` and `b463a07f80`):
+
+1. **Replace all BTreeMap fields with `imbl::OrdMap`** — clone is O(1) via
+   structural sharing (refcount bump on shared tree root), mutations are O(log n)
+   with path-copying. Fields changed: `database_by_name`, `database_by_id`,
+   `entry_by_id`, `entry_by_global_id`, `ambient_schemas_by_name`,
+   `ambient_schemas_by_id`, `clusters_by_name`, `clusters_by_id`,
+   `roles_by_name`, `roles_by_id`, `network_policies_by_name`,
+   `network_policies_by_id`, `role_auth_by_id`, `source_references`,
+   `temporary_schemas` (15 maps total).
+
+2. **Wrap expensive non-map fields in `Arc`** — clone is O(1) (refcount bump),
+   mutation via `Arc::make_mut()` which COW-clones only when shared. Fields:
+   `system_configuration`, `default_privileges`, `system_privileges`, `comments`,
+   `storage_metadata`.
+
+3. **`MutableMap` trait** — abstraction in apply.rs so helper functions work
+   uniformly with both `BTreeMap` (nested inside value types) and `imbl::OrdMap`
+   (CatalogState top-level fields).
+
+4. **Prerequisite: replaced `im` crate with `imbl`** — the `im` crate is
+   unmaintained; `imbl` is a compatible, maintained fork.
+
+**Setup:** Optimized build (`bin/environmentd --reset --optimized`). Created
+50,000 tables (50,001 user objects total). Ran 7 samples × 2 runs per DDL type
+(14 total samples per DDL type).
+
+**Results (median of 14 samples, optimized build, ~50k user objects):**
+
+| DDL Type     | Session 6 (baseline) | Session 8 (prev best) | Session 9 (persistent) | S9 vs S8 | S9 vs S6 |
+|-------------|---------------------|----------------------|------------------------|----------|----------|
+| CREATE TABLE | 444 ms              | 320 ms               | 262 ms                 | **18%**  | **41%**  |
+| CREATE VIEW  | 436 ms              | 295 ms               | 228 ms                 | **23%**  | **48%**  |
+| DROP TABLE   | 311 ms              | 282 ms               | 221 ms                 | **22%**  | **29%**  |
+| DROP VIEW    | —                   | 278 ms               | 211 ms                 | **24%**  | —        |
+
+**Raw data (sorted, 14 samples each):**
+- CREATE TABLE: 249 255 255 255 256 260 260 264 284 309 311 314 317 559
+- CREATE VIEW:  220 221 221 221 224 225 228 228 230 231 234 234 278 289
+- DROP TABLE:   218 218 219 219 220 220 221 222 224 225 274 278 281 287
+- DROP VIEW:    207 207 208 208 209 209 210 212 212 213 264 267 273 286
+
+**Key observations:**
+
+- **18-24% improvement over Session 8** across all DDL types. This is consistent
+  with eliminating the Cow\<CatalogState\> deep clone+drop, which was estimated
+  at ~30% of DDL time. The improvement is less than the full 30% because:
+  - The `imbl::OrdMap` mutations (path-copying at O(log n)) have slightly higher
+    per-operation cost than BTreeMap mutations, trading single-op speed for O(1)
+    clone.
+  - The `Cow::to_mut()` clone that was previously O(n) is now O(1), but there
+    are still other O(n) costs (Snapshot clone, Transaction::new, etc.).
+
+- **41-48% cumulative improvement over Session 6 baseline** for CREATE operations.
+  Combined effect of all optimizations: cached Snapshot (Session 7) +
+  lightweight allocate_id (Session 8) + persistent CatalogState (Session 9).
+
+- **DROP operations improved 22-24% over Session 8.** DROPs don't go through
+  `allocate_id`, so Session 8 gave them minimal benefit. The persistent data
+  structure change helps DROPs equally since the Cow\<CatalogState\> clone+drop
+  is in the common DDL transaction path.
+
+- **Bimodal variance observed:** Some samples (~10-15% of them) show spikes
+  40-100ms above the cluster, likely from CockroachDB background activity or
+  persist consolidation. The median is robust to these outliers.
+
+**Cumulative progress (optimized build, ~50k objects):**
+
+| DDL Type     | Session 6 | Session 7 | Session 8 | Session 9 | Total improvement |
+|-------------|-----------|-----------|-----------|-----------|-------------------|
+| CREATE TABLE | 444 ms    | 387 ms    | 320 ms    | 262 ms    | **41%**           |
+| CREATE VIEW  | 436 ms    | 368 ms    | 295 ms    | 228 ms    | **48%**           |
+| DROP TABLE   | 311 ms    | 295 ms    | 282 ms    | 221 ms    | **29%**           |
+| DROP VIEW    | —         | —         | 278 ms    | 211 ms    | —                 |
+
+**Remaining O(n) sources in production (estimated post-Session 9):**
+1. **Transaction::new proto→Rust in catalog_transact (~8-12%)** — The main DDL
+   transaction still deserializes all 20 collections from proto to Rust types.
+   Most DDL operations only access a few collections.
+2. **Snapshot clone in with_snapshot (~12-15%)** — The cached Snapshot is still
+   fully cloned (BTreeMaps) for each transaction. Could use `Arc<BTreeMap>` so
+   clone shares data.
+3. **Persist consolidation (~3-5%)** — Consolidating the trace after updates.
+4. **apply_updates and other bookkeeping (~5%)** — In-memory state updates.
+
+**Next step:** Profile again to confirm the new cost breakdown and identify the
+next dominant bottleneck. The two most promising targets are:
+- **Make Transaction::new lazy** — only deserialize accessed collections
+- **Reduce Snapshot clone cost** — use Arc\<BTreeMap\> for the large maps
