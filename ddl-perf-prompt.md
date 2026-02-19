@@ -50,25 +50,29 @@ http://localhost:6878/metrics.
 
 Below here, I have some immediate next steps to explore. Once you feel you have
 resolved one of them, please update this prompt so that we don't consider them
-anymore in our next sessions. Update the prompt in a separate jj change with a
+anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
+
+Current status (after Session 8): At 50k objects (optimized build), DDL latency
+is CREATE TABLE ~320ms, CREATE VIEW ~295ms, DROP TABLE ~282ms. That's down from
+444ms/436ms/311ms at the Session 6 baseline (28-32% improvement for creates).
 
 Immediate next steps (handoff):
 
-- **Use --optimized after all.** If we think that debug build might be to
-  different to an optimized build, we might have to update our instructions to
-  use --optimized builds and continue with that. The consistency check thing
-  was already a red herring.
+- **Eliminate Cow\<CatalogState\> clone+drop (~30% of DDL time).** This is the
+  largest remaining O(n) cost. `transact_inner` in
+  `src/adapter/src/catalog/transact.rs` calls `Cow::to_mut()` which deep-clones
+  the entire CatalogState (50k+ entries in `entry_by_id` BTreeMap). Options:
+  - Use `Arc` for the large maps so clone is O(1)
+  - Use persistent/immutable data structures (e.g., `im` crate)
+  - Restructure `transact_inner` for in-place mutation with rollback
+  Profile first to confirm this is still the dominant cost after Session 8.
 
-- **Reproduce the problem.** Start environmentd with `--reset`, create
-  increasing numbers of objects (tables with default indexes, views, etc.) and
-  measure how long DDL statements take at each scale. Find the threshold where
-  DDL becomes meaningfully slow (e.g., >1s per statement). Log the baseline
-  numbers. Try different DDL types: CREATE TABLE, CREATE VIEW, CREATE INDEX,
-  DROP, ALTER. Some may degrade faster than others.
+- **Make Transaction::new lazy for catalog_transact (~8%).** The main DDL
+  transaction still deserializes all 20 collections from proto to Rust types.
+  Most DDL operations only access a few collections. Could lazily deserialize
+  only accessed collections.
 
-- **Profile the slow path.** Once we have a reproduction at a scale where DDL is
-  slow, use `perf record` to capture a flamegraph during a batch of DDL
-  statements. Identify which functions dominate. Look at coordinator message
-  handling, catalog operations, persist operations, compute/storage controller
-  interactions, and any O(n) or O(n^2) loops over existing objects.
+- **Reduce Snapshot clone cost (~12%).** The cached Snapshot still needs to be
+  fully cloned for each transaction. Could use `Arc<BTreeMap>` for the large
+  maps (items, comments) so clone shares data.
