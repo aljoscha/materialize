@@ -53,31 +53,28 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 8): At 50k objects (optimized build), DDL latency
-is CREATE TABLE ~320ms, CREATE VIEW ~295ms, DROP TABLE ~282ms. That's down from
-444ms/436ms/311ms at the Session 6 baseline (28-32% improvement for creates).
+Current status (after Session 9): At 50k objects (optimized build), DDL latency
+is CREATE TABLE ~262ms, CREATE VIEW ~228ms, DROP TABLE ~221ms, DROP VIEW ~211ms.
+That's down from 444ms/436ms/311ms at the Session 6 baseline (41-48% improvement
+for creates, 29% for drops).
 
-Immediate next steps (handoff):
+Completed optimizations (Sessions 7-9):
+- Cached Snapshot in PersistHandle (Session 7)
+- Lightweight allocate_id bypassing full Transaction (Session 8)
+- Persistent CatalogState with imbl::OrdMap + Arc (Session 9) — eliminated the
+  ~30% Cow\<CatalogState\> clone+drop cost
 
-- **Benchmark cow/persistent catalog change.** I added a change that turns the
-  CatalogState into  persistent/immutable data structure. This should help with
-  the Cow copies that we're doing as part of transactions. Can you benchmark
-  this change against baseline and report your findings in the log, please.
+Immediate next steps:
 
-- **Eliminate Cow\<CatalogState\> clone+drop (~30% of DDL time).** This is the
-  largest remaining O(n) cost. `transact_inner` in
-  `src/adapter/src/catalog/transact.rs` calls `Cow::to_mut()` which deep-clones
-  the entire CatalogState (50k+ entries in `entry_by_id` BTreeMap). Options:
-  - Use `Arc` for the large maps so clone is O(1)
-  - Use persistent/immutable data structures (e.g., `im` crate)
-  - Restructure `transact_inner` for in-place mutation with rollback
-  Profile first to confirm this is still the dominant cost after Session 8.
+- **Profile post-Session 9 to identify next bottleneck.** The cost breakdown has
+  shifted significantly. Profile at ~50k objects to get the new breakdown and
+  confirm which O(n) source is now dominant.
 
-- **Make Transaction::new lazy for catalog_transact (~8%).** The main DDL
+- **Make Transaction::new lazy for catalog_transact (~8-12%).** The main DDL
   transaction still deserializes all 20 collections from proto to Rust types.
   Most DDL operations only access a few collections. Could lazily deserialize
   only accessed collections.
 
-- **Reduce Snapshot clone cost (~12%).** The cached Snapshot still needs to be
+- **Reduce Snapshot clone cost (~12-15%).** The cached Snapshot still needs to be
   fully cloned for each transaction. Could use `Arc<BTreeMap>` for the large
   maps (items, comments) so clone shares data.
