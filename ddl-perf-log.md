@@ -806,3 +806,129 @@ to eliminate the ~30% Cow\<CatalogState\> clone+drop cost by making
 next dominant bottleneck. The two most promising targets are:
 - **Make Transaction::new lazy** — only deserialize accessed collections
 - **Reduce Snapshot clone cost** — use Arc\<BTreeMap\> for the large maps
+
+### Session 10: Post-Session 9 profiling — group_commit table advancement is new top bottleneck (2026-02-19)
+
+**Goal:** Profile DDL after all Sessions 7-9 optimizations to identify the new
+dominant bottleneck now that Cow\<CatalogState\> clone+drop and allocate_id have
+been eliminated.
+
+**Setup:** Optimized build (same binary as Session 9). Started with ~10k user
+objects (~9720 user tables). Ran `perf record -F 99 --call-graph fp` during 30
+CREATE TABLE statements. Processed with `inferno-collapse-perf | rustfilt`.
+
+**DDL latency at ~10k objects (optimized build):**
+
+| DDL Type     | Median (ms) | Notes |
+|-------------|-------------|-------|
+| CREATE TABLE | 374         | 5 samples: 368, 373, 374, 384, 389 |
+
+Note: Session 9 measured ~262ms at ~50k objects. The higher latency here (~374ms)
+may reflect CockroachDB variance, different data directory state, or the `--reset`
+startup overhead amortizing. The relative cost breakdown is what matters.
+
+**Results — Full DDL time breakdown (optimized build, ~10k objects):**
+
+Percentages are of `catalog_transact_with_side_effects` time (which is 79.9%
+of total coordinator active time). `allocate_user_id` accounts for another 5.5%.
+
+| Component | % of catalog_transact | O(n)? | Description |
+|-----------|----------------------|-------|-------------|
+| **group_commit (table advancement)** | **23.1%** | **YES** | Iterates ALL catalog entries, advances ALL table frontiers |
+| **Transaction::new (proto→Rust)** | **19.6%** | **YES** | Deserializes all 20 collections from proto to Rust types |
+| **snapshot clone** | **19.1%** | **YES** | Clones all BTreeMaps from cached Snapshot |
+| commit (persist write) | 13.4% | partial | compare_and_append + consolidation |
+| apply_updates (in-memory) | 11.9% | YES | sort_unstable on full StateUpdate trace |
+| apply_catalog_implications | 8.5% | no | Compute/storage side effects |
+| DDL ops (insert_user_item) | 4.5% | no | The actual DDL operation |
+
+**Key finding #1: group_commit table advancement = 23.1% of DDL time**
+
+Every DDL statement triggers `group_commit()` via `BuiltinTableAppend::execute()`
+to update system tables (`mz_tables`, `mz_objects`, etc.). Inside `group_commit`,
+there is an O(n) loop at `src/adapter/src/coord/appends.rs:512-516`:
+
+```rust
+// Add table advancements for all tables.
+for table in self.catalog().entries().filter(|entry| entry.is_table()) {
+    appends.entry(table.id()).or_default();
+}
+```
+
+This iterates ALL catalog entries, filters for `is_table()`, and creates an
+appends entry for every table — even tables not modified by the current DDL.
+The purpose is to advance all table write frontiers to the new timestamp.
+
+Sub-cost breakdown inside group_commit:
+- BTreeMap construction/destruction for ~10k entries: **40%** of group_commit
+  (building `appends: BTreeMap<CatalogItemId, SmallVec<TableData>>` and then
+  dropping it after `into_iter()`)
+- imbl::OrdMap traversal of catalog entries: **19%** (`self.catalog().entries()`)
+- `latest_global_id()` lookups per table: **6%** (`last_key_value` on
+  `RelationVersion → GlobalId` maps)
+- `is_table()` filter checks: **5%**
+
+Then `append_table` sends ALL table entries (including empty advancement entries)
+to the persist table worker, which does `compare_and_append` per table.
+
+**Key finding #2: apply_updates dominated by sort_unstable consolidation**
+
+`apply_updates` (11.9%) is dominated by `sort_unstable_by` on the full
+`Vec<(StateUpdateKind, Timestamp, Diff)>` trace, called from
+`differential_dataflow::consolidation::consolidate_updates_slice_slow`.
+This sorts the entire trace (O(n log n) in trace size) on every DDL commit.
+
+**Key finding #3: DDL scaling is now very flat**
+
+At ~10k objects, DDL takes ~374ms. Session 9 measured ~262ms at ~50k. The
+surprisingly small difference suggests the O(n) per-object marginal cost is
+now very low (~2.8ms per 1000 objects). Most of the ~250-370ms is constant
+overhead (persist writes, CockroachDB round-trips, message passing).
+
+**Comparison with Session 6 profile (pre-optimization):**
+
+| Component | Session 6 (50k) | Session 10 (~10k) | Change |
+|-----------|-----------------|-------------------|--------|
+| allocate_user_id | 24.9% | 5.5% | ✓ Fixed in Session 8 |
+| Cow\<CatalogState\> clone+drop | 30.1% | ~0% | ✓ Fixed in Session 9 |
+| snapshot rebuild from trace | 23.7% | 19.1% (clone from cache) | ✓ Partially fixed in Session 7 |
+| Transaction::new proto→Rust | 16.4% | 19.6% | Proportionally larger |
+| group_commit | not separately measured | 23.1% | NEW: previously hidden by larger costs |
+| apply_updates | 4.2% | 11.9% | Proportionally larger + sort overhead |
+
+**Summary of remaining O(n) sources (optimized build, ranked by impact):**
+
+| Source | DDL % | Scaling |
+|--------|-------|---------|
+| group_commit table advancement | 23.1% | O(n) — iterates all tables |
+| Transaction::new proto→Rust | 19.6% | O(n) — deserializes all 20 collections |
+| Snapshot clone | 19.1% | O(n) — clones all BTreeMaps |
+| apply_updates sort/consolidation | 11.9% | O(n log n) — sorts full trace |
+| **Total O(n)** | **~74%** | |
+
+**Possible optimizations (ranked by impact):**
+
+1. **Eliminate the O(n) table advancement loop in group_commit (~23%)** — The
+   biggest single win. Options:
+   - Don't advance every table on every DDL — only advance tables that actually
+     had writes in this group commit. Use a separate periodic mechanism to
+     advance idle table frontiers.
+   - Pre-compute and cache the set of table IDs to avoid iterating all entries.
+   - Use a single "advance all tables" storage command instead of per-table
+     entries in the appends map.
+
+2. **Make Transaction::new lazy (~20%)** — Only deserialize the collections
+   actually accessed during the transaction. Most DDLs only touch `items`,
+   `schemas`, and `id_allocator` out of 20 collections.
+
+3. **Reduce Snapshot clone cost (~19%)** — Wrap each BTreeMap in the Snapshot
+   in `Arc` so clone is O(1) (reference count bump). Mutations use
+   `Arc::make_mut()` for COW semantics.
+
+4. **Reduce apply_updates consolidation cost (~12%)** — Instead of sorting the
+   full trace on every update, maintain the trace in sorted order (or use a
+   data structure that supports efficient incremental consolidation).
+
+**Next step:** Tackle optimization #1 (eliminate the O(n) table advancement
+loop in group_commit) as it's the single largest cost at 23% of DDL time and
+is a clear O(n) scaling bottleneck.
