@@ -61,45 +61,38 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 10): At ~10k objects (optimized build), DDL
-latency is CREATE TABLE ~374ms. Session 9 measured ~262ms at ~50k objects.
-The O(n) per-object marginal cost is now very low (~2.8ms per 1000 objects).
-Most of the remaining ~250-370ms is constant overhead.
+Current status (after Session 11): At ~28k objects (optimized build), DDL
+latency is CREATE TABLE ~131ms, CREATE VIEW ~96ms, DROP TABLE ~97ms, DROP VIEW
+~86ms. That's down from 444ms/436ms/311ms at the Session 6 baseline (70-78%
+improvement for creates, 59-69% for drops).
 
-That's down from 444ms/436ms/311ms at the Session 6 baseline (41-48% improvement
-for creates, 29% for drops).
-
-Completed optimizations (Sessions 7-9):
+Completed optimizations (Sessions 7-9, 11):
 - Cached Snapshot in PersistHandle (Session 7)
 - Lightweight allocate_id bypassing full Transaction (Session 8)
 - Persistent CatalogState with imbl::OrdMap + Arc (Session 9) — eliminated the
   ~30% Cow\<CatalogState\> clone+drop cost
+- Removed O(n) table advancement loop from group_commit (Session 11) — eliminated
+  the 23% cost of iterating all tables on every DDL. Txn-wal protocol already
+  handles logical frontier advancement for all registered shards.
 
 Completed diagnostics (Session 10):
 - Profiled post-Session 9 optimized build at ~10k objects
-- Identified group_commit table advancement as the new top bottleneck (23%)
 - Full cost breakdown in ddl-perf-log.md Session 10
 
 Immediate next steps:
 
-- **Eliminate O(n) table advancement loop in group_commit (~23%).** The biggest
-  single bottleneck. `group_commit()` iterates ALL catalog entries on every DDL
-  to advance every table's write frontier (`src/adapter/src/coord/appends.rs:512-516`).
-  This creates a BTreeMap with ~10k entries, looks up GlobalIds for all of them,
-  and sends all entries to storage. Options:
-  - Only advance tables that actually had writes in this group commit
-  - Pre-compute/cache the set of table IDs
-  - Use a single "advance all tables" storage command
+- **Profile post-Session 11 to identify next bottleneck.** The cost breakdown
+  has shifted significantly again. Profile to get the new breakdown.
 
-- **Make Transaction::new lazy for catalog_transact (~20%).** The main DDL
+- **Make Transaction::new lazy for catalog_transact (~20-25%).** The main DDL
   transaction still deserializes all 20 collections from proto to Rust types.
   Most DDL operations only access a few collections. Could lazily deserialize
   only accessed collections.
 
-- **Reduce Snapshot clone cost (~19%).** The cached Snapshot still needs to be
+- **Reduce Snapshot clone cost (~20-25%).** The cached Snapshot still needs to be
   fully cloned for each transaction. Could use `Arc<BTreeMap>` for the large
   maps (items, comments) so clone shares data.
 
-- **Reduce apply_updates consolidation cost (~12%).** `apply_updates` is
+- **Reduce apply_updates consolidation cost (~12-15%).** `apply_updates` is
   dominated by sort_unstable on the full StateUpdate trace (O(n log n)).
   Could maintain the trace in sorted order or use incremental consolidation.
