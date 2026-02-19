@@ -59,6 +59,11 @@ is CREATE TABLE ~320ms, CREATE VIEW ~295ms, DROP TABLE ~282ms. That's down from
 
 Immediate next steps (handoff):
 
+- **Benchmark cow/persistent catalog change.** I added a change that turns the
+  CatalogState into  persistent/immutable data structure. This should help with
+  the Cow copies that we're doing as part of transactions. Can you benchmark
+  this change against baseline and report your findings in the log, please.
+
 - **Eliminate Cow\<CatalogState\> clone+drop (~30% of DDL time).** This is the
   largest remaining O(n) cost. `transact_inner` in
   `src/adapter/src/catalog/transact.rs` calls `Cow::to_mut()` which deep-clones
