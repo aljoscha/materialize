@@ -10,11 +10,11 @@ scale. We measure per-statement latency at various object counts.
 ```bash
 # Debug build (faster to compile, makes O(n) scaling more visible)
 bin/environmentd --build-only
-bin/environmentd --reset -- --system-parameter-default=log_filter=info
+bin/environmentd -- --system-parameter-default=log_filter=info
 
 # Optimized build (for confirming fixes against realistic absolute numbers)
 bin/environmentd --optimized --build-only
-bin/environmentd --reset --optimized -- --system-parameter-default=log_filter=info
+bin/environmentd --optimized -- --system-parameter-default=log_filter=info
 
 # Connect as materialize user (external port)
 psql -U materialize -h localhost -p 6875 materialize
@@ -23,8 +23,15 @@ psql -U materialize -h localhost -p 6875 materialize
 psql -U mz_system -h localhost -p 6877 materialize
 ```
 
-**Important:** After `--reset`, you must raise object limits before creating
-large numbers of objects:
+**Important: Don't use `--reset` between runs.** Creating 50k tables takes a
+very long time. Reuse existing state across runs and even when switching between
+debug and optimized builds. Instead: start environmentd without `--reset`,
+inspect current state (e.g. `SELECT count(*) FROM mz_objects`), verify the
+expected number of objects, and proceed. Only use `--reset` if the state is
+actually corrupt or you explicitly need a fresh start.
+
+After a fresh `--reset` (or first-ever start), you must raise object limits
+before creating large numbers of objects:
 ```bash
 psql -U mz_system -h localhost -p 6877 materialize -c "
   ALTER SYSTEM SET max_tables = 100000;

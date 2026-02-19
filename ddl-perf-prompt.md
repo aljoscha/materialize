@@ -33,6 +33,14 @@ visible since everything is slower. We don't care about absolute performance,
 only how latency degrades as object count grows. Use `--optimized` only when
 you need to confirm a fix against realistic absolute numbers.
 
+**Don't use `--reset` between runs.** Creating 50k tables takes a very long
+time, so we want to reuse existing state across runs and even across switching
+between debug and optimized builds. Instead of resetting, start environmentd
+without `--reset`, inspect current state (e.g. count objects with
+`SELECT count(*) FROM mz_objects`), verify you have the expected number of
+objects, and then proceed with your measurements. Only use `--reset` if the
+state is actually corrupt or you explicitly need a fresh start.
+
 You'll likely need hundreds or thousands of objects before degradation is
 visible. Use a script (bash loop with psql, or a SQL DO block) to bulk-create
 objects rather than doing it by hand.
