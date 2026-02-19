@@ -509,14 +509,14 @@ impl Coordinator {
             }
         }
 
-        // Add table advancements for all tables.
-        let table_advancement_start = Instant::now();
-        for table in self.catalog().entries().filter(|entry| entry.is_table()) {
-            appends.entry(table.id()).or_default();
-        }
-        self.metrics
-            .group_commit_table_advancement_seconds
-            .observe(table_advancement_start.elapsed().as_secs_f64());
+        // NOTE: We used to iterate ALL catalog entries here to add empty
+        // advancement entries for every table, ensuring their write frontiers
+        // advanced. This was O(n) in the number of tables and became a
+        // significant bottleneck with large catalogs (~23% of DDL time at 10k+
+        // tables). The txn-wal protocol makes this unnecessary: when any
+        // transaction commits to the txns shard, the logical upper of ALL
+        // registered data shards advances automatically, including those not
+        // involved in the transaction.
 
         // Consolidate all Rows for a given table. We do not consolidate the
         // staged batches, that's up to whoever staged them.
