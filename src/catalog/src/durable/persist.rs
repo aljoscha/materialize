@@ -56,13 +56,14 @@ use crate::durable::objects::state_update::{
     IntoStateUpdateKindJson, StateUpdate, StateUpdateKind, StateUpdateKindJson,
     TryIntoStateUpdateKind,
 };
+use crate::durable::objects::serialization::proto;
 use crate::durable::objects::{AuditLogKey, FenceToken, Snapshot};
 use crate::durable::transaction::TransactionBatch;
 use crate::durable::upgrade::upgrade;
 use crate::durable::{
     AuditLogIterator, BootstrapArgs, CATALOG_CONTENT_VERSION_KEY, CatalogError,
     DurableCatalogError, DurableCatalogState, Epoch, OpenableDurableCatalogState,
-    ReadOnlyDurableCatalogState, Transaction, initialize,
+    ReadOnlyDurableCatalogState, SYSTEM_ITEM_ALLOC_KEY, Transaction, initialize,
 };
 use crate::memory;
 
@@ -784,6 +785,34 @@ impl<U: ApplyUpdate<StateUpdateKind>> PersistHandle<StateUpdateKind, U> {
 
         self.cached_snapshot = Some(snapshot.clone());
         f(snapshot)
+    }
+
+    /// Returns just the `id_allocator` collection from the current catalog snapshot.
+    ///
+    /// This is much cheaper than `with_snapshot` which clones all 21 BTreeMaps: here we only
+    /// clone the small `id_allocator` map (~5 entries). Used by the lightweight `allocate_id`
+    /// path to avoid building a full `Transaction` just for ID allocation.
+    async fn snapshot_id_allocator(
+        &mut self,
+    ) -> Result<BTreeMap<proto::IdAllocKey, proto::IdAllocValue>, CatalogError> {
+        self.sync_to_current_upper().await?;
+
+        if let Some(ref cached) = self.cached_snapshot {
+            return Ok(cached.id_allocator.clone());
+        }
+
+        // No cache yet — scan the trace for only IdAllocator entries.
+        let mut id_allocator = BTreeMap::new();
+        for (kind, _ts, diff) in &self.snapshot {
+            if let StateUpdateKind::IdAllocator(key, value) = kind {
+                if *diff == Diff::ONE {
+                    id_allocator.insert(key.clone(), value.clone());
+                } else if *diff == Diff::MINUS_ONE {
+                    id_allocator.remove(key);
+                }
+            }
+        }
+        Ok(id_allocator)
     }
 
     /// Generates an iterator of [`StateUpdate`] that contain all updates to the catalog
@@ -1753,6 +1782,94 @@ impl DurableCatalogState for PersistCatalogState {
         }
         self.sync_to_current_upper().await?;
         Ok(())
+    }
+
+    /// Lightweight ID allocation that avoids building a full `Transaction`.
+    ///
+    /// The default `allocate_id` implementation opens a full `Transaction` which deserializes
+    /// all 20 catalog collections (items, schemas, roles, etc.) into Rust types — even though
+    /// only the `id_allocator` collection (~5 entries) is actually accessed. At scale (50k+
+    /// objects), this O(n) deserialization accounts for ~25% of DDL time.
+    ///
+    /// This override extracts only the `id_allocator` BTreeMap from the cached snapshot and
+    /// builds a minimal `TransactionBatch` with just the counter update, skipping the expensive
+    /// deserialization of all other collections.
+    #[mz_ore::instrument(level = "debug")]
+    async fn allocate_id(
+        &mut self,
+        id_type: &str,
+        amount: u64,
+        commit_ts: Timestamp,
+    ) -> Result<Vec<u64>, CatalogError> {
+        let start = Instant::now();
+        if amount == 0 {
+            return Ok(Vec::new());
+        }
+
+        assert!(
+            id_type != SYSTEM_ITEM_ALLOC_KEY || !self.is_bootstrap_complete(),
+            "system item IDs cannot be allocated outside of bootstrap"
+        );
+
+        self.metrics.transactions_started.inc();
+        let upper = self.upper.clone();
+
+        // Extract only the id_allocator collection from the cached snapshot.
+        let id_allocator = self.snapshot_id_allocator().await?;
+
+        // Find the current ID for the requested type.
+        let alloc_key = proto::IdAllocKey {
+            name: id_type.to_string(),
+        };
+        let current_value = id_allocator
+            .get(&alloc_key)
+            .unwrap_or_else(|| panic!("{id_type} id allocator missing"));
+        let current_id = current_value.next_id;
+        let next_id = current_id
+            .checked_add(amount)
+            .ok_or(mz_sql::catalog::CatalogError::IdExhaustion)?;
+
+        // Build the id_allocator diff: retract old value, insert new value.
+        let old_value = current_value.clone();
+        let new_value = proto::IdAllocValue { next_id };
+        let id_allocator_updates = vec![
+            (alloc_key.clone(), old_value, Diff::MINUS_ONE),
+            (alloc_key, new_value, Diff::ONE),
+        ];
+
+        // Build a minimal TransactionBatch with only the id_allocator changes.
+        let txn_batch = TransactionBatch {
+            databases: Vec::new(),
+            schemas: Vec::new(),
+            items: Vec::new(),
+            comments: Vec::new(),
+            roles: Vec::new(),
+            role_auth: Vec::new(),
+            clusters: Vec::new(),
+            cluster_replicas: Vec::new(),
+            network_policies: Vec::new(),
+            introspection_sources: Vec::new(),
+            id_allocator: id_allocator_updates,
+            configs: Vec::new(),
+            settings: Vec::new(),
+            system_gid_mapping: Vec::new(),
+            system_configurations: Vec::new(),
+            default_privileges: Vec::new(),
+            source_references: Vec::new(),
+            system_privileges: Vec::new(),
+            storage_collection_metadata: Vec::new(),
+            unfinalized_shards: Vec::new(),
+            txn_wal_shard: Vec::new(),
+            audit_log_updates: Vec::new(),
+            upper,
+        };
+
+        self.commit_transaction(txn_batch, commit_ts).await?;
+
+        self.metrics()
+            .allocate_id_seconds
+            .observe(start.elapsed().as_secs_f64());
+        Ok((current_id..next_id).collect())
     }
 }
 
