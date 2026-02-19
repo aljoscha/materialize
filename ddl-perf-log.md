@@ -400,3 +400,130 @@ when there's only one op (or on the last op of a multi-op transaction).
 
 The durable catalog snapshot rebuild (~30%) is the next largest target. It
 requires making `with_snapshot` incremental or caching the snapshot.
+
+### Session 6: Optimized build profiling — real production bottlenecks (2026-02-19)
+
+**Goal:** Profile DDL with an optimized (`--optimized`) build to identify the
+real production bottlenecks, since previous sessions used debug builds where
+`check_consistency` (a debug-only assertion) dominated.
+
+**Setup:** Optimized build with `bin/environmentd --reset --optimized`. Created
+50,050 tables (50,090 user objects total). Ran `perf record -F 7000 --call-graph
+fp` during 30 CREATE TABLE statements.
+
+**Baseline measurements (optimized build, ~50k user objects):**
+
+| DDL Type     | Median (ms) | Notes |
+|-------------|-------------|-------|
+| CREATE TABLE | 444         | 5 samples: 409, 425, 444, 473, 480 |
+| CREATE VIEW  | 436         | 5 samples: 392, 404, 456, 466, 466 |
+| DROP TABLE   | 311         | 5 samples: 310, 311, 311, 314, 370 |
+
+**Key finding: No `check_consistency` in production.** In optimized (release)
+builds, soft assertions are disabled, so `check_consistency` never runs. All
+the time we spent making it incremental (Sessions 3-5) only helps debug/test
+builds. The production profile is entirely different.
+
+**Results — Full DDL time breakdown (optimized build, ~50k objects):**
+
+```
+A. allocate_user_id path: 24.9%
+   - snapshot rebuild from trace: 11.7%
+   - Transaction::new (proto→Rust conversion): 8.2%
+   - compare_and_append (persist write): 3.6%
+   - consolidation: 3.5%
+
+B. catalog_transact_with_side_effects: 75.0%
+   - Cow::to_mut (CatalogState clone): 19.4%
+   - DurableCatalogState::transaction: 20.0%
+     - snapshot rebuild from trace: 12.0%
+     - Transaction::new (proto→Rust): 8.2%
+   - drop(CatalogState): 10.7%
+   - apply_updates: 4.2%
+   - apply_catalog_implications: 3.4%
+   - persist writes: 4.2%
+   - other: ~1%
+```
+
+**O(n) vs O(1) classification:**
+
+| Category | DDL % | O(n)? |
+|----------|-------|-------|
+| Cow\<CatalogState\> clone+drop | 30.1% | YES — clones/drops all catalog entries |
+| Snapshot rebuild from trace (2×) | 23.7% | YES — iterates full trace, clones into BTreeMaps |
+| Transaction::new proto→Rust (2×) | 16.4% | YES — deserializes all proto entries to Rust types |
+| apply_updates | 4.2% | partial |
+| consolidation | 3.5% | YES |
+| **Total O(n)** | **~78%** | |
+| Persist writes (compare_and_append) | ~7.8% | NO — O(1) |
+| apply_catalog_implications | 3.4% | NO — O(1) |
+| Other | ~10% | mixed |
+
+**Critical architectural insight:** Each CREATE TABLE opens **two** full durable
+catalog transactions:
+
+1. `allocate_user_id` — opens a full transaction (snapshot rebuild + proto
+   conversion for ALL 20 collections) just to read one ID counter, increment
+   it, and commit. This is 24.9% of DDL time.
+
+2. `catalog_transact` — opens another full transaction for the actual DDL
+   mutation. This is 75.0% of DDL time.
+
+Both transactions rebuild the `Snapshot` struct from scratch by iterating the
+entire in-memory trace (O(n) entries), then `Transaction::new` deserializes
+every proto entry to Rust types across all 20 collections. For `allocate_id`,
+only the `id_allocator` collection (~5 entries) is actually accessed, but all
+50k+ items are needlessly deserialized.
+
+**Code locations:**
+- `src/catalog/src/durable/persist.rs:1733-1738` — `transaction()` calls
+  `self.snapshot()` which calls `with_snapshot`
+- `src/catalog/src/durable/persist.rs:740-850` — `with_snapshot` iterates full
+  trace into fresh `Snapshot`
+- `src/catalog/src/durable/transaction.rs:117-198` — `Transaction::new`
+  deserializes all proto→Rust
+- `src/catalog/src/durable.rs:323-340` — `allocate_id` opens full transaction
+  for a single counter
+- `src/adapter/src/catalog/transact.rs:436-440` — `catalog_transact` opens
+  second full transaction
+
+**Comparison with debug build profile (Sessions 2-5):**
+
+| Component | Debug build % | Optimized build % | Notes |
+|-----------|--------------|-------------------|-------|
+| check_consistency | 52% → 17% (after fix) | 0% | Debug-only |
+| Cow clone+drop | 31% | 30% | Same in both |
+| Snapshot rebuild | ~12% | 24% | Larger % since no check_consistency |
+| Transaction::new | ~7% | 16% | Same |
+| Persist writes | ~8% | ~8% | Same |
+
+**Possible optimizations (ranked by impact):**
+
+1. **Cache the `Snapshot` in `PersistHandle` (~24%)** — Instead of rebuilding
+   the `Snapshot` from the trace on every `transaction()` call, maintain a
+   cached `Snapshot` as a live derived view. When `apply_updates()` is called,
+   update the cached Snapshot incrementally. This eliminates the O(n) trace
+   iteration on every transaction open. Implementation: add
+   `cached_snapshot: Snapshot` field to `PersistHandle`, update it in
+   `apply_updates`, return a clone in `with_snapshot`.
+
+2. **Eliminate the separate `allocate_user_id` transaction (~25%)** — The
+   `allocate_id` method opens a full transaction just for one counter. Options:
+   - Move ID allocation into the main `catalog_transact` using the existing
+     `Transaction::allocate_user_item_ids()` method. This requires refactoring
+     the sequencer to defer ID assignment until inside transact_inner.
+   - Create a lightweight `allocate_id` path that reads the counter directly
+     from the trace (like `get_next_id` already does) and commits only the
+     counter update, without building a full `Snapshot` or `Transaction`.
+
+3. **Eliminate Cow\<CatalogState\> clone+drop (~30%)** — Use `Arc` fields or
+   persistent data structures inside CatalogState so clone is O(1). Or
+   restructure `transact_inner` to mutate in place with rollback.
+
+4. **Lazy proto→Rust deserialization in Transaction::new (~16%)** — Instead of
+   deserializing all 20 collections upfront, lazily deserialize only the
+   collections that are actually accessed during the transaction.
+
+**Next step:** Cache the `Snapshot` in `PersistHandle` (optimization #1). This
+is the cleanest single change with ~24% impact. It avoids the O(n) trace
+iteration on both the `allocate_user_id` and `catalog_transact` paths.
