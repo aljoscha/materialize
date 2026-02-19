@@ -377,6 +377,12 @@ pub(crate) struct PersistHandle<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> {
     ///
     /// We use a tuple instead of [`StateUpdate`] to make consolidation easier.
     pub(crate) snapshot: Vec<(T, Timestamp, Diff)>,
+    /// Pre-built snapshot derived from `self.snapshot` trace, maintained incrementally.
+    ///
+    /// When present, `with_snapshot` returns a clone of this instead of rebuilding
+    /// from the trace vector. Updated incrementally in `apply_updates` to avoid
+    /// O(n) trace iteration on every transaction.
+    cached_snapshot: Option<Snapshot>,
     /// Applies custom processing, filtering, and fencing for each individual update.
     update_applier: U,
     /// The current upper of the persist shard.
@@ -659,7 +665,20 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
                 &mut self.fenceable_token,
                 &self.metrics,
             ) {
-                Ok(Some(StateUpdate { kind, ts, diff })) => self.snapshot.push((kind, ts, diff)),
+                Ok(Some(StateUpdate { kind, ts, diff })) => {
+                    if let Some(ref mut cached) = self.cached_snapshot {
+                        // Incrementally maintain the cached snapshot.
+                        // T::try_into is infallible for StateUpdateKind (identity conversion).
+                        // For StateUpdateKindJson, cached_snapshot is always None so we never
+                        // reach this branch.
+                        if let Ok(state_kind) =
+                            <T as TryIntoStateUpdateKind>::try_into(kind.clone())
+                        {
+                            cached.apply_update(&state_kind, diff);
+                        }
+                    }
+                    self.snapshot.push((kind, ts, diff));
+                }
                 Ok(None) => {}
                 // Instead of returning immediately, we accumulate all the errors and return the one
                 // with the most information.
@@ -737,116 +756,34 @@ impl<U: ApplyUpdate<StateUpdateKind>> PersistHandle<StateUpdateKind, U> {
     /// Execute and return the results of `f` on the current catalog snapshot.
     ///
     /// Will return an error if the catalog has been fenced out.
+    ///
+    /// Uses a cached snapshot when available (maintained incrementally by `apply_updates`),
+    /// falling back to rebuilding from the trace on the first call or if the cache was
+    /// invalidated.
     async fn with_snapshot<T>(
         &mut self,
         f: impl FnOnce(Snapshot) -> Result<T, CatalogError>,
     ) -> Result<T, CatalogError> {
-        fn apply<K, V>(map: &mut BTreeMap<K, V>, key: &K, value: &V, diff: Diff)
-        where
-            K: Ord + Clone,
-            V: Ord + Clone + Debug,
-        {
-            let key = key.clone();
-            let value = value.clone();
-            if diff == Diff::ONE {
-                let prev = map.insert(key, value);
-                assert_eq!(
-                    prev, None,
-                    "values must be explicitly retracted before inserting a new value"
-                );
-            } else if diff == Diff::MINUS_ONE {
-                let prev = map.remove(&key);
-                assert_eq!(
-                    prev,
-                    Some(value),
-                    "retraction does not match existing value"
-                );
-            }
+        // Sync to the current upper first (may trigger apply_updates which maintains the cache).
+        self.sync_to_current_upper().await?;
+
+        // If we have a cached snapshot, clone and use it directly.
+        if let Some(ref cached) = self.cached_snapshot {
+            return f(cached.clone());
         }
 
-        self.with_trace(|trace| {
-            let mut snapshot = Snapshot::empty();
-            for (kind, ts, diff) in trace {
-                let diff = *diff;
-                if diff != Diff::ONE && diff != Diff::MINUS_ONE {
-                    panic!("invalid update in consolidated trace: ({kind:?}, {ts:?}, {diff:?})");
-                }
-
-                match kind {
-                    StateUpdateKind::AuditLog(_key, ()) => {
-                        // Ignore for snapshots.
-                    }
-                    StateUpdateKind::Cluster(key, value) => {
-                        apply(&mut snapshot.clusters, key, value, diff);
-                    }
-                    StateUpdateKind::ClusterReplica(key, value) => {
-                        apply(&mut snapshot.cluster_replicas, key, value, diff);
-                    }
-                    StateUpdateKind::Comment(key, value) => {
-                        apply(&mut snapshot.comments, key, value, diff);
-                    }
-                    StateUpdateKind::Config(key, value) => {
-                        apply(&mut snapshot.configs, key, value, diff);
-                    }
-                    StateUpdateKind::Database(key, value) => {
-                        apply(&mut snapshot.databases, key, value, diff);
-                    }
-                    StateUpdateKind::DefaultPrivilege(key, value) => {
-                        apply(&mut snapshot.default_privileges, key, value, diff);
-                    }
-                    StateUpdateKind::FenceToken(_token) => {
-                        // Ignore for snapshots.
-                    }
-                    StateUpdateKind::IdAllocator(key, value) => {
-                        apply(&mut snapshot.id_allocator, key, value, diff);
-                    }
-                    StateUpdateKind::IntrospectionSourceIndex(key, value) => {
-                        apply(&mut snapshot.introspection_sources, key, value, diff);
-                    }
-                    StateUpdateKind::Item(key, value) => {
-                        apply(&mut snapshot.items, key, value, diff);
-                    }
-                    StateUpdateKind::NetworkPolicy(key, value) => {
-                        apply(&mut snapshot.network_policies, key, value, diff);
-                    }
-                    StateUpdateKind::Role(key, value) => {
-                        apply(&mut snapshot.roles, key, value, diff);
-                    }
-                    StateUpdateKind::Schema(key, value) => {
-                        apply(&mut snapshot.schemas, key, value, diff);
-                    }
-                    StateUpdateKind::Setting(key, value) => {
-                        apply(&mut snapshot.settings, key, value, diff);
-                    }
-                    StateUpdateKind::SourceReferences(key, value) => {
-                        apply(&mut snapshot.source_references, key, value, diff);
-                    }
-                    StateUpdateKind::SystemConfiguration(key, value) => {
-                        apply(&mut snapshot.system_configurations, key, value, diff);
-                    }
-                    StateUpdateKind::SystemObjectMapping(key, value) => {
-                        apply(&mut snapshot.system_object_mappings, key, value, diff);
-                    }
-                    StateUpdateKind::SystemPrivilege(key, value) => {
-                        apply(&mut snapshot.system_privileges, key, value, diff);
-                    }
-                    StateUpdateKind::StorageCollectionMetadata(key, value) => {
-                        apply(&mut snapshot.storage_collection_metadata, key, value, diff);
-                    }
-                    StateUpdateKind::UnfinalizedShard(key, ()) => {
-                        apply(&mut snapshot.unfinalized_shards, key, &(), diff);
-                    }
-                    StateUpdateKind::TxnWalShard((), value) => {
-                        apply(&mut snapshot.txn_wal_shard, &(), value, diff);
-                    }
-                    StateUpdateKind::RoleAuth(key, value) => {
-                        apply(&mut snapshot.role_auth, key, value, diff);
-                    }
-                }
+        // Otherwise, build from the trace and cache the result.
+        let mut snapshot = Snapshot::empty();
+        for (kind, _ts, diff) in &self.snapshot {
+            let diff = *diff;
+            if diff != Diff::ONE && diff != Diff::MINUS_ONE {
+                panic!("invalid update in consolidated trace: ({kind:?}, {diff:?})");
             }
-            f(snapshot)
-        })
-        .await
+            snapshot.apply_update(kind, diff);
+        }
+
+        self.cached_snapshot = Some(snapshot.clone());
+        f(snapshot)
     }
 
     /// Generates an iterator of [`StateUpdate`] that contain all updates to the catalog
@@ -1064,6 +1001,7 @@ impl UnopenedPersistCatalogState {
             shard_id: catalog_shard_id,
             // Initialize empty in-memory state.
             snapshot: Vec::new(),
+            cached_snapshot: None,
             update_applier: UnopenedCatalogStateInner::new(organization_id),
             upper,
             fenceable_token: FenceableToken::new(deploy_generation),
@@ -1227,6 +1165,7 @@ impl UnopenedPersistCatalogState {
             fenceable_token: self.fenceable_token,
             // Initialize empty in-memory state.
             snapshot: Vec::new(),
+            cached_snapshot: None,
             update_applier: CatalogStateInner::new(),
             catalog_content_version: self.catalog_content_version,
             bootstrap_complete: false,

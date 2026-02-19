@@ -38,7 +38,7 @@ use mz_persist_types::ShardId;
 use mz_repr::adt::mz_acl_item::{AclMode, MzAclItem};
 use mz_repr::network_policy_id::NetworkPolicyId;
 use mz_repr::role_id::RoleId;
-use mz_repr::{CatalogItemId, GlobalId, RelationVersion};
+use mz_repr::{CatalogItemId, Diff, GlobalId, RelationVersion};
 use mz_sql::catalog::{
     CatalogItemType, DefaultPrivilegeAclItem, DefaultPrivilegeObject, ObjectType, RoleAttributes,
     RoleMembership, RoleVars,
@@ -1165,6 +1165,111 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn empty() -> Snapshot {
         Snapshot::default()
+    }
+
+    /// Apply a single update to this snapshot.
+    ///
+    /// For `diff = +1`, inserts the key-value pair into the appropriate map.
+    /// For `diff = -1`, removes the key-value pair.
+    /// Panics if the update is inconsistent (e.g., inserting a duplicate or
+    /// retracting a non-existent value).
+    pub fn apply_update(&mut self, kind: &state_update::StateUpdateKind, diff: Diff) {
+        use state_update::StateUpdateKind;
+
+        fn apply<K, V>(map: &mut BTreeMap<K, V>, key: &K, value: &V, diff: Diff)
+        where
+            K: Ord + Clone,
+            V: Ord + Clone + std::fmt::Debug,
+        {
+            let key = key.clone();
+            let value = value.clone();
+            if diff == Diff::ONE {
+                let prev = map.insert(key, value);
+                assert_eq!(
+                    prev, None,
+                    "values must be explicitly retracted before inserting a new value"
+                );
+            } else if diff == Diff::MINUS_ONE {
+                let prev = map.remove(&key);
+                assert_eq!(
+                    prev,
+                    Some(value),
+                    "retraction does not match existing value"
+                );
+            }
+        }
+
+        match kind {
+            StateUpdateKind::AuditLog(_key, ()) => {
+                // Ignore for snapshots.
+            }
+            StateUpdateKind::Cluster(key, value) => {
+                apply(&mut self.clusters, key, value, diff);
+            }
+            StateUpdateKind::ClusterReplica(key, value) => {
+                apply(&mut self.cluster_replicas, key, value, diff);
+            }
+            StateUpdateKind::Comment(key, value) => {
+                apply(&mut self.comments, key, value, diff);
+            }
+            StateUpdateKind::Config(key, value) => {
+                apply(&mut self.configs, key, value, diff);
+            }
+            StateUpdateKind::Database(key, value) => {
+                apply(&mut self.databases, key, value, diff);
+            }
+            StateUpdateKind::DefaultPrivilege(key, value) => {
+                apply(&mut self.default_privileges, key, value, diff);
+            }
+            StateUpdateKind::FenceToken(_token) => {
+                // Ignore for snapshots.
+            }
+            StateUpdateKind::IdAllocator(key, value) => {
+                apply(&mut self.id_allocator, key, value, diff);
+            }
+            StateUpdateKind::IntrospectionSourceIndex(key, value) => {
+                apply(&mut self.introspection_sources, key, value, diff);
+            }
+            StateUpdateKind::Item(key, value) => {
+                apply(&mut self.items, key, value, diff);
+            }
+            StateUpdateKind::NetworkPolicy(key, value) => {
+                apply(&mut self.network_policies, key, value, diff);
+            }
+            StateUpdateKind::Role(key, value) => {
+                apply(&mut self.roles, key, value, diff);
+            }
+            StateUpdateKind::Schema(key, value) => {
+                apply(&mut self.schemas, key, value, diff);
+            }
+            StateUpdateKind::Setting(key, value) => {
+                apply(&mut self.settings, key, value, diff);
+            }
+            StateUpdateKind::SourceReferences(key, value) => {
+                apply(&mut self.source_references, key, value, diff);
+            }
+            StateUpdateKind::SystemConfiguration(key, value) => {
+                apply(&mut self.system_configurations, key, value, diff);
+            }
+            StateUpdateKind::SystemObjectMapping(key, value) => {
+                apply(&mut self.system_object_mappings, key, value, diff);
+            }
+            StateUpdateKind::SystemPrivilege(key, value) => {
+                apply(&mut self.system_privileges, key, value, diff);
+            }
+            StateUpdateKind::StorageCollectionMetadata(key, value) => {
+                apply(&mut self.storage_collection_metadata, key, value, diff);
+            }
+            StateUpdateKind::UnfinalizedShard(key, ()) => {
+                apply(&mut self.unfinalized_shards, key, &(), diff);
+            }
+            StateUpdateKind::TxnWalShard((), value) => {
+                apply(&mut self.txn_wal_shard, &(), value, diff);
+            }
+            StateUpdateKind::RoleAuth(key, value) => {
+                apply(&mut self.role_auth, key, value, diff);
+            }
+        }
     }
 }
 

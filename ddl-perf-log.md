@@ -527,3 +527,88 @@ only the `id_allocator` collection (~5 entries) is actually accessed, but all
 **Next step:** Cache the `Snapshot` in `PersistHandle` (optimization #1). This
 is the cleanest single change with ~24% impact. It avoids the O(n) trace
 iteration on both the `allocate_user_id` and `catalog_transact` paths.
+
+### Session 7: Cache Snapshot in PersistHandle (2026-02-19)
+
+**Goal:** Eliminate the O(n) trace→Snapshot rebuild that happens twice per DDL
+(once in `allocate_user_id`, once in `catalog_transact`), accounting for ~24%
+of DDL time in the production (optimized) profile.
+
+**Analysis:** Each time `transaction()` is called, it calls `snapshot()` →
+`with_snapshot()` which iterates the entire consolidated trace vector
+(`self.snapshot: Vec<(StateUpdateKind, Timestamp, Diff)>`) and rebuilds a
+`Snapshot` struct (21 BTreeMaps, one per collection). With 50k tables, this
+means iterating 50k+ entries and inserting them into BTreeMaps — twice per DDL.
+
+**Approach:** Maintain a pre-built `Snapshot` as a cached field in
+`PersistHandle`, updated incrementally:
+
+1. Added `Snapshot::apply_update(&mut self, kind: &StateUpdateKind, diff: Diff)`
+   method that applies a single insert/retract to the appropriate BTreeMap,
+   extracting the match logic from the old `with_snapshot` into a reusable
+   method.
+
+2. Added `cached_snapshot: Option<Snapshot>` field to `PersistHandle`.
+
+3. Modified `apply_updates` to incrementally maintain the cached snapshot:
+   when an update passes through `update_applier.apply_update()` and gets
+   pushed to the trace, it's also applied to the cached snapshot (if present).
+   For `StateUpdateKindJson` (the unopened catalog), the cache is always `None`
+   so this is a no-op.
+
+4. Modified `with_snapshot` to check the cache first: if present, clone and
+   return it (O(Snapshot size) for the clone, but avoids the O(n) trace
+   iteration + BTreeMap insert). On first call (cache miss), builds from trace
+   as before and caches the result.
+
+The key insight: after the first `with_snapshot` call builds the cache, every
+subsequent `apply_updates` call (from transaction commits) only applies the
+small delta (e.g., 1-3 entries for a single DDL) to the existing cached
+Snapshot. The next `with_snapshot` call then gets a cache hit and just clones
+the pre-built Snapshot.
+
+**Code changes:**
+- `src/catalog/src/durable/objects.rs` — added `Snapshot::apply_update` method
+- `src/catalog/src/durable/persist.rs` — added `cached_snapshot` field to
+  `PersistHandle`, modified `apply_updates` to maintain cache incrementally,
+  modified `with_snapshot` to use cache when available
+
+**Results (median of 10 samples, optimized build, ~50k user objects):**
+
+| DDL Type     | Session 6 Baseline | Session 7 Cached | Improvement |
+|-------------|-------------------|------------------|-------------|
+| CREATE TABLE | 444 ms            | 387 ms           | **13%**     |
+| CREATE VIEW  | 436 ms            | 368 ms           | **16%**     |
+| DROP TABLE   | 311 ms            | 295 ms           | **5%**      |
+
+**Key observations:**
+- CREATE TABLE and CREATE VIEW improved by 13-16%, consistent with eliminating
+  one of the two O(n) snapshot rebuilds per DDL. The first `with_snapshot` call
+  (in `allocate_user_id`) still rebuilds from trace on the very first DDL after
+  startup, but subsequent calls hit the cache.
+- DROP TABLE improved less (5%), possibly because DROP has different snapshot
+  access patterns or the snapshot rebuild was a smaller fraction of DROP time.
+- The `Snapshot` clone in `with_snapshot` (cache hit path) is still O(n) in
+  Snapshot size, but much cheaper than iterating the trace and doing BTreeMap
+  insertions: a BTreeMap clone copies the tree structure directly, while
+  building from trace does individual insertions that must find their position.
+- Note: These measurements have some bimodal variance (some samples ~60ms
+  slower than others), likely from CockroachDB background activity. Medians
+  should be compared rather than individual samples.
+
+**Remaining O(n) sources in production (optimized build, estimated):**
+1. **Cow\<CatalogState\> clone+drop (~30%)** — Still the largest single O(n) cost
+2. **Transaction::new proto→Rust conversion (~16%)** — Deserializes all proto
+   entries to Rust types across 20 collections for each transaction
+3. **Snapshot clone in with_snapshot (~12%)** — The cached Snapshot still needs
+   to be cloned for each transaction (clone is cheaper than rebuild, but still
+   O(n))
+4. **Persist consolidation (~3.5%)** — Consolidating the trace after updates
+
+**Next step:** The next biggest target is either:
+- **Eliminate the Cow\<CatalogState\> clone+drop (~30%)** — Use `Arc` fields,
+  persistent data structures, or restructure `transact_inner` for in-place
+  mutation with rollback.
+- **Make Transaction::new lazy (~16%)** — Only deserialize the collections that
+  are actually accessed during the transaction (e.g., `allocate_user_id` only
+  needs `id_allocator`, not all 20 collections).
