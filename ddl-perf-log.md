@@ -1019,3 +1019,97 @@ The remaining O(n) costs (estimated) are:
 
 **Next step:** Profile again to confirm the new cost breakdown, then tackle
 Transaction::new lazy deserialization or Snapshot clone cost reduction.
+
+---
+
+## Session 12: Profile post-Session 11 optimized build
+
+**Goal:** Profile the optimized build after eliminating the group_commit table
+advancement loop (Session 11) to identify the next bottleneck and get an updated
+cost breakdown.
+
+**Setup:** Optimized build, ~28k objects, perf record at 99 Hz for 10 seconds.
+30 CREATE TABLEs in 3.3s = ~111ms per DDL. 3068 samples captured.
+
+**Top-level breakdown (% of active coordinator time):**
+
+| Function                           | % of active | Est. time |
+|------------------------------------|-------------|-----------|
+| sequence_create_table (total)      | 80%         | ~89ms     |
+| catalog_transact_with_side_effects | 70%         | ~78ms     |
+| allocate_user_id                   | 8%          | ~9ms      |
+| group_commit                       | 0%          | 0ms       |
+| Non-DDL overhead                   | 20%         | ~22ms     |
+
+**Detailed catalog_transact breakdown (% of catalog_transact time):**
+
+| Function                             | % of ct | Est. time | Notes                              |
+|--------------------------------------|---------|-----------|-------------------------------------|
+| DurableCatalogState::transaction     | 38%     | ~30ms     | snapshot + Transaction::new         |
+|   Snapshot::clone                    | 12%     | ~9ms      | items=8%, storage_coll_meta=3%      |
+|   TableTransaction::new              | 26%     | ~20ms     | items=16%, storage_coll_meta=10%    |
+| DurableCatalogState::commit_transaction | 28%  | ~22ms     | consolidate + compare_and_append    |
+|   consolidate (inside apply_updates) | 24%     | ~19ms     | O(n log n) sort_unstable on trace   |
+|   compare_and_append + pending       | 3%      | ~2ms      |                                     |
+| apply_updates (standalone)           | 3%      | ~2ms      | CatalogState apply, excl consolidate |
+| apply_catalog_implications           | 13%     | ~10ms     | create_table_collections, read holds |
+| transact_op                          | 8%      | ~6ms      | user-provided DDL ops               |
+| Transaction drop                     | 6%      | ~5ms      | BTreeMap destruction                 |
+
+**Cross-cutting costs:**
+
+- **BTreeMap clone/create/destroy** dominates the profile. The Snapshot uses
+  `BTreeMap<ProtoKey, ProtoValue>` for each of ~20 collections, and
+  TableTransaction converts these to `BTreeMap<RustKey, Option<RustValue>>`.
+  The largest collections are `items` (~10k+ entries) and
+  `storage_collection_metadata` (~10k+ entries).
+
+- **Consolidation** (`consolidate_updates_slice_slow`) = 24% of ct. This sorts
+  the entire StateUpdate trace using `sort_unstable` every DDL. The trace grows
+  with object count making this O(n log n).
+
+- **Proto-to-Rust conversion** in `TableTransaction::new` iterates each
+  collection's BTreeMap, converts every entry from proto types to Rust types,
+  and builds a new `BTreeMap<RustKey, Option<RustValue>>`. The `items` collection
+  accounts for 16% of ct and `storage_collection_metadata` for 10%.
+
+**Key findings vs Session 10:**
+
+| Cost center              | Session 10 | Session 12 | Change          |
+|--------------------------|-----------|-----------|-----------------|
+| group_commit advancement | 23%       | 0%        | Eliminated (S11)|
+| Transaction::new         | 20%       | 26%       | Now top cost    |
+| Snapshot clone           | 19%       | 12%       | Relatively smaller|
+| consolidate              | 12%       | 24%       | Now #2 cost     |
+| apply_catalog_implications | 9%      | 13%       | Relatively larger|
+
+The elimination of the 23% group_commit cost reshuffled the relative rankings.
+Transaction::new (26%) and consolidation (24%) are now the top two bottlenecks.
+
+**Optimization opportunities ranked by impact:**
+
+1. **Make Transaction::new lazy (26% of ct, ~20ms).** Most DDL operations only
+   touch 1-2 of the 20 collections. If `TableTransaction::new` is only called
+   for collections that are actually accessed, the items and
+   storage_collection_metadata conversions (26% total) would be avoided for most
+   DDL types. This requires lazy initialization of each `TableTransaction`.
+
+2. **Reduce consolidation cost (24% of ct, ~19ms).** The full trace is sorted
+   on every DDL. Options:
+   - Maintain the trace in sorted order (insert in sorted position)
+   - Use incremental consolidation (only consolidate new entries)
+   - Keep a separate sorted buffer and merge
+
+3. **Reduce Snapshot clone cost (12% of ct, ~9ms).** Wrap the large BTreeMaps
+   (`items`, `storage_collection_metadata`) in `Arc` so clone is O(1). The
+   snapshot is cloned once per transaction and the clone is consumed by
+   `Transaction::new`, so using `Arc` + clone-on-write would make the clone
+   near-free.
+
+4. **Reduce apply_catalog_implications (13% of ct, ~10ms).** This includes
+   `create_table_collections` and read hold management. May be harder to
+   optimize as it's real work for each DDL.
+
+5. **Reduce Transaction drop cost (6% of ct, ~5ms).** The Transaction holds
+   BTreeMaps for all 20 collections. If lazy init (#1) is implemented, only
+   accessed collections would need to be dropped.
