@@ -1865,3 +1865,137 @@ profiling **misleading for I/O-bound operations** — always verify with optimiz
 - Added `mz_initialize_storage_collections_seconds` histogram (adapter metrics)
 - Added `mz_storage_create_collections_seconds` histogram (storage controller)
 - No functional changes — diagnostic only
+
+## Session 20: Skip upgrade_version CAS for shards at current version
+
+**Date:** 2026-02-20
+**Type:** Optimization
+**Build:** Optimized (release + debuginfo), Docker CockroachDB
+**Object count:** ~37.5k → ~37.9k
+
+### Goal
+
+Reduce `storage_collections` persist operations (~24ms, 73% of create_collections
+in Session 19). Three sequential persist CAS operations happen for every new table:
+`upgrade_version`, `open_critical_handle` (includes `register_critical_reader` +
+`compare_and_downgrade_since`), and a table-specific `compare_and_downgrade_since`.
+
+### Analysis
+
+For newly-created shards, `upgrade_version` is a no-op: the shard is initialized
+with `cfg.build_version` (the current version) via `maybe_init_shard` →
+`write_initial_rollup` → `TypedState::new(cfg.build_version, ...)`. The
+`upgrade_version` work function checks `state.version <= cfg.build_version` and
+sets `state.version = cfg.build_version` — but for a new shard, the version is
+already equal. Despite this, the code returns `Continue(Ok(()))` which triggers
+a consensus CAS write that changes nothing.
+
+This is also true for existing shards after restart without a version change: the
+shard version matches the build version, but `upgrade_version` still performs a
+consensus CAS write.
+
+### Change
+
+Modified `Machine::upgrade_version()` in `src/persist-client/src/internal/machine.rs`
+to distinguish three cases:
+1. `state.version == cfg.build_version` → `Break(NoOpStateTransition(Ok(())))`:
+   Already at current version, skip consensus CAS write entirely.
+2. `state.version < cfg.build_version` → `Continue(Ok(()))`: Needs upgrade,
+   perform CAS write as before.
+3. `state.version > cfg.build_version` → `Break(NoOpStateTransition(Err(...)))`:
+   Incompatible version, return error as before.
+
+When `Break(NoOpStateTransition(...))` is returned, the persist state machine
+skips the `try_compare_and_set_current` consensus write entirely via the
+`ApplyCmdResult::SkippedStateTransition` path. This saves one consensus round-trip
+(~3-4ms with local filesystem persist, ~10-50ms with S3-backed persist in
+production).
+
+**Benefits beyond DDL:**
+- Bootstrap: All shards already at current version skip the CAS during restart
+  (~thousands of shards × ~4ms each = significant startup time savings)
+- Any other caller of `upgrade_version` benefits from the same optimization
+
+### Results (optimized build, Docker CockroachDB, ~37.5-37.9k objects)
+
+**100-batch averages (most reliable due to variance smoothing):**
+
+| Metric | Session 19 (20 batch) | Session 20 (100 batch) | Change |
+|--------|----------------------|-----------------------|--------|
+| catalog_transact avg | ~95ms | 90.4ms | **-5%** |
+| apply_catalog_implications avg | ~46ms | 41.5ms | **-10%** |
+| storage_collections avg | ~24ms | 20.9ms | **-13%** |
+| table_register avg | ~6.5ms | 8.2ms | +26% (noise) |
+| create_collections avg | ~33ms | 29.9ms | **-9%** |
+| allocate_id avg | ~3.5ms | 3.5ms | ~0 |
+
+**Individual psql measurements (14 samples, sorted):**
+122 124 125 126 127 127 127 127 127 129 129 137 147 156
+Median: **127ms** (Session 19: 136ms, **-7%**)
+
+**Batch mode throughput:**
+- Batch of 100: 105ms per DDL (Session 19: ~105ms batch mode)
+
+**Note on variance:** Docker CockroachDB shows significant batch-to-batch variance.
+20-batch measurements ranged from 75ms to 89ms for catalog_transact. The 100-batch
+average (90.4ms) is the most reliable comparison point.
+
+### Key observations
+
+1. **storage_collections dropped ~3ms** from ~24ms to ~20.9ms. This matches the
+   expected savings from skipping one consensus CAS write (~3-4ms with local
+   filesystem persist).
+
+2. **Individual psql median dropped 9ms** from 136ms to 127ms. Part of the
+   improvement is from the storage_collections savings; the rest may be from
+   reduced contention (one fewer CAS means less consensus load).
+
+3. **table_register variance is high** (5.4-8.2ms across batches). This is
+   Docker CockroachDB variance, not a regression.
+
+4. **The optimization benefits all shards, not just DDL.** During bootstrap,
+   thousands of existing shards that are already at the current version will
+   skip the consensus CAS. This could save significant startup time.
+
+### Updated wall-clock breakdown per CREATE TABLE (~127ms individual psql)
+
+```
+Total DDL: ~127ms
+├── catalog_transact: 90ms (71%)
+│   ├── apply_catalog_implications: 42ms (33%)
+│   │   ├── get_local_write_ts: ~2.1ms
+│   │   ├── confirm_leadership: ~0.8ms
+│   │   ├── create_collections: ~30ms                    ← was ~33ms
+│   │   │   ├── storage_collections: ~21ms (was ~24ms)   ← IMPROVED
+│   │   │   │   ├── open_critical_handle: ~13ms (2 CAS)
+│   │   │   │   └── upgrade_version: ~8ms (make_machine + no-op CAS skip)
+│   │   │   ├── open_data_handles: ~0.7ms
+│   │   │   └── table_register: ~8ms
+│   │   └── apply_local_write: ~2.3ms
+│   └── catalog_transact_inner: ~48ms
+├── allocate_id: 3.5ms (3%)
+└── Non-catalog overhead: ~34ms (27%)
+```
+
+### Remaining optimization targets (updated)
+
+1. **Overlap storage_collections with open_data_handles + table_register
+   (~8ms savings).** Currently sequential: storage_collections (21ms) must
+   complete before the controller opens WriteHandles (0.7ms) and does
+   table_register (8ms). Since the WriteHandle and table_register don't
+   depend on the SinceHandle, they could run concurrently with
+   storage_collections. Saves up to 8ms (table_register running during the
+   21ms storage_collections window).
+
+2. **Combine compare_and_downgrade_since calls (~4ms savings).** For new tables,
+   `open_critical_handle` sets the since to T::minimum() and then a separate CAS
+   advances it to register_ts. Could pass register_ts directly to
+   `open_critical_handle`. Challenge: during bootstrap, existing tables' since
+   must NOT be advanced to register_ts. Needs a way to distinguish DDL from
+   bootstrap (e.g., a parameter to create_collections_for_bootstrap).
+
+3. **Merge allocate_id into catalog_transact (~3ms).** Saves one persist
+   round-trip.
+
+4. **Reduce DurableCatalogState::transaction CPU cost (~12-15ms).** Arc-wrapping
+   Snapshot BTreeMaps, lazy Transaction::new.

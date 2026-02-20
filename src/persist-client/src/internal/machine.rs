@@ -193,7 +193,13 @@ where
         let metrics = Arc::clone(&self.applier.metrics);
         let (_seqno, upgrade_result, maintenance) = self
             .apply_unbatched_idempotent_cmd(&metrics.cmds.remove_rollups, |_, cfg, state| {
-                if state.version <= cfg.build_version {
+                if state.version == cfg.build_version {
+                    // Already at the current version — skip the consensus CAS
+                    // write entirely. This is the common case for newly-created
+                    // shards (initialized at current version) and for existing
+                    // shards after restart without a version change.
+                    Break(NoOpStateTransition(Ok(())))
+                } else if state.version < cfg.build_version {
                     // This would be the place to remove any deprecated items from state, now
                     // that we're dropping compatibility with any previous versions.
                     state.version = cfg.build_version.clone();
