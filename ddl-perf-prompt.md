@@ -61,10 +61,18 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 16): At ~36.5k objects (optimized build, Docker
-CockroachDB), DDL latency is CREATE TABLE median ~127ms, catalog_transact avg
-90.2ms. That's down from 444ms at the Session 6 baseline (~71% cumulative
-improvement, or ~76% accounting for ~30-40ms Docker CockroachDB overhead).
+Current status (after Session 17): At ~37k objects (optimized build, Docker
+CockroachDB), DDL latency is CREATE TABLE ~106ms (batch) / ~128ms (individual
+psql), catalog_transact avg 89.1ms. That's down from 444ms at the Session 6
+baseline. CPU work per DDL is now ~0.6ms — DDL is I/O bound.
+
+**Important: DDL is now I/O bound, not CPU bound.** Session 17 revealed that
+CPU profiling (perf, flamegraphs) gives a misleading picture because it only
+captures compute time and misses async I/O waits. Use Prometheus wall-clock
+histograms for profiling instead. The wall-clock breakdown shows
+apply_catalog_implications at 42ms (40% of DDL time) — 6x larger than its CPU
+profile suggested — because it includes async waits for storage controller IPC,
+timestamp oracle round-trips, and persist operations.
 
 Completed optimizations (Sessions 7-9, 11, 13, 15-16):
 - Cached Snapshot in PersistHandle (Session 7)
@@ -84,33 +92,53 @@ Completed optimizations (Sessions 7-9, 11, 13, 15-16):
   call with a check on whether the corresponding delta is positive. For CREATE TABLE,
   skips ~10 unnecessary O(n) catalog scans. Was 7.8% of total CPU in Session 14.
 
-Completed diagnostics (Sessions 10, 12, 13, 14):
+Completed diagnostics (Sessions 10, 12, 13, 14, 17):
 - Profiled post-Session 9 optimized build at ~10k objects (Session 10)
 - Profiled post-Session 11 optimized build at ~28k objects (Session 12)
 - Profiled post-Session 13 optimized build at ~36.5k objects (Session 14)
+- Wall-clock profiling via Prometheus at ~37k objects (Session 17) — revealed
+  I/O dominance: apply_catalog_implications=42ms, create_collections=20-25ms,
+  oracle operations=5ms, initialize_read_policies=10ms
 - Full cost breakdowns in ddl-perf-log.md
 - Session 13 investigated lazy Transaction::new: found that CREATE TABLE accesses
   both expensive collections (items 16%, storage_collection_metadata 10%) plus
   reads from databases/schemas/roles/introspection_sources for OID allocation.
   Lazy init would save very little for CREATE TABLE specifically.
 
-Profiling notes: `perf record` works on this machine using the older perf binary
-at `/usr/lib/linux-tools/6.8.0-100-generic/perf` after setting
-`perf_event_paranoid` to 1. Use `rustfilt` for symbol demangling.
+Profiling notes:
+- **Use Prometheus metrics for wall-clock profiling**, not perf/flamegraphs.
+  CPU sampling misses async I/O waits which now dominate DDL time. Key metrics:
+  `mz_catalog_transact_seconds`, `mz_apply_catalog_implications_seconds`,
+  `mz_catalog_allocate_id_seconds`, `mz_catalog_transaction_commit_latency_seconds`,
+  `mz_slow_message_handling` (by message_kind), `mz_ts_oracle_seconds` (by op).
+- Capture metrics before/after a DDL batch and compute deltas for accurate
+  per-DDL averages. Use `curl -s http://localhost:6878/metrics > /tmp/before.txt`
+  then compare after.
 
-Immediate next steps (ranked by estimated impact from Session 14 profiling,
-with consolidation and validate_resource_limits now optimized):
+Immediate next steps (ranked by wall-clock impact from Session 17 profiling):
 
-- **Arc-wrap Snapshot BTreeMaps (~5.7% of total, ~12ms).** The durable catalog's
-  `Snapshot` (21 BTreeMaps) is fully cloned for each transaction. Wrapping in
-  `Arc` makes clone O(1) with copy-on-write semantics in `apply_update`.
+- **Reduce create_collections latency (~20-25ms, 19-24% of DDL).** The storage
+  controller opens persist WriteHandles and registers with txn-wal for each new
+  table. This involves `open_data_handles` → persist shard operations, plus
+  txn-wal registration. Code path: `src/storage-controller/src/lib.rs`
+  `create_collections_for_bootstrap` → `open_data_handles` → persist. Could
+  potentially fire-and-forget (don't wait for completion), overlap with other
+  async operations, or pre-open handles.
 
-- **Lazy Transaction::new (~14% of total, ~29ms, but limited savings for CREATE
-  TABLE).** Items deserialization alone is 9.5%. CREATE TABLE accesses both
-  `items` and `storage_collection_metadata` plus OID allocation collections,
-  limiting savings to ~2% from skipping the other 18 collections. More
-  beneficial for other DDL types.
+- **Overlap apply_catalog_implications with group_commit (~7ms).** Currently
+  sequential: catalog_transact finishes (including apply_catalog_implications)
+  before group_commit starts. If they could overlap, saves ~7ms.
 
-- **Optimize ReadHold::try_downgrade (~5.5% of total, ~11ms).** Part of
-  `apply_catalog_implications` (6.7% total). Iterates a BTreeMap of all storage
-  collection read holds. May be batchable or optimizable.
+- **Reduce initialize_read_policies latency (~10ms, 9% of DDL).** Read hold
+  acquisition and downgrade involves IPC to storage controller. Code path:
+  `src/adapter/src/coord/catalog_implications.rs` `initialize_storage_collections`
+  → `initialize_read_policies`. Could batch or defer.
+
+- **Merge allocate_id into catalog_transact (~3ms, 3% of DDL).** Saves one
+  persist round-trip by allocating IDs within the main transaction instead of a
+  separate one.
+
+- **Reduce DurableCatalogState::transaction CPU cost (~12-15ms).** Snapshot clone
+  + Transaction::new (proto→Rust conversion). Arc-wrapping Snapshot BTreeMaps
+  saves ~2-3ms of clone overhead. Lazy Transaction::new saves little for CREATE
+  TABLE (accesses most collections) but helps other DDL types.
