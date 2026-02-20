@@ -1231,3 +1231,136 @@ Raw data (sorted, 14 samples, ~35k objects):
    collect all allocated OIDs. This triggers initialization of those collections
    in Transaction::new. Maintaining a cached set of allocated OIDs could avoid
    this scan and make more collections eligible for lazy initialization.
+
+### Session 14: Profile post-Session 13 optimized build at ~36.5k objects (2026-02-20)
+
+**Goal:** Get `perf` profiling working and produce a fresh post-Session 13 cost
+breakdown at the current object count (~36.5k).
+
+**Setup:** Optimized build, Docker CockroachDB (`cockroachdb/cockroach:v23.1.11`),
+~36,490 total objects. Used `perf record -g -F 997 -p <pid>` to profile 100
+CREATE TABLE statements, yielding 23,442 samples.
+
+**Profiling notes:** The `perf` binary for the running kernel (6.14.0-1015-aws)
+wasn't available, but the older `perf` at `/usr/lib/linux-tools/6.8.0-100-generic/perf`
+works after lowering `perf_event_paranoid` to 1. Used `rustfilt` for symbol
+demangling.
+
+**Absolute timing:**
+
+| Metric | Value |
+|--------|-------|
+| CREATE TABLE median (psql) | ~163ms |
+| catalog_transact avg (Prometheus) | 110.9ms (11.09s / 100) |
+| 99th percentile bucket | <128ms |
+
+**Cost breakdown (children% of total CPU, 23k samples):**
+
+```
+sequence_create_table:                     61.3%  (~127ms)
+├── catalog_transact_with_ddl_transaction:  53.5%  (~111ms)
+│   ├── catalog_transact_inner:              46.8%
+│   │   ├── Catalog::transact:                38.7%
+│   │   │   ├── DurableCatalogState::transaction:  19.7%  (~41ms)
+│   │   │   │   ├── Snapshot::clone:                5.7%  (~12ms)
+│   │   │   │   └── Transaction::new:              14.0%  (~29ms)
+│   │   │   │       └── items deserialization:      9.5%  (~20ms)
+│   │   │   ├── commit_transaction:                16.2%  (~34ms)
+│   │   │   │   └── consolidate_incremental:       15.0%  (~31ms)
+│   │   │   └── Transaction::commit:               10.9%  (~23ms)
+│   │   │       ├── into_parts:                     2.4%
+│   │   │       └── items pending:                  1.8%
+│   │   └── validate_resource_limits:            7.8%  (~16ms)
+│   │       └── 7+ full catalog scans via is_*
+│   └── apply_catalog_implications:            6.7%  (~14ms)
+│       └── ReadHold::try_downgrade:           5.5%  (~11ms)
+└── non-catalog-transact:                    7.8%  (~16ms)
+```
+
+**Top self-time functions:**
+
+| Function | Self % |
+|----------|--------|
+| imbl OrdMap Cursor::seek_to_first | 3.6% |
+| BTreeMap search_tree (GlobalId → SetValZST) | 1.5% |
+| malloc | 1.1% |
+| CatalogEntry::is_continual_task | 1.05% |
+| sdallocx (jemalloc free) | 0.83% |
+| items DedupSortedIter::next | 0.78% |
+| BTreeMap search_tree (GlobalId → CollectionState) | 0.76% |
+| mpsc::UnboundedSender::send (ChangeBatch) | 0.67% |
+| CatalogEntry::is_connection | 0.65% |
+| CatalogEntry::is_temporary | 0.63% |
+
+**Key findings:**
+
+1. **consolidate_incremental still 15% despite O(n) optimization.** The Session 13
+   O(n) merge is working correctly, but O(n) at 36k entries still means allocating
+   a new Vec and copying ~36k `(StateUpdateKind, Timestamp, Diff)` tuples every
+   commit. The merge is dominated by the sheer data movement. Changing the snapshot
+   from `Vec` to `BTreeMap<StateUpdateKind, Diff>` would make consolidation
+   O(m log n) per commit (where m=1-5 new entries), eliminating this cost almost
+   entirely.
+
+2. **validate_resource_limits is 7.8% — a new top target.** This function calls
+   7+ separate `user_*()` methods (user_tables, user_sources, user_sinks,
+   user_materialized_views, user_connections, user_secrets, user_continual_tasks),
+   each of which iterates ALL entries in the `imbl::OrdMap<CatalogItemId,
+   CatalogEntry>` with `is_*` type checks. Combined, the `is_*` functions account
+   for ~4.5% of self-time. Could be eliminated by maintaining cached resource
+   counts that are updated incrementally during catalog transactions.
+
+3. **Snapshot::clone at 5.7%.** The durable catalog's `Snapshot` struct (21
+   BTreeMaps) is fully cloned for each transaction in
+   `DurableCatalogState::transaction()`. The `items` BTreeMap clone alone is
+   likely ~4% given items deserialization is 9.5%. Wrapping BTreeMaps in `Arc`
+   would make clone O(1), with copy-on-write semantics in `Snapshot::apply_update`.
+
+4. **Transaction::new (14%) + commit/drop (10.9%) = 25%.** Proto deserialization
+   on creation and re-serialization + BTreeMap drop on commit are together the
+   largest combined cost. Items collection alone accounts for 9.5% (new) + 1.8%
+   (pending) + drop time.
+
+5. **apply_catalog_implications at 6.7%.** Dominated by `ReadHold::try_downgrade`
+   (5.5%) which iterates a `BTreeMap<GlobalId, ReadHold>` of all storage
+   collections. This is real per-DDL work but could potentially be batched.
+
+6. **OID allocation (allocate_oids + get_temporary_oids) at ~3.5%.** The
+   `allocate_oids` path in Transaction scans items (0.94%) and the
+   `get_temporary_oids` path in CatalogState scans schemas + items (1.6%).
+   Total OID cost is lower than expected (~3.5% vs the Transaction::new cost
+   of 14%), but it forces initialization of multiple collections in lazy
+   Transaction scenarios.
+
+**Comparison with Session 12 profile (both at ~28-36k objects, optimized):**
+
+| Component | Session 12 (% of catalog_transact) | Session 14 (% of total) | Notes |
+|-----------|-----------------------------------|------------------------|-------|
+| Transaction::new | 26% | 14.0% | Similar; % basis differs |
+| consolidation | 24% | 15.0% | Was O(n log n), now O(n) |
+| Snapshot clone | 12% | 5.7% | Unchanged |
+| apply_catalog_implications | 13% | 6.7% | Unchanged |
+| validate_resource_limits | not measured | 7.8% | New finding |
+
+**Optimization targets (ranked by estimated absolute savings):**
+
+1. **Change snapshot trace from Vec to BTreeMap** — eliminate 15% (~31ms).
+   Use `BTreeMap<StateUpdateKind, Diff>` with a separate "current timestamp"
+   field. Consolidation becomes O(m log n) per commit instead of O(n). Building
+   Snapshot from trace is still O(n) but is already cached.
+
+2. **Cache validate_resource_limits counts** — eliminate 7.8% (~16ms). Maintain
+   a `ResourceCounts` struct in CatalogState, updated incrementally when
+   entries are added/removed. Avoids 7+ full catalog iterations per DDL.
+
+3. **Arc-wrap Snapshot BTreeMaps** — eliminate 5.7% (~12ms). Make Snapshot::clone
+   O(1) via Arc. Use Arc::make_mut for copy-on-write in apply_update.
+
+4. **Lazy Transaction::new** — eliminate portion of 14% (~29ms). Only
+   deserialize collections actually accessed. For CREATE TABLE, both `items`
+   and `storage_collection_metadata` are needed (together ~12%), so savings
+   would be ~2% from skipping the other 18 collections. More beneficial for
+   other DDL types.
+
+5. **Optimize ReadHold::try_downgrade** — reduce 5.5% (~11ms). Investigate
+   whether the downgrade can be done more efficiently or batched.
