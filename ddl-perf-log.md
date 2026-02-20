@@ -1364,3 +1364,86 @@ sequence_create_table:                     61.3%  (~127ms)
 
 5. **Optimize ReadHold::try_downgrade** — reduce 5.5% (~11ms). Investigate
    whether the downgrade can be done more efficiently or batched.
+
+### Session 15: BTreeMap snapshot trace — eliminate O(n) consolidation (2026-02-20)
+
+**Goal:** Replace the `Vec<(T, Timestamp, Diff)>` snapshot trace with
+`BTreeMap<T, Diff>` to eliminate the O(n) consolidation cost that was 15% of
+total CPU time in Session 14's profiling.
+
+**Analysis:** The `consolidate_incremental` method (Session 13) performed an
+O(n) merge on every commit: allocating a new Vec, copying all ~36k entries,
+and merging in 1-5 new entries. With a BTreeMap, consolidation becomes
+O(m log n) per commit — each new entry does a single BTreeMap lookup/insert.
+
+**Approach:** Changed the snapshot data structure in `PersistHandle`:
+
+1. **Field change:** `snapshot: Vec<(T, Timestamp, Diff)>` →
+   `snapshot: BTreeMap<T, Diff>` + `snapshot_ts: Timestamp`. The timestamp is
+   unified across all entries (was already the case after consolidation), so
+   it's stored once instead of per-entry.
+
+2. **apply_updates:** Instead of `push` + `consolidate_incremental`, each
+   update does a BTreeMap `entry()` lookup. For matching keys, diffs are
+   combined; zero-diff entries are removed. This is O(log n) per update.
+
+3. **consolidate():** Becomes a no-op — the BTreeMap is always consolidated.
+
+4. **consolidate_incremental():** Removed entirely — no longer needed.
+
+5. **with_trace():** Reconstructed from BTreeMap on the fly (only called by
+   `get_next_id`, which is infrequent).
+
+6. **with_snapshot(), snapshot_id_allocator(), current_snapshot():** Updated
+   to iterate `(kind, diff)` pairs from BTreeMap instead of
+   `(kind, ts, diff)` tuples from Vec.
+
+7. **Initialization paths:** Updated `audit_log` partition to use
+   `BTreeMap::retain()` instead of `Vec::partition()`. Updated struct
+   initialization to use `BTreeMap::new()` + `Timestamp::minimum()`.
+
+Both `StateUpdateKind` and `StateUpdateKindJson` already derive `Ord`
+(required by `IntoStateUpdateKindJson` trait bound), so the BTreeMap
+constraint is naturally satisfied.
+
+**Code changes:**
+- `src/catalog/src/durable/persist.rs` — main changes to PersistHandle
+- `src/catalog/src/durable/upgrade.rs` — updated snapshot iteration
+
+**Results (median of 14 samples, optimized build, ~36.5k objects, Docker CockroachDB):**
+
+| DDL Type     | Session 14 Baseline | Session 15 BTreeMap | Improvement |
+|-------------|--------------------|--------------------|-------------|
+| CREATE TABLE | 163 ms             | 134 ms             | **18%**     |
+| CREATE VIEW  | —                  | 100 ms             | —           |
+| DROP TABLE   | —                  | 110 ms             | —           |
+| DROP VIEW    | —                  | 96 ms              | —           |
+
+Prometheus catalog_transact_with_ddl_transaction (CREATE TABLE only):
+- Session 14: 110.9ms avg (100 ops)
+- Session 15: 97.7ms avg (14 ops)
+- **12% improvement** in catalog_transact
+
+Raw data (sorted, 14 samples each):
+- CREATE TABLE: 130 131 132 133 133 133 134 134 135 136 137 146 161 163
+- CREATE VIEW:  95 96 97 97 97 98 99 100 100 100 101 102 106 119
+- DROP TABLE:   105 106 107 108 108 109 110 110 111 111 111 111 129 133
+- DROP VIEW:    94 94 95 95 96 96 96 97 97 97 99 99 106 107
+
+**Key observations:**
+
+- **CREATE TABLE improved 18%** from 163ms → 134ms median. The consolidation
+  cost (~31ms estimated in Session 14) was essentially eliminated, replaced
+  by O(m log n) BTreeMap operations (~microseconds for m=5 entries).
+
+- **Despite having ~36.5k objects (same as Session 14), all DDL types are
+  significantly faster.** Session 13 measured 169ms CREATE TABLE at ~28k
+  objects. Session 15 at ~36.5k objects is 134ms — faster despite 30% more
+  objects, confirming the scaling improvement.
+
+- **The BTreeMap approach eliminates an entire O(n) bottleneck** from the
+  commit path. The commit_transaction cost is now dominated by other work
+  (persist sync, etc.) rather than data structure maintenance.
+
+- **Cumulative improvement from Session 6 baseline:** 444ms → 134ms = **70%
+  reduction** (or ~75% accounting for Docker CockroachDB overhead).

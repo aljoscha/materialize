@@ -374,10 +374,15 @@ pub(crate) struct PersistHandle<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> {
     persist_client: PersistClient,
     /// Catalog shard ID.
     shard_id: ShardId,
-    /// Cache of the most recent catalog snapshot.
+    /// Cache of the most recent catalog snapshot (consolidated).
     ///
-    /// We use a tuple instead of [`StateUpdate`] to make consolidation easier.
-    pub(crate) snapshot: Vec<(T, Timestamp, Diff)>,
+    /// Each key maps to its current diff (always +1 for existing entries).
+    /// This replaces the previous `Vec<(T, Timestamp, Diff)>` trace representation
+    /// to avoid O(n) consolidation on every commit. With a BTreeMap, consolidation
+    /// is O(m log n) where m is the number of new entries per commit.
+    pub(crate) snapshot: BTreeMap<T, Diff>,
+    /// The current unified timestamp for all snapshot entries.
+    pub(crate) snapshot_ts: Timestamp,
     /// Pre-built snapshot derived from `self.snapshot` trace, maintained incrementally.
     ///
     /// When present, `with_snapshot` returns a clone of this instead of rebuilding
@@ -656,9 +661,6 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
 
         let mut errors = Vec::new();
 
-        // Track the boundary between already-consolidated entries and new ones.
-        let old_len = self.snapshot.len();
-
         for (kind, ts, diff) in updates {
             if diff != Diff::ONE && diff != Diff::MINUS_ONE {
                 panic!("invalid update in consolidated trace: ({kind:?}, {ts:?}, {diff:?})");
@@ -681,7 +683,21 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
                             cached.apply_update(&state_kind, diff);
                         }
                     }
-                    self.snapshot.push((kind, ts, diff));
+                    // Update snapshot BTreeMap: combine diffs, remove if zero.
+                    self.snapshot_ts = std::cmp::max(self.snapshot_ts, ts);
+                    match self.snapshot.entry(kind) {
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let combined = *entry.get() + diff;
+                            if combined == Diff::ZERO {
+                                entry.remove();
+                            } else {
+                                *entry.get_mut() = combined;
+                            }
+                        }
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(diff);
+                        }
+                    }
                 }
                 Ok(None) => {}
                 // Instead of returning immediately, we accumulate all the errors and return the one
@@ -695,111 +711,15 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
             return Err(err);
         }
 
-        self.consolidate_incremental(old_len);
-
         Ok(())
     }
 
+    /// With a BTreeMap snapshot, consolidation is a no-op — the BTreeMap is always
+    /// consolidated. We just ensure the timestamp is up to date (which `apply_updates`
+    /// already handles via `snapshot_ts`).
     #[mz_ore::instrument]
     pub(crate) fn consolidate(&mut self) {
-        soft_assert_no_log!(
-            self.snapshot
-                .windows(2)
-                .all(|updates| updates[0].1 <= updates[1].1),
-            "snapshot should be sorted by timestamp, {:#?}",
-            self.snapshot
-        );
-
-        let new_ts = self
-            .snapshot
-            .last()
-            .map(|(_, ts, _)| *ts)
-            .unwrap_or_else(Timestamp::minimum);
-        for (_, ts, _) in &mut self.snapshot {
-            *ts = new_ts;
-        }
-        differential_dataflow::consolidation::consolidate_updates(&mut self.snapshot);
-    }
-
-    /// Like [`Self::consolidate`], but takes advantage of the fact that
-    /// `self.snapshot[..old_len]` is already consolidated (sorted with unified
-    /// timestamps). Only the entries at `self.snapshot[old_len..]` are new.
-    ///
-    /// Instead of re-sorting the entire snapshot (O(n log n)), this method
-    /// merges the small batch of new entries into the sorted portion in O(n + m)
-    /// where m is the number of new entries. For typical DDL operations where
-    /// m = 1-5 and n = tens of thousands, this is a significant speedup.
-    fn consolidate_incremental(&mut self, old_len: usize) {
-        let new_len = self.snapshot.len();
-        if old_len >= new_len {
-            // No new entries; nothing to do.
-            return;
-        }
-
-        // Find the new unified timestamp (the maximum across all entries).
-        let new_ts = self
-            .snapshot
-            .last()
-            .map(|(_, ts, _)| *ts)
-            .unwrap_or_else(Timestamp::minimum);
-
-        // Extract the new entries and consolidate them among themselves.
-        // This is O(m log m) where m is tiny (typically 1-5).
-        let mut new_entries: Vec<_> = self.snapshot.drain(old_len..).collect();
-        for (_, ts, _) in &mut new_entries {
-            *ts = new_ts;
-        }
-        differential_dataflow::consolidation::consolidate_updates(&mut new_entries);
-
-        if new_entries.is_empty() {
-            // New entries cancelled each other. Just unify timestamps on old.
-            for (_, ts, _) in &mut self.snapshot {
-                *ts = new_ts;
-            }
-            return;
-        }
-
-        // Merge the sorted old entries with the sorted new entries.
-        // The old portion is already sorted by (kind, ts, diff) with unified
-        // timestamps, so effectively sorted by (kind, diff). We compare by
-        // kind only since each kind appears at most once after consolidation.
-        //
-        // During the merge, if an old and new entry have the same kind, we sum
-        // their diffs. If the sum is zero, the entry is dropped (cancelled).
-        let mut result = Vec::with_capacity(self.snapshot.len() + new_entries.len());
-        let old_entries = std::mem::take(&mut self.snapshot);
-        let mut old_iter = old_entries.into_iter().peekable();
-        let mut new_iter = new_entries.into_iter().peekable();
-
-        while let (Some(old), Some(new)) = (old_iter.peek(), new_iter.peek()) {
-            match old.0.cmp(&new.0) {
-                std::cmp::Ordering::Less => {
-                    let (kind, _, diff) = old_iter.next().expect("peeked");
-                    result.push((kind, new_ts, diff));
-                }
-                std::cmp::Ordering::Greater => {
-                    result.push(new_iter.next().expect("peeked"));
-                }
-                std::cmp::Ordering::Equal => {
-                    let (kind, _, old_diff) = old_iter.next().expect("peeked");
-                    let (_, _, new_diff) = new_iter.next().expect("peeked");
-                    let combined = old_diff + new_diff;
-                    if combined != Diff::ZERO {
-                        result.push((kind, new_ts, combined));
-                    }
-                    // If combined == 0, both entries cancel and we skip them.
-                }
-            }
-        }
-
-        // Drain remaining old entries (updating their timestamps).
-        for (kind, _, diff) in old_iter {
-            result.push((kind, new_ts, diff));
-        }
-        // Drain remaining new entries.
-        result.extend(new_iter);
-
-        self.snapshot = result;
+        // BTreeMap is always consolidated. Nothing to do.
     }
 
     /// Execute and return the results of `f` on the current catalog trace.
@@ -810,7 +730,12 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
         f: impl FnOnce(&Vec<(T, Timestamp, Diff)>) -> Result<R, CatalogError>,
     ) -> Result<R, CatalogError> {
         self.sync_to_current_upper().await?;
-        f(&self.snapshot)
+        let trace: Vec<_> = self
+            .snapshot
+            .iter()
+            .map(|(kind, diff)| (kind.clone(), self.snapshot_ts, *diff))
+            .collect();
+        f(&trace)
     }
 
     /// Open a read handle to the catalog.
@@ -859,7 +784,7 @@ impl<U: ApplyUpdate<StateUpdateKind>> PersistHandle<StateUpdateKind, U> {
 
         // Otherwise, build from the trace and cache the result.
         let mut snapshot = Snapshot::empty();
-        for (kind, _ts, diff) in &self.snapshot {
+        for (kind, diff) in &self.snapshot {
             let diff = *diff;
             if diff != Diff::ONE && diff != Diff::MINUS_ONE {
                 panic!("invalid update in consolidated trace: ({kind:?}, {diff:?})");
@@ -887,7 +812,7 @@ impl<U: ApplyUpdate<StateUpdateKind>> PersistHandle<StateUpdateKind, U> {
 
         // No cache yet — scan the trace for only IdAllocator entries.
         let mut id_allocator = BTreeMap::new();
-        for (kind, _ts, diff) in &self.snapshot {
+        for (kind, diff) in &self.snapshot {
             if let StateUpdateKind::IdAllocator(key, value) = kind {
                 if *diff == Diff::ONE {
                     id_allocator.insert(key.clone(), value.clone());
@@ -1113,7 +1038,8 @@ impl UnopenedPersistCatalogState {
             persist_client,
             shard_id: catalog_shard_id,
             // Initialize empty in-memory state.
-            snapshot: Vec::new(),
+            snapshot: BTreeMap::new(),
+            snapshot_ts: Timestamp::minimum(),
             cached_snapshot: None,
             update_applier: UnopenedCatalogStateInner::new(organization_id),
             upper,
@@ -1249,11 +1175,16 @@ impl UnopenedPersistCatalogState {
         soft_assert_ne_or_log!(self.upper, Timestamp::minimum());
 
         // Remove all audit log entries.
-        let (audit_logs, snapshot): (Vec<_>, Vec<_>) = self
-            .snapshot
-            .into_iter()
-            .partition(|(update, _, _)| update.is_audit_log());
-        self.snapshot = snapshot;
+        let snapshot_ts = self.snapshot_ts;
+        let mut audit_logs = Vec::new();
+        self.snapshot.retain(|update, diff| {
+            if update.is_audit_log() {
+                audit_logs.push((update.clone(), snapshot_ts, *diff));
+                false
+            } else {
+                true
+            }
+        });
         let audit_log_count = audit_logs.iter().map(|(_, _, diff)| diff).sum::<Diff>();
         let audit_log_handle = AuditLogIterator::new(audit_logs);
 
@@ -1277,7 +1208,8 @@ impl UnopenedPersistCatalogState {
             upper: self.upper,
             fenceable_token: self.fenceable_token,
             // Initialize empty in-memory state.
-            snapshot: Vec::new(),
+            snapshot: BTreeMap::new(),
+            snapshot_ts: Timestamp::minimum(),
             cached_snapshot: None,
             update_applier: CatalogStateInner::new(),
             catalog_content_version: self.catalog_content_version,
@@ -1292,9 +1224,14 @@ impl UnopenedPersistCatalogState {
             .collection_entries
             .with_label_values(&[&CollectionType::AuditLog.to_string()])
             .add(audit_log_count.into_inner());
-        let updates = self.snapshot.into_iter().map(|(kind, ts, diff)| {
+        let snapshot_ts = self.snapshot_ts;
+        let updates = self.snapshot.into_iter().map(move |(kind, diff)| {
             let kind = TryIntoStateUpdateKind::try_into(kind).expect("kind decoding error");
-            StateUpdate { kind, ts, diff }
+            StateUpdate {
+                kind,
+                ts: snapshot_ts,
+                diff,
+            }
         });
         catalog.apply_updates(updates)?;
 
@@ -1320,7 +1257,7 @@ impl UnopenedPersistCatalogState {
                 catalog
                     .snapshot
                     .iter()
-                    .filter(|(kind, _, _)| !matches!(kind, StateUpdateKind::FenceToken(_)))
+                    .filter(|(kind, _)| !matches!(kind, StateUpdateKind::FenceToken(_)))
                     .count(),
                 0,
                 "trace should not contain any updates for an uninitialized catalog: {:#?}",
@@ -2255,10 +2192,15 @@ impl UnopenedPersistCatalogState {
         &mut self,
     ) -> Result<impl IntoIterator<Item = StateUpdate> + '_, CatalogError> {
         self.sync_to_current_upper().await?;
-        self.consolidate();
-        Ok(self.snapshot.iter().cloned().map(|(kind, ts, diff)| {
-            let kind = TryIntoStateUpdateKind::try_into(kind).expect("kind decoding error");
-            StateUpdate { kind, ts, diff }
+        let snapshot_ts = self.snapshot_ts;
+        Ok(self.snapshot.iter().map(move |(kind, diff)| {
+            let kind =
+                TryIntoStateUpdateKind::try_into(kind.clone()).expect("kind decoding error");
+            StateUpdate {
+                kind,
+                ts: snapshot_ts,
+                diff: *diff,
+            }
         }))
     }
 }

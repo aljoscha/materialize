@@ -418,11 +418,11 @@ async fn run_versioned_upgrade<V1: IntoStateUpdateKindJson, V2: IntoStateUpdateK
     let snapshot: Vec<_> = unopened_catalog_state
         .snapshot
         .iter()
-        .map(|(kind, ts, diff)| {
+        .map(|(kind, diff)| {
             soft_assert_eq_or_log!(
                 *diff,
                 Diff::ONE,
-                "snapshot is consolidated, ({kind:?}, {ts:?}, {diff:?})"
+                "snapshot is consolidated, ({kind:?}, {diff:?})"
             );
             V1::try_from(kind.clone()).expect("invalid catalog data persisted")
         })
