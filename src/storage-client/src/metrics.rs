@@ -49,6 +49,9 @@ pub struct StorageControllerMetrics {
 
     /// Metrics shared with the compute controller.
     shared: ControllerMetrics,
+
+    /// Histogram for create_collections sub-step wall-clock time.
+    pub create_collections_seconds: prometheus::HistogramVec,
 }
 
 impl StorageControllerMetrics {
@@ -98,6 +101,13 @@ impl StorageControllerMetrics {
                 name: "mz_storage_controller_replica_connect_wait_time_seconds_total",
                 help: "The total time the storage controller spent waiting for replica (re-)connection.",
                 var_labels: ["instance_id", "replica_id"],
+            )),
+
+            create_collections_seconds: metrics_registry.register(metric!(
+                name: "mz_storage_create_collections_seconds",
+                help: "Wall-clock time for sub-steps of create_collections.",
+                var_labels: ["step"],
+                buckets: mz_ore::stats::histogram_seconds_buckets(0.0005, 32.0),
             )),
 
             shared,

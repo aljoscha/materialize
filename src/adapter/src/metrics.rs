@@ -52,6 +52,8 @@ pub struct Metrics {
     pub pgwire_recv_scheduling_delay_ms: HistogramVec,
     pub catalog_transact_seconds: HistogramVec,
     pub apply_catalog_implications_seconds: Histogram,
+    pub create_table_collections_seconds: HistogramVec,
+    pub initialize_storage_collections_seconds: Histogram,
     pub group_commit_confirm_leadership_seconds: Histogram,
 }
 
@@ -235,6 +237,17 @@ impl Metrics {
                 name: "mz_apply_catalog_implications_seconds",
                 help: "The time it takes to apply catalog implications.",
                 buckets: histogram_seconds_buckets(0.001, 32.0),
+            )),
+            create_table_collections_seconds: registry.register(metric!(
+                name: "mz_create_table_collections_seconds",
+                help: "Time for sub-steps of create_table_collections.",
+                var_labels: ["step"],
+                buckets: histogram_seconds_buckets(0.0005, 32.0),
+            )),
+            initialize_storage_collections_seconds: registry.register(metric!(
+                name: "mz_initialize_storage_collections_seconds",
+                help: "Time for initialize_storage_collections (read policy init).",
+                buckets: histogram_seconds_buckets(0.0005, 32.0),
             )),
             group_commit_confirm_leadership_seconds: registry.register(metric!(
                 name: "mz_group_commit_confirm_leadership_seconds",

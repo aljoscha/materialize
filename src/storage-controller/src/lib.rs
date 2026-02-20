@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
@@ -766,6 +766,7 @@ where
         self.migrated_storage_collections
             .extend(migrated_storage_collections.iter().cloned());
 
+        let step_start = Instant::now();
         self.storage_collections
             .create_collections_for_bootstrap(
                 storage_metadata,
@@ -774,6 +775,10 @@ where
                 migrated_storage_collections,
             )
             .await?;
+        self.metrics
+            .create_collections_seconds
+            .with_label_values(&["storage_collections"])
+            .observe(step_start.elapsed().as_secs_f64());
 
         // At this point we're connected to all the collection shards in persist. Our warming task
         // is no longer useful, so abort it if it's still running.
@@ -827,6 +832,7 @@ where
         // this stream cannot all have exclusive access.
         use futures::stream::{StreamExt, TryStreamExt};
         let this = &*self;
+        let step_start = Instant::now();
         let mut to_register: Vec<_> = futures::stream::iter(enriched_with_metadata)
             .map(|data: Result<_, StorageError<Self::Timestamp>>| {
                 async move {
@@ -864,6 +870,10 @@ where
             // `collect`!
             .try_collect()
             .await?;
+        self.metrics
+            .create_collections_seconds
+            .with_label_values(&["open_data_handles"])
+            .observe(step_start.elapsed().as_secs_f64());
 
         // The set of collections that we should render at the end of this
         // function.
@@ -898,6 +908,7 @@ where
         let mut new_webhook_statistic_entries = BTreeSet::new();
         let mut new_sink_statistic_entries = BTreeSet::new();
 
+        let step_start = Instant::now();
         for (id, description, write, metadata) in to_register {
             let is_in_txns = |id, metadata: &CollectionMetadata| {
                 metadata.txns_shard.is_some()
@@ -1146,6 +1157,10 @@ where
 
             self.collections.insert(id, collection_state);
         }
+        self.metrics
+            .create_collections_seconds
+            .with_label_values(&["sequential_loop"])
+            .observe(step_start.elapsed().as_secs_f64());
 
         {
             let mut source_statistics = self.source_statistics.lock().expect("poisoned");
@@ -1162,6 +1177,7 @@ where
         }
 
         // Register the tables all in one batch.
+        let step_start = Instant::now();
         if !table_registers.is_empty() {
             let register_ts = register_ts
                 .expect("caller should have provided a register_ts when creating a table");
@@ -1190,6 +1206,10 @@ where
                     .expect("table worker unexpectedly shut down");
             }
         }
+        self.metrics
+            .create_collections_seconds
+            .with_label_values(&["table_register"])
+            .observe(step_start.elapsed().as_secs_f64());
 
         self.append_shard_mappings(new_collections.into_iter(), Diff::ONE);
 

@@ -919,7 +919,12 @@ impl Coordinator {
         execution_timestamps_to_set: BTreeSet<StatementLoggingId>,
     ) -> Result<(), AdapterError> {
         // If we have tables, determine the initial validity for the table.
+        let step_start = Instant::now();
         let register_ts = self.get_local_write_ts().await.timestamp;
+        self.metrics
+            .create_table_collections_seconds
+            .with_label_values(&["get_local_write_ts"])
+            .observe(step_start.elapsed().as_secs_f64());
 
         // After acquiring `register_ts` but before using it, we need to
         // be sure we're still the leader. Otherwise a new generation
@@ -927,10 +932,15 @@ impl Coordinator {
         // purpose.
         //
         // See #28216.
+        let step_start = Instant::now();
         self.catalog
             .confirm_leadership()
             .await
             .unwrap_or_terminate("unable to confirm leadership");
+        self.metrics
+            .create_table_collections_seconds
+            .with_label_values(&["confirm_leadership"])
+            .observe(step_start.elapsed().as_secs_f64());
 
         for id in execution_timestamps_to_set {
             self.set_statement_execution_timestamp(id, register_ts);
@@ -938,6 +948,7 @@ impl Coordinator {
 
         let storage_metadata = self.catalog.state().storage_metadata();
 
+        let step_start = Instant::now();
         self.controller
             .storage
             .create_collections(
@@ -947,8 +958,17 @@ impl Coordinator {
             )
             .await
             .unwrap_or_terminate("cannot fail to create collections");
+        self.metrics
+            .create_table_collections_seconds
+            .with_label_values(&["create_collections"])
+            .observe(step_start.elapsed().as_secs_f64());
 
+        let step_start = Instant::now();
         self.apply_local_write(register_ts).await;
+        self.metrics
+            .create_table_collections_seconds
+            .with_label_values(&["apply_local_write"])
+            .observe(step_start.elapsed().as_secs_f64());
 
         Ok(())
     }
@@ -978,6 +998,7 @@ impl Coordinator {
         &mut self,
         storage_policies_to_initialize: BTreeMap<CompactionWindow, BTreeSet<GlobalId>>,
     ) -> Result<(), AdapterError> {
+        let start = Instant::now();
         for (compaction_window, global_ids) in storage_policies_to_initialize {
             self.initialize_read_policies(
                 &CollectionIdBundle {
@@ -988,6 +1009,9 @@ impl Coordinator {
             )
             .await;
         }
+        self.metrics
+            .initialize_storage_collections_seconds
+            .observe(start.elapsed().as_secs_f64());
 
         Ok(())
     }
