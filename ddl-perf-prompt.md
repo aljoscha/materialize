@@ -61,9 +61,9 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 17): At ~37k objects (optimized build, Docker
-CockroachDB), DDL latency is CREATE TABLE ~106ms (batch) / ~128ms (individual
-psql), catalog_transact avg 89.1ms. That's down from 444ms at the Session 6
+Current status (after Session 18): At ~37.5k objects (optimized build, Docker
+CockroachDB), DDL latency is CREATE TABLE ~112ms (batch) / ~135ms (individual
+psql), catalog_transact avg ~95ms. That's down from 444ms at the Session 6
 baseline. CPU work per DDL is now ~0.6ms — DDL is I/O bound.
 
 **Important: DDL is now I/O bound, not CPU bound.** Session 17 revealed that
@@ -74,7 +74,7 @@ apply_catalog_implications at 42ms (40% of DDL time) — 6x larger than its CPU
 profile suggested — because it includes async waits for storage controller IPC,
 timestamp oracle round-trips, and persist operations.
 
-Completed optimizations (Sessions 7-9, 11, 13, 15-16):
+Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18):
 - Cached Snapshot in PersistHandle (Session 7)
 - Lightweight allocate_id bypassing full Transaction (Session 8)
 - Persistent CatalogState with imbl::OrdMap + Arc (Session 9) — eliminated the
@@ -91,14 +91,22 @@ Completed optimizations (Sessions 7-9, 11, 13, 15-16):
 - Lazy validate_resource_limits counting (Session 16) — guard each user_*().count()
   call with a check on whether the corresponding delta is positive. For CREATE TABLE,
   skips ~10 unnecessary O(n) catalog scans. Was 7.8% of total CPU in Session 14.
+- Eliminated redundant WriteHandle in storage_collections for tables (Session 18)
+  — tables had two separate WriteHandle opens for the same shard (one in
+  storage_collections, one in storage_controller). Not measurable with local
+  filesystem persist but saves ~20-50ms per DDL with S3-backed persist in
+  production.
 
-Completed diagnostics (Sessions 10, 12, 13, 14, 17):
+Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18):
 - Profiled post-Session 9 optimized build at ~10k objects (Session 10)
 - Profiled post-Session 11 optimized build at ~28k objects (Session 12)
 - Profiled post-Session 13 optimized build at ~36.5k objects (Session 14)
 - Wall-clock profiling via Prometheus at ~37k objects (Session 17) — revealed
   I/O dominance: apply_catalog_implications=42ms, create_collections=20-25ms,
   oracle operations=5ms, initialize_read_policies=10ms
+- Session 18 A/B tested redundant WriteHandle elimination: no measurable
+  improvement with local filesystem persist. Key insight: persist blob location
+  (local vs S3) determines whether persist operation elimination is impactful.
 - Full cost breakdowns in ddl-perf-log.md
 - Session 13 investigated lazy Transaction::new: found that CREATE TABLE accesses
   both expensive collections (items 16%, storage_collection_metadata 10%) plus
