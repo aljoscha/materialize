@@ -1755,3 +1755,113 @@ variance.
 
 5. **Reduce `DurableCatalogState::transaction` CPU cost (~12-15ms).**
    Arc-wrapping Snapshot BTreeMaps, lazy Transaction::new.
+
+---
+
+## Session 19: Wall-clock profiling of create_collections breakdown
+
+**Goal:** Instrument and measure the internal wall-clock breakdown of
+`create_collections` — identified in Session 17 as costing 20-25ms (19-24% of
+DDL). Understand where time goes within that call to target optimizations.
+
+**Approach:** Added Prometheus histogram metrics at two levels:
+1. **Adapter level** (`mz_create_table_collections_seconds{step=...}`):
+   `get_local_write_ts`, `confirm_leadership`, `create_collections`,
+   `apply_local_write`
+2. **Storage controller level** (`mz_storage_create_collections_seconds{step=...}`):
+   `storage_collections`, `open_data_handles`, `sequential_loop`, `table_register`
+3. **Adapter level** (`mz_initialize_storage_collections_seconds`): read policy
+   initialization
+
+Also ran measurements in BOTH debug and optimized builds to verify proportions.
+
+### Results: Optimized build (~37.5k objects, Docker CockroachDB)
+
+**Wall-clock total:** 136ms per individual psql CREATE TABLE
+
+**Full DDL breakdown (per-DDL averages, 20 DDL batch):**
+
+```
+catalog_transact_with_side_effects: 95ms
+├── catalog_transact_inner: ~49ms
+└── apply_catalog_implications: ~46ms
+    ├── create_table_collections: ~38ms
+    │   ├── get_local_write_ts:    2.0ms ( 5%)
+    │   ├── confirm_leadership:    0.7ms ( 2%)
+    │   ├── create_collections:   33.0ms (87%)    ← DOMINANT
+    │   │   ├── storage_collections: ~24ms (73%)  ← persist handle opens
+    │   │   ├── open_data_handles:    0.7ms ( 2%) ← write handle for txn-wal
+    │   │   ├── sequential_loop:      0.1ms ( 0%) ← CPU work
+    │   │   └── table_register:       6.5ms (20%) ← txn-wal registration
+    │   └── apply_local_write:     2.3ms ( 6%)
+    ├── initialize_storage_collections: 0.5ms
+    └── overhead (classification):      ~7.5ms
+```
+
+**storage_collections (24ms) breakdown — three sequential persist operations:**
+1. `upgrade_version` (~8ms) — schema compatibility check
+2. `open_critical_handle` (~8ms) — CriticalSince handle
+3. `compare_and_downgrade_since` (~8ms) — advance since for new tables
+
+### Results: Debug build (~37.5k objects)
+
+**Wall-clock total:** 3340ms per individual psql CREATE TABLE
+
+**Key proportional differences from optimized:**
+
+| Component | Debug | Optimized |
+|-----------|-------|-----------|
+| storage_collections | 2.5% | **73%** |
+| table_register | **95%** | 20% |
+
+The debug build massively inflates CPU-heavy operations (txn-wal serialization,
+txn cache management) while I/O operations stay similar. This makes debug-build
+profiling **misleading for I/O-bound operations** — always verify with optimized.
+
+### Key insights
+
+1. **`storage_collections` (since handle opens) is the dominant cost at 73% of
+   `create_collections` in optimized builds.** It performs three sequential
+   persist operations (~8ms each) for every new table: upgrade_version,
+   open_critical_handle, compare_and_downgrade_since.
+
+2. **`table_register` (txn-wal registration) is second at 20% (~6.5ms).** This
+   involves try_register_schema, txns_cache.update_ge, compare-and-append to
+   txns shard, and apply_le.
+
+3. **Debug vs optimized proportions are completely different.** In debug,
+   table_register appears to be 95% of cost (due to amplified CPU work in
+   persist serialization). In optimized, it's only 20%. This confirms Session
+   17's warning: always use Prometheus metrics on optimized builds for accurate
+   proportions.
+
+4. **`initialize_storage_collections` is negligible at 0.5ms** — much less than
+   Session 17's estimate of ~10ms. This may have been reduced by prior
+   optimizations or was overestimated.
+
+5. **`get_local_write_ts` + `confirm_leadership` = 2.7ms** — relatively small
+   compared to create_collections.
+
+### Optimization targets (updated ranking by optimized-build wall-clock)
+
+1. **Reduce storage_collections persist operations (~24ms, 73% of
+   create_collections).** Three sequential persist ops for every table:
+   upgrade_version, open_critical_handle, compare_and_downgrade_since.
+   Potential: overlap with open_data_handles/table_register, eliminate
+   upgrade_version for new shards, or defer compare_and_downgrade_since.
+
+2. **Reduce table_register latency (~6.5ms, 20% of create_collections).**
+   txn-wal registration involves multiple persist operations. Could overlap
+   with post-create_collections work (apply_local_write, read policy init).
+
+3. **Overlap storage_collections and open_data_handles.** Currently sequential.
+   The write handle open doesn't depend on the since handle (only
+   fetch_recent_upper does, and tables don't use it). Could save ~0.7ms by
+   overlapping them, or more if we also overlap table_register.
+
+### Changes made
+
+- Added `mz_create_table_collections_seconds` histogram (adapter metrics)
+- Added `mz_initialize_storage_collections_seconds` histogram (adapter metrics)
+- Added `mz_storage_create_collections_seconds` histogram (storage controller)
+- No functional changes — diagnostic only
