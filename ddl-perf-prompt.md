@@ -61,11 +61,10 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 13): At ~28k objects (optimized build), DDL
-latency is CREATE TABLE ~131ms (Session 11 baseline, native CockroachDB).
-Session 13 measured ~169ms with Docker CockroachDB (~30-40ms overhead from
-Docker networking). That's down from 444ms at the Session 6 baseline (~70%
-cumulative improvement).
+Current status (after Session 14): At ~36.5k objects (optimized build, Docker
+CockroachDB), DDL latency is CREATE TABLE median ~163ms, catalog_transact avg
+110.9ms. That's down from 444ms at the Session 6 baseline (~63% cumulative
+improvement, or ~70% accounting for ~30-40ms Docker CockroachDB overhead).
 
 Completed optimizations (Sessions 7-9, 11, 13):
 - Cached Snapshot in PersistHandle (Session 7)
@@ -79,39 +78,47 @@ Completed optimizations (Sessions 7-9, 11, 13):
   sort_unstable on the full trace with O(n) merge of sorted old + new entries.
   Consolidation was 24% of catalog_transact (~19ms) in Session 12 profiling.
 
-Completed diagnostics (Sessions 10, 12, 13):
+Completed diagnostics (Sessions 10, 12, 13, 14):
 - Profiled post-Session 9 optimized build at ~10k objects (Session 10)
 - Profiled post-Session 11 optimized build at ~28k objects (Session 12)
+- Profiled post-Session 13 optimized build at ~36.5k objects (Session 14)
 - Full cost breakdowns in ddl-perf-log.md
 - Session 13 investigated lazy Transaction::new: found that CREATE TABLE accesses
   both expensive collections (items 16%, storage_collection_metadata 10%) plus
   reads from databases/schemas/roles/introspection_sources for OID allocation.
   Lazy init would save very little for CREATE TABLE specifically.
 
-Immediate next steps (ranked by impact from Session 12 profiling):
+Profiling notes: `perf record` works on this machine using the older perf binary
+at `/usr/lib/linux-tools/6.8.0-100-generic/perf` after setting
+`perf_event_paranoid` to 1. Use `rustfilt` for symbol demangling.
 
-- **Make Transaction::new lazy (~26% of catalog_transact, ~20ms).** The main
-  DDL transaction calls `TableTransaction::new` for ALL 20 collections,
-  converting every entry from proto to Rust types. The `items` collection alone
-  costs 16% of catalog_transact. Session 13 found that CREATE TABLE accesses
-  both `items` and `storage_collection_metadata` (together 26%), plus reads from
-  databases/schemas/roles/introspection_sources for OID allocation. So for
-  CREATE TABLE the savings would be limited. However, could still help for
-  CREATE VIEW (which may skip `storage_collection_metadata`), ALTER, and other
-  DDL types that touch fewer collections. Also saves Transaction drop time (6%).
+Immediate next steps (ranked by impact from Session 14 profiling):
 
-- **Reduce Snapshot clone cost (~12% of catalog_transact, ~9ms).** The cached
-  Snapshot's BTreeMaps (especially `items` at 8% and `storage_collection_metadata`
-  at 3%) are fully cloned each transaction. Wrap in `Arc` so clone is O(1) and
-  use clone-on-write semantics. If lazy Transaction::new is implemented, the
-  Snapshot clone may become partly unnecessary too.
+- **Change snapshot trace from Vec to BTreeMap (~15% of total, ~31ms).** The
+  `consolidate_incremental` merge is O(n) — it allocates a new Vec and copies
+  all ~36k `(StateUpdateKind, Timestamp, Diff)` tuples every commit. Changing
+  `self.snapshot` to `BTreeMap<StateUpdateKind, Diff>` with a separate "current
+  timestamp" field would make consolidation O(m log n) per commit (m=1-5 new
+  entries), essentially eliminating this cost. The cached `Snapshot` is already
+  built from this trace and cached, so downstream code is unaffected.
 
-- **Reduce apply_catalog_implications (~13% of catalog_transact, ~10ms).**
-  Includes `create_table_collections` and read hold management. May be harder
-  to optimize as it's real work for each DDL.
+- **Cache validate_resource_limits counts (~7.8% of total, ~16ms).** This
+  function calls 7+ `user_*()` methods (user_tables, user_sources, etc.), each
+  iterating ALL entries in the imbl::OrdMap with `is_*` type checks. Combined
+  `is_*` self-time is ~4.5%. Maintaining a `ResourceCounts` struct in
+  CatalogState, updated incrementally during catalog transactions, would
+  eliminate these scans entirely.
 
-- **Reduce OID allocation cost.** During CREATE TABLE, `allocate_oids` scans
-  `databases`, `schemas`, `roles`, `items`, and `introspection_sources` to
-  collect all allocated OIDs. This forces initialization of those collections in
-  Transaction::new. Maintaining a cached set of allocated OIDs could avoid this
-  scan and make more collections eligible for lazy initialization.
+- **Arc-wrap Snapshot BTreeMaps (~5.7% of total, ~12ms).** The durable catalog's
+  `Snapshot` (21 BTreeMaps) is fully cloned for each transaction. Wrapping in
+  `Arc` makes clone O(1) with copy-on-write semantics in `apply_update`.
+
+- **Lazy Transaction::new (~14% of total, ~29ms, but limited savings for CREATE
+  TABLE).** Items deserialization alone is 9.5%. CREATE TABLE accesses both
+  `items` and `storage_collection_metadata` plus OID allocation collections,
+  limiting savings to ~2% from skipping the other 18 collections. More
+  beneficial for other DDL types.
+
+- **Optimize ReadHold::try_downgrade (~5.5% of total, ~11ms).** Part of
+  `apply_catalog_implications` (6.7% total). Iterates a BTreeMap of all storage
+  collection read holds. May be batchable or optimizable.
