@@ -1447,3 +1447,76 @@ Raw data (sorted, 14 samples each):
 
 - **Cumulative improvement from Session 6 baseline:** 444ms → 134ms = **70%
   reduction** (or ~75% accounting for Docker CockroachDB overhead).
+
+---
+
+## Session 16: Lazy validate_resource_limits counting
+
+**Date:** 2026-02-20
+**Type:** Optimization
+**Build:** Optimized (release + debuginfo), Docker CockroachDB
+**Object count:** ~36,500
+
+### Goal
+
+Eliminate unnecessary catalog scans in `validate_resource_limits`. The Session 14
+profiling showed this function consuming ~7.8% of total CPU (~16ms), calling 7+
+`user_*()` methods that each iterate ALL entries in the catalog with `is_*` type
+checks. For CREATE TABLE, only `user_tables().count()` is needed — all other
+resource type deltas are 0.
+
+### Change
+
+Instead of caching counts (which requires maintaining a `ResourceCounts` struct
+through all catalog mutations), used a simpler approach: guard each expensive
+counting operation with a check on whether the corresponding `new_*` delta is
+positive. Since `validate_resource_limit` already short-circuits when
+`new_instances <= 0` (returning `Ok(())` without using the `current_amount`),
+passing `0` when no new instances are being created is semantically equivalent.
+
+For CREATE TABLE, this eliminates ~10 unnecessary catalog scans (connections,
+sources, sinks, materialized views, clusters, databases, secrets, roles,
+continual tasks, network policies), leaving only `user_tables().count()` and
+the per-schema items count.
+
+**File changed:** `src/adapter/src/coord/ddl.rs`
+
+### Results
+
+| DDL Type     | Session 15 median  | Session 16 median  | Improvement |
+|--------------|--------------------|--------------------|-------------|
+| CREATE TABLE | 134 ms             | 127 ms             | -5%         |
+| CREATE VIEW  | 100 ms             | 92 ms              | -8%         |
+| DROP TABLE   | 110 ms             | 100 ms             | -9%         |
+| DROP VIEW    | 96 ms              | 87 ms              | -9%         |
+
+Prometheus catalog_transact_with_ddl_transaction (CREATE TABLE only):
+- Session 15: 97.7ms avg (14 ops)
+- Session 16: 90.2ms avg (100 ops)
+- **8% improvement** in catalog_transact
+
+Raw data (sorted, 100 CREATE TABLE samples):
+121 122 122 122 123 123 123 123 123 123 124 124 124 124 124 124 124 124 124 124
+125 125 125 125 125 125 125 125 125 125 125 125 125 126 126 126 126 126 126 126
+126 126 127 127 127 127 127 127 127 127 127 127 127 127 127 127 128 128 128 128
+128 128 128 128 128 128 128 128 128 129 129 129 129 129 129 129 129 129 130 130
+130 130 131 131 132 134 134 139 146 151 155 156 156 156 157 157 158 158 158 158
+
+**Key observations:**
+
+- **CREATE TABLE improved 5%** from 134ms → 127ms median. The improvement is
+  modest because CREATE TABLE only has one positive delta (new_tables=1), so we
+  skip ~10 O(n) scans but still pay for `user_tables().count()` and other
+  fixed costs.
+
+- **DROP VIEW improved most (9%)** — drops have zero positive deltas for all
+  resource types, so the entire `validate_resource_limits` counting section is
+  skipped entirely.
+
+- **The improvement was larger than expected.** Session 14 profiling estimated
+  7.8% CPU on validate_resource_limits, but the actual wall-clock improvement
+  suggests the catalog scans had additional cache/memory effects beyond pure
+  CPU cost.
+
+- **Cumulative improvement from Session 6 baseline:** 444ms → 127ms = **71%
+  reduction** (or ~76% accounting for Docker CockroachDB overhead).

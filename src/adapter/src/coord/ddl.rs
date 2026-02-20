@@ -1277,26 +1277,36 @@ impl Coordinator {
             }
         }
 
+        // Only scan user_connections when a connection type delta is positive.
         let mut current_aws_privatelink_connections = 0;
         let mut current_postgres_connections = 0;
         let mut current_mysql_connections = 0;
         let mut current_sql_server_connections = 0;
         let mut current_kafka_connections = 0;
-        for c in self.catalog().user_connections() {
-            let connection = c
-                .connection()
-                .expect("`user_connections()` only returns connection objects");
+        if new_kafka_connections > 0
+            || new_postgres_connections > 0
+            || new_mysql_connections > 0
+            || new_sql_server_connections > 0
+            || new_aws_privatelink_connections > 0
+        {
+            for c in self.catalog().user_connections() {
+                let connection = c
+                    .connection()
+                    .expect("`user_connections()` only returns connection objects");
 
-            match connection.details {
-                ConnectionDetails::AwsPrivatelink(_) => current_aws_privatelink_connections += 1,
-                ConnectionDetails::Postgres(_) => current_postgres_connections += 1,
-                ConnectionDetails::MySql(_) => current_mysql_connections += 1,
-                ConnectionDetails::SqlServer(_) => current_sql_server_connections += 1,
-                ConnectionDetails::Kafka(_) => current_kafka_connections += 1,
-                ConnectionDetails::Csr(_)
-                | ConnectionDetails::Ssh { .. }
-                | ConnectionDetails::Aws(_)
-                | ConnectionDetails::IcebergCatalog(_) => {}
+                match connection.details {
+                    ConnectionDetails::AwsPrivatelink(_) => {
+                        current_aws_privatelink_connections += 1
+                    }
+                    ConnectionDetails::Postgres(_) => current_postgres_connections += 1,
+                    ConnectionDetails::MySql(_) => current_mysql_connections += 1,
+                    ConnectionDetails::SqlServer(_) => current_sql_server_connections += 1,
+                    ConnectionDetails::Kafka(_) => current_kafka_connections += 1,
+                    ConnectionDetails::Csr(_)
+                    | ConnectionDetails::Ssh { .. }
+                    | ConnectionDetails::Aws(_)
+                    | ConnectionDetails::IcebergCatalog(_) => {}
+                }
             }
         }
         self.validate_resource_limit(
@@ -1334,22 +1344,32 @@ impl Coordinator {
             "AWS PrivateLink Connection",
             MAX_AWS_PRIVATELINK_CONNECTIONS.name(),
         )?;
+        // Only compute current counts when a positive delta requires limit
+        // checking. validate_resource_limit short-circuits on new_instances <= 0,
+        // so passing 0 for current_amount is safe (the value is unused).
         self.validate_resource_limit(
-            self.catalog().user_tables().count(),
+            if new_tables > 0 {
+                self.catalog().user_tables().count()
+            } else {
+                0
+            },
             new_tables,
             SystemVars::max_tables,
             "table",
             MAX_TABLES.name(),
         )?;
 
-        let current_sources: usize = self
-            .catalog()
-            .user_sources()
-            .filter_map(|source| source.source())
-            .map(|source| source.user_controllable_persist_shard_count())
-            .sum::<i64>()
-            .try_into()
-            .expect("non-negative sum of sources");
+        let current_sources: usize = if new_sources > 0 {
+            self.catalog()
+                .user_sources()
+                .filter_map(|source| source.source())
+                .map(|source| source.user_controllable_persist_shard_count())
+                .sum::<i64>()
+                .try_into()
+                .expect("non-negative sum of sources")
+        } else {
+            0
+        };
 
         self.validate_resource_limit(
             current_sources,
@@ -1359,14 +1379,22 @@ impl Coordinator {
             MAX_SOURCES.name(),
         )?;
         self.validate_resource_limit(
-            self.catalog().user_sinks().count(),
+            if new_sinks > 0 {
+                self.catalog().user_sinks().count()
+            } else {
+                0
+            },
             new_sinks,
             SystemVars::max_sinks,
             "sink",
             MAX_SINKS.name(),
         )?;
         self.validate_resource_limit(
-            self.catalog().user_materialized_views().count(),
+            if new_materialized_views > 0 {
+                self.catalog().user_materialized_views().count()
+            } else {
+                0
+            },
             new_materialized_views,
             SystemVars::max_materialized_views,
             "materialized view",
@@ -1378,7 +1406,11 @@ impl Coordinator {
             //
             // TODO(benesch): remove the `max_sources` and `max_sinks` limit,
             // and set a higher max cluster limit?
-            self.catalog().user_clusters().count(),
+            if new_clusters > 0 {
+                self.catalog().user_clusters().count()
+            } else {
+                0
+            },
             new_clusters,
             SystemVars::max_clusters,
             "cluster",
@@ -1400,7 +1432,11 @@ impl Coordinator {
             )?;
         }
         self.validate_resource_limit_numeric(
-            self.current_credit_consumption_rate(),
+            if new_credit_consumption_rate > Numeric::zero() {
+                self.current_credit_consumption_rate()
+            } else {
+                Numeric::zero()
+            },
             new_credit_consumption_rate,
             |system_vars| {
                 self.license_key
@@ -1411,7 +1447,11 @@ impl Coordinator {
             MAX_CREDIT_CONSUMPTION_RATE.name(),
         )?;
         self.validate_resource_limit(
-            self.catalog().databases().count(),
+            if new_databases > 0 {
+                self.catalog().databases().count()
+            } else {
+                0
+            },
             new_databases,
             SystemVars::max_databases,
             "database",
@@ -1443,28 +1483,44 @@ impl Coordinator {
             )?;
         }
         self.validate_resource_limit(
-            self.catalog().user_secrets().count(),
+            if new_secrets > 0 {
+                self.catalog().user_secrets().count()
+            } else {
+                0
+            },
             new_secrets,
             SystemVars::max_secrets,
             "secret",
             MAX_SECRETS.name(),
         )?;
         self.validate_resource_limit(
-            self.catalog().user_roles().count(),
+            if new_roles > 0 {
+                self.catalog().user_roles().count()
+            } else {
+                0
+            },
             new_roles,
             SystemVars::max_roles,
             "role",
             MAX_ROLES.name(),
         )?;
         self.validate_resource_limit(
-            self.catalog().user_continual_tasks().count(),
+            if new_continual_tasks > 0 {
+                self.catalog().user_continual_tasks().count()
+            } else {
+                0
+            },
             new_continual_tasks,
             SystemVars::max_continual_tasks,
             "continual_task",
             MAX_CONTINUAL_TASKS.name(),
         )?;
         self.validate_resource_limit(
-            self.catalog().user_continual_tasks().count(),
+            if new_network_policies > 0 {
+                self.catalog().user_continual_tasks().count()
+            } else {
+                0
+            },
             new_network_policies,
             SystemVars::max_network_policies,
             "network_policy",
