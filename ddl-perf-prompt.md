@@ -61,12 +61,12 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 14): At ~36.5k objects (optimized build, Docker
-CockroachDB), DDL latency is CREATE TABLE median ~163ms, catalog_transact avg
-110.9ms. That's down from 444ms at the Session 6 baseline (~63% cumulative
-improvement, or ~70% accounting for ~30-40ms Docker CockroachDB overhead).
+Current status (after Session 15): At ~36.5k objects (optimized build, Docker
+CockroachDB), DDL latency is CREATE TABLE median ~134ms, catalog_transact avg
+97.7ms. That's down from 444ms at the Session 6 baseline (~70% cumulative
+improvement, or ~75% accounting for ~30-40ms Docker CockroachDB overhead).
 
-Completed optimizations (Sessions 7-9, 11, 13):
+Completed optimizations (Sessions 7-9, 11, 13, 15):
 - Cached Snapshot in PersistHandle (Session 7)
 - Lightweight allocate_id bypassing full Transaction (Session 8)
 - Persistent CatalogState with imbl::OrdMap + Arc (Session 9) — eliminated the
@@ -77,6 +77,9 @@ Completed optimizations (Sessions 7-9, 11, 13):
 - Incremental consolidation in apply_updates (Session 13) — replaced O(n log n)
   sort_unstable on the full trace with O(n) merge of sorted old + new entries.
   Consolidation was 24% of catalog_transact (~19ms) in Session 12 profiling.
+- BTreeMap snapshot trace (Session 15) — replaced Vec<(T, Timestamp, Diff)> with
+  BTreeMap<T, Diff>, eliminating the O(n) consolidation entirely. Consolidation
+  was 15% of total CPU (~31ms) in Session 14 profiling. Now O(m log n) per commit.
 
 Completed diagnostics (Sessions 10, 12, 13, 14):
 - Profiled post-Session 9 optimized build at ~10k objects (Session 10)
@@ -92,15 +95,8 @@ Profiling notes: `perf record` works on this machine using the older perf binary
 at `/usr/lib/linux-tools/6.8.0-100-generic/perf` after setting
 `perf_event_paranoid` to 1. Use `rustfilt` for symbol demangling.
 
-Immediate next steps (ranked by impact from Session 14 profiling):
-
-- **Change snapshot trace from Vec to BTreeMap (~15% of total, ~31ms).** The
-  `consolidate_incremental` merge is O(n) — it allocates a new Vec and copies
-  all ~36k `(StateUpdateKind, Timestamp, Diff)` tuples every commit. Changing
-  `self.snapshot` to `BTreeMap<StateUpdateKind, Diff>` with a separate "current
-  timestamp" field would make consolidation O(m log n) per commit (m=1-5 new
-  entries), essentially eliminating this cost. The cached `Snapshot` is already
-  built from this trace and cached, so downstream code is unaffected.
+Immediate next steps (ranked by estimated impact from Session 14 profiling,
+with consolidation now eliminated):
 
 - **Cache validate_resource_limits counts (~7.8% of total, ~16ms).** This
   function calls 7+ `user_*()` methods (user_tables, user_sources, etc.), each
