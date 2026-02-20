@@ -61,9 +61,9 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 19): At ~37.5k objects (optimized build, Docker
-CockroachDB), DDL latency is CREATE TABLE ~136ms (individual psql),
-catalog_transact avg ~95ms, apply_catalog_implications avg ~46ms. That's down
+Current status (after Session 20): At ~37.9k objects (optimized build, Docker
+CockroachDB), DDL latency is CREATE TABLE ~127ms (individual psql median),
+catalog_transact avg ~90ms, apply_catalog_implications avg ~42ms. That's down
 from 444ms at the Session 6 baseline. CPU work per DDL is now ~0.6ms — DDL is
 I/O bound.
 
@@ -73,14 +73,15 @@ with optimized builds** — debug builds grossly distort CPU-heavy vs I/O-heavy
 ratios (Session 19 showed table_register as 95% in debug but only 20% in
 optimized).
 
-**Session 19 create_collections breakdown (optimized, 33ms total):**
-- `storage_collections`: **~24ms (73%)** — 3 sequential persist ops:
-  upgrade_version, open_critical_handle, compare_and_downgrade_since
-- `table_register`: ~6.5ms (20%) — txn-wal registration
+**Session 20 create_collections breakdown (optimized, ~30ms total):**
+- `storage_collections`: **~21ms (70%)** — 2 sequential persist ops:
+  open_critical_handle (register_critical_reader + compare_and_downgrade_since).
+  `upgrade_version` CAS is now skipped for shards at current version (Session 20).
+- `table_register`: ~8ms (27%) — txn-wal registration
 - `open_data_handles`: ~0.7ms (2%) — write handle open
-- `sequential_loop`: ~0.1ms (0%) — CPU work
+- `sequential_loop`: ~0.0ms (0%) — CPU work
 
-Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18):
+Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18, 20):
 - Cached Snapshot in PersistHandle (Session 7)
 - Lightweight allocate_id bypassing full Transaction (Session 8)
 - Persistent CatalogState with imbl::OrdMap + Arc (Session 9) — eliminated the
@@ -102,8 +103,12 @@ Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18):
   storage_collections, one in storage_controller). Not measurable with local
   filesystem persist but saves ~20-50ms per DDL with S3-backed persist in
   production.
+- Skip upgrade_version CAS for shards at current version (Session 20) — for
+  newly-created shards and existing shards after restart without version change,
+  the version is already current. Skip the consensus CAS write entirely. Reduced
+  storage_collections from ~24ms to ~21ms (~3ms savings per DDL).
 
-Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19):
+Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19, 20):
 - Profiled post-Session 9 optimized build at ~10k objects (Session 10)
 - Profiled post-Session 11 optimized build at ~28k objects (Session 12)
 - Profiled post-Session 13 optimized build at ~36.5k objects (Session 14)
@@ -118,6 +123,9 @@ Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19):
   open_data_handles=0.7ms (2%). Key: debug build proportions are misleading
   (table_register appeared as 95% in debug but is only 20% in optimized).
 - Full cost breakdowns in ddl-perf-log.md
+- Session 20 measured: storage_collections=21ms (was 24ms), catalog_transact=90ms
+  (was 95ms), CREATE TABLE median=127ms (was 136ms). upgrade_version CAS skip
+  saves ~3ms per DDL.
 - Session 13 investigated lazy Transaction::new: found that CREATE TABLE accesses
   both expensive collections (items 16%, storage_collection_metadata 10%) plus
   reads from databases/schemas/roles/introspection_sources for OID allocation.
@@ -136,24 +144,25 @@ Profiling notes:
   per-DDL averages. Use `curl -s http://localhost:6878/metrics > /tmp/before.txt`
   then compare after.
 
-Immediate next steps (ranked by Session 19 optimized-build wall-clock profiling):
+Immediate next steps (ranked by Session 20 optimized-build wall-clock profiling):
 
-- **Reduce storage_collections persist ops (~24ms, 73% of create_collections,
-  ~25% of DDL).** Three sequential persist operations for every table:
-  `upgrade_version` (~8ms), `open_critical_handle` (~8ms),
-  `compare_and_downgrade_since` (~8ms). Code path:
-  `src/storage-client/src/storage_collections.rs` → `open_since_handle` +
-  concurrent block. Options:
-  - Eliminate `upgrade_version` for newly-created shards (schema is already correct)
-  - Overlap these persist ops with open_data_handles/table_register
-  - Defer `compare_and_downgrade_since` to background
-  - Batch multiple persist ops into fewer round-trips
+- **Overlap storage_collections with open_data_handles + table_register
+  (~8ms savings).** Currently sequential: storage_collections (~21ms) must
+  complete before the controller opens WriteHandles (0.7ms) and does
+  table_register (~8ms). The WriteHandle and table_register don't depend on
+  the SinceHandle, so they could run concurrently with storage_collections.
+  Saves up to ~8ms. Code path: `src/storage-controller/src/lib.rs`
+  `create_collections_for_bootstrap`. Requires restructuring the sequential
+  flow so that open_write_handle + table_register fires concurrently with the
+  storage_collections call.
 
-- **Reduce table_register latency (~6.5ms, 20% of create_collections).** txn-wal
-  registration: `try_register_schema`, `txns_cache.update_ge`, `small_caa`,
-  `apply_le`. Code path: `src/storage-controller/src/persist_handles.rs`
-  `TxnsTableWorker::register` → `src/txn-wal/src/txns.rs` `Txns::register`.
-  Could overlap with post-create_collections work.
+- **Combine compare_and_downgrade_since calls (~4ms savings).** For new tables,
+  `open_critical_handle` sets the since to T::minimum() via one CAS, then a
+  separate CAS advances it to register_ts. Could pass register_ts directly to
+  `open_critical_handle` to set it in one CAS. Challenge: during bootstrap,
+  existing tables' since must NOT be advanced to register_ts. Needs a way to
+  distinguish DDL from bootstrap (e.g., a `skip_version_upgrade: bool` or
+  `is_new_shard: bool` parameter to `create_collections_for_bootstrap`).
 
 - **Merge allocate_id into catalog_transact (~3ms, 3% of DDL).** Saves one
   persist round-trip by allocating IDs within the main transaction instead of a
