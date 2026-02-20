@@ -61,18 +61,24 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 18): At ~37.5k objects (optimized build, Docker
-CockroachDB), DDL latency is CREATE TABLE ~112ms (batch) / ~135ms (individual
-psql), catalog_transact avg ~95ms. That's down from 444ms at the Session 6
-baseline. CPU work per DDL is now ~0.6ms — DDL is I/O bound.
+Current status (after Session 19): At ~37.5k objects (optimized build, Docker
+CockroachDB), DDL latency is CREATE TABLE ~136ms (individual psql),
+catalog_transact avg ~95ms, apply_catalog_implications avg ~46ms. That's down
+from 444ms at the Session 6 baseline. CPU work per DDL is now ~0.6ms — DDL is
+I/O bound.
 
-**Important: DDL is now I/O bound, not CPU bound.** Session 17 revealed that
-CPU profiling (perf, flamegraphs) gives a misleading picture because it only
-captures compute time and misses async I/O waits. Use Prometheus wall-clock
-histograms for profiling instead. The wall-clock breakdown shows
-apply_catalog_implications at 42ms (40% of DDL time) — 6x larger than its CPU
-profile suggested — because it includes async waits for storage controller IPC,
-timestamp oracle round-trips, and persist operations.
+**Important: DDL is now I/O bound, not CPU bound.** Use Prometheus wall-clock
+histograms for profiling, not perf/flamegraphs. **Always verify proportions
+with optimized builds** — debug builds grossly distort CPU-heavy vs I/O-heavy
+ratios (Session 19 showed table_register as 95% in debug but only 20% in
+optimized).
+
+**Session 19 create_collections breakdown (optimized, 33ms total):**
+- `storage_collections`: **~24ms (73%)** — 3 sequential persist ops:
+  upgrade_version, open_critical_handle, compare_and_downgrade_since
+- `table_register`: ~6.5ms (20%) — txn-wal registration
+- `open_data_handles`: ~0.7ms (2%) — write handle open
+- `sequential_loop`: ~0.1ms (0%) — CPU work
 
 Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18):
 - Cached Snapshot in PersistHandle (Session 7)
@@ -97,7 +103,7 @@ Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18):
   filesystem persist but saves ~20-50ms per DDL with S3-backed persist in
   production.
 
-Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18):
+Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19):
 - Profiled post-Session 9 optimized build at ~10k objects (Session 10)
 - Profiled post-Session 11 optimized build at ~28k objects (Session 12)
 - Profiled post-Session 13 optimized build at ~36.5k objects (Session 14)
@@ -107,6 +113,10 @@ Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18):
 - Session 18 A/B tested redundant WriteHandle elimination: no measurable
   improvement with local filesystem persist. Key insight: persist blob location
   (local vs S3) determines whether persist operation elimination is impactful.
+- Session 19 instrumented create_collections internal breakdown (optimized build):
+  storage_collections=24ms (73%), table_register=6.5ms (20%),
+  open_data_handles=0.7ms (2%). Key: debug build proportions are misleading
+  (table_register appeared as 95% in debug but is only 20% in optimized).
 - Full cost breakdowns in ddl-perf-log.md
 - Session 13 investigated lazy Transaction::new: found that CREATE TABLE accesses
   both expensive collections (items 16%, storage_collection_metadata 10%) plus
@@ -118,29 +128,32 @@ Profiling notes:
   CPU sampling misses async I/O waits which now dominate DDL time. Key metrics:
   `mz_catalog_transact_seconds`, `mz_apply_catalog_implications_seconds`,
   `mz_catalog_allocate_id_seconds`, `mz_catalog_transaction_commit_latency_seconds`,
-  `mz_slow_message_handling` (by message_kind), `mz_ts_oracle_seconds` (by op).
+  `mz_slow_message_handling` (by message_kind), `mz_ts_oracle_seconds` (by op),
+  `mz_create_table_collections_seconds` (by step),
+  `mz_storage_create_collections_seconds` (by step),
+  `mz_initialize_storage_collections_seconds`.
 - Capture metrics before/after a DDL batch and compute deltas for accurate
   per-DDL averages. Use `curl -s http://localhost:6878/metrics > /tmp/before.txt`
   then compare after.
 
-Immediate next steps (ranked by wall-clock impact from Session 17 profiling):
+Immediate next steps (ranked by Session 19 optimized-build wall-clock profiling):
 
-- **Reduce create_collections latency (~20-25ms, 19-24% of DDL).** The storage
-  controller opens persist WriteHandles and registers with txn-wal for each new
-  table. This involves `open_data_handles` → persist shard operations, plus
-  txn-wal registration. Code path: `src/storage-controller/src/lib.rs`
-  `create_collections_for_bootstrap` → `open_data_handles` → persist. Could
-  potentially fire-and-forget (don't wait for completion), overlap with other
-  async operations, or pre-open handles.
+- **Reduce storage_collections persist ops (~24ms, 73% of create_collections,
+  ~25% of DDL).** Three sequential persist operations for every table:
+  `upgrade_version` (~8ms), `open_critical_handle` (~8ms),
+  `compare_and_downgrade_since` (~8ms). Code path:
+  `src/storage-client/src/storage_collections.rs` → `open_since_handle` +
+  concurrent block. Options:
+  - Eliminate `upgrade_version` for newly-created shards (schema is already correct)
+  - Overlap these persist ops with open_data_handles/table_register
+  - Defer `compare_and_downgrade_since` to background
+  - Batch multiple persist ops into fewer round-trips
 
-- **Overlap apply_catalog_implications with group_commit (~7ms).** Currently
-  sequential: catalog_transact finishes (including apply_catalog_implications)
-  before group_commit starts. If they could overlap, saves ~7ms.
-
-- **Reduce initialize_read_policies latency (~10ms, 9% of DDL).** Read hold
-  acquisition and downgrade involves IPC to storage controller. Code path:
-  `src/adapter/src/coord/catalog_implications.rs` `initialize_storage_collections`
-  → `initialize_read_policies`. Could batch or defer.
+- **Reduce table_register latency (~6.5ms, 20% of create_collections).** txn-wal
+  registration: `try_register_schema`, `txns_cache.update_ge`, `small_caa`,
+  `apply_le`. Code path: `src/storage-controller/src/persist_handles.rs`
+  `TxnsTableWorker::register` → `src/txn-wal/src/txns.rs` `Txns::register`.
+  Could overlap with post-create_collections work.
 
 - **Merge allocate_id into catalog_transact (~3ms, 3% of DDL).** Saves one
   persist round-trip by allocating IDs within the main transaction instead of a
@@ -150,3 +163,6 @@ Immediate next steps (ranked by wall-clock impact from Session 17 profiling):
   + Transaction::new (proto→Rust conversion). Arc-wrapping Snapshot BTreeMaps
   saves ~2-3ms of clone overhead. Lazy Transaction::new saves little for CREATE
   TABLE (accesses most collections) but helps other DDL types.
+
+Note: `initialize_read_policies` is now only ~0.5ms (down from Session 17's
+~10ms estimate). No longer a significant optimization target.
