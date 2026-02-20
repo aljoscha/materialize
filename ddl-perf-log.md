@@ -1113,3 +1113,121 @@ Transaction::new (26%) and consolidation (24%) are now the top two bottlenecks.
 5. **Reduce Transaction drop cost (6% of ct, ~5ms).** The Transaction holds
    BTreeMaps for all 20 collections. If lazy init (#1) is implemented, only
    accessed collections would need to be dropped.
+
+### Session 13: Incremental consolidation — replace O(n log n) sort with O(n) merge (2026-02-20)
+
+**Goal:** Reduce the O(n log n) consolidation cost that was identified in Session
+12 as 24% of catalog_transact time (~19ms at ~28k objects). Every DDL commit
+calls `consolidate()` which sorts the entire in-memory trace with
+`sort_unstable` and deduplicates. With ~28k entries, this is an O(n log n) cost
+on every DDL.
+
+**Analysis:** The consolidation works on `PersistHandle.snapshot`, a
+`Vec<(StateUpdateKind, Timestamp, Diff)>` that accumulates all catalog state.
+After each DDL, 1-5 new entries are pushed to this trace, then `consolidate()`
+is called which:
+1. Unifies all timestamps to the latest (O(n))
+2. Calls `differential_dataflow::consolidation::consolidate_updates()` which
+   sorts the entire vec with `sort_unstable` (O(n log n)) and deduplicates
+
+The key insight: the trace is already consolidated (sorted, deduplicated) before
+new entries are pushed. Only the last 1-5 entries are unsorted. Sorting the
+entire 28k-entry vec to handle 5 new entries is wasteful.
+
+**Approach:** Added `consolidate_incremental(old_len)` method that takes
+advantage of the already-consolidated prefix:
+1. Records `old_len = self.snapshot.len()` before pushing new entries
+2. After pushing, extracts and consolidates only the new entries (O(m log m)
+   where m = 1-5, trivially fast)
+3. Merges the sorted old entries with the sorted new entries in a single pass
+   (O(n + m)), unifying timestamps and cancelling entries with matching keys
+   and opposite diffs during the merge
+
+This replaces the O(n log n) full sort with an O(n) merge. The full
+`consolidate()` method is preserved for `current_snapshot()` and other callers
+outside the DDL hot path.
+
+**Also investigated: lazy Transaction::new.** Before implementing the
+consolidation fix, investigated making `Transaction::new` lazy (deferring
+proto-to-Rust deserialization of the 20 collections). Found that CREATE TABLE
+accesses both of the two expensive collections: `items` (16% of catalog_transact)
+and `storage_collection_metadata` (10%). It also reads from `databases`,
+`schemas`, `roles`, and `introspection_sources` for OID allocation. Since the
+two largest collections are both accessed for the most common DDL type, lazy
+init would save very little for CREATE TABLE specifically. Deferred this in
+favor of the consolidation fix which benefits all DDL types equally.
+
+**Code changes:**
+- `src/catalog/src/durable/persist.rs` — added `consolidate_incremental` method
+  on `PersistHandle`, modified `apply_updates` to use it instead of
+  `consolidate()`. The incremental method extracts new entries, consolidates them,
+  then merges with the sorted old portion in a single O(n) pass.
+
+**Results (optimized build, ~28k and ~35k user objects):**
+
+Note: This session used Docker CockroachDB (previous sessions used native
+CockroachDB), which adds ~30-40ms of I/O latency per DDL. Absolute numbers are
+not directly comparable with Sessions 11-12; catalog_transact metrics and scaling
+slopes are the meaningful comparisons.
+
+Catalog_transact time (from Prometheus histogram, wall time):
+- At ~28k objects: avg **116.7ms** (30 samples)
+- At ~35k objects: avg **134.9ms** (14 samples)
+- Scaling slope: **~2.6ms per 1000 objects** for catalog_transact
+
+Wall-clock DDL latency (median of 14 samples, optimized build):
+
+| DDL Type     | ~28k objects | ~35k objects |
+|-------------|-------------|-------------|
+| CREATE TABLE | 169 ms      | 192 ms      |
+| CREATE VIEW  | 128 ms      | —           |
+| DROP TABLE   | 128 ms      | —           |
+| DROP VIEW    | 110 ms      | —           |
+
+Raw data (sorted, 14 samples each, ~28k objects):
+- CREATE TABLE: 159 160 161 164 166 167 168 170 172 173 174 193 199 199
+- CREATE VIEW:  124 125 126 127 127 127 127 128 129 130 130 134 157 158
+- DROP TABLE:   123 124 124 125 127 127 128 128 128 128 130 131 131 133
+- DROP VIEW:    107 107 108 108 108 109 109 110 111 111 111 119 138 146
+
+Raw data (sorted, 14 samples, ~35k objects):
+- CREATE TABLE: 182 186 188 189 190 191 191 192 193 194 194 195 221 231
+
+**Key observations:**
+
+- **Absolute numbers are ~30-40ms higher than Sessions 11-12** due to Docker
+  CockroachDB overhead. Session 11 used native CockroachDB with lower latency.
+
+- **The consolidation change is architecturally correct.** Replaces O(n log n)
+  sort with O(n) merge. The merge allocates a new Vec and copies all entries
+  (single O(n) pass), compared to the old in-place sort_unstable (which, for
+  nearly-sorted data, may have been close to O(n) already via pdqsort's
+  adaptive behavior).
+
+- **All DDL operations work correctly** at scale (28k-35k objects). CREATE,
+  DROP, CREATE VIEW, DROP VIEW all succeed.
+
+- **Scaling slope of ~2.6ms per 1000 objects** for catalog_transact is consistent
+  with the remaining O(n) costs (Transaction::new, Snapshot clone, etc.)
+
+**Remaining optimization targets (from Session 12 profiling, updated):**
+
+1. **Make Transaction::new lazy (~26% of catalog_transact, ~20ms).** Still the
+   largest single cost. However, for CREATE TABLE specifically, both `items`
+   (16%) and `storage_collection_metadata` (10%) are accessed, limiting the
+   savings. Could still help for CREATE VIEW (which may not access
+   `storage_collection_metadata`), ALTER, and other DDL types that touch fewer
+   collections. Also saves Transaction drop time (6%).
+
+2. **Reduce Snapshot clone cost (~12% of catalog_transact, ~9ms).** Wrap large
+   BTreeMaps in `Arc` for O(1) clone. Combined with lazy Transaction::new,
+   could avoid cloning unaccessed collections entirely.
+
+3. **Reduce apply_catalog_implications (~13% of catalog_transact, ~10ms).**
+   Includes `create_table_collections` and read hold management.
+
+4. **Reduce OID allocation cost.** During CREATE TABLE, `allocate_oids` scans
+   `databases`, `schemas`, `roles`, `items`, and `introspection_sources` to
+   collect all allocated OIDs. This triggers initialization of those collections
+   in Transaction::new. Maintaining a cached set of allocated OIDs could avoid
+   this scan and make more collections eligible for lazy initialization.

@@ -656,6 +656,9 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
 
         let mut errors = Vec::new();
 
+        // Track the boundary between already-consolidated entries and new ones.
+        let old_len = self.snapshot.len();
+
         for (kind, ts, diff) in updates {
             if diff != Diff::ONE && diff != Diff::MINUS_ONE {
                 panic!("invalid update in consolidated trace: ({kind:?}, {ts:?}, {diff:?})");
@@ -692,7 +695,7 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
             return Err(err);
         }
 
-        self.consolidate();
+        self.consolidate_incremental(old_len);
 
         Ok(())
     }
@@ -716,6 +719,87 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
             *ts = new_ts;
         }
         differential_dataflow::consolidation::consolidate_updates(&mut self.snapshot);
+    }
+
+    /// Like [`Self::consolidate`], but takes advantage of the fact that
+    /// `self.snapshot[..old_len]` is already consolidated (sorted with unified
+    /// timestamps). Only the entries at `self.snapshot[old_len..]` are new.
+    ///
+    /// Instead of re-sorting the entire snapshot (O(n log n)), this method
+    /// merges the small batch of new entries into the sorted portion in O(n + m)
+    /// where m is the number of new entries. For typical DDL operations where
+    /// m = 1-5 and n = tens of thousands, this is a significant speedup.
+    fn consolidate_incremental(&mut self, old_len: usize) {
+        let new_len = self.snapshot.len();
+        if old_len >= new_len {
+            // No new entries; nothing to do.
+            return;
+        }
+
+        // Find the new unified timestamp (the maximum across all entries).
+        let new_ts = self
+            .snapshot
+            .last()
+            .map(|(_, ts, _)| *ts)
+            .unwrap_or_else(Timestamp::minimum);
+
+        // Extract the new entries and consolidate them among themselves.
+        // This is O(m log m) where m is tiny (typically 1-5).
+        let mut new_entries: Vec<_> = self.snapshot.drain(old_len..).collect();
+        for (_, ts, _) in &mut new_entries {
+            *ts = new_ts;
+        }
+        differential_dataflow::consolidation::consolidate_updates(&mut new_entries);
+
+        if new_entries.is_empty() {
+            // New entries cancelled each other. Just unify timestamps on old.
+            for (_, ts, _) in &mut self.snapshot {
+                *ts = new_ts;
+            }
+            return;
+        }
+
+        // Merge the sorted old entries with the sorted new entries.
+        // The old portion is already sorted by (kind, ts, diff) with unified
+        // timestamps, so effectively sorted by (kind, diff). We compare by
+        // kind only since each kind appears at most once after consolidation.
+        //
+        // During the merge, if an old and new entry have the same kind, we sum
+        // their diffs. If the sum is zero, the entry is dropped (cancelled).
+        let mut result = Vec::with_capacity(self.snapshot.len() + new_entries.len());
+        let old_entries = std::mem::take(&mut self.snapshot);
+        let mut old_iter = old_entries.into_iter().peekable();
+        let mut new_iter = new_entries.into_iter().peekable();
+
+        while let (Some(old), Some(new)) = (old_iter.peek(), new_iter.peek()) {
+            match old.0.cmp(&new.0) {
+                std::cmp::Ordering::Less => {
+                    let (kind, _, diff) = old_iter.next().expect("peeked");
+                    result.push((kind, new_ts, diff));
+                }
+                std::cmp::Ordering::Greater => {
+                    result.push(new_iter.next().expect("peeked"));
+                }
+                std::cmp::Ordering::Equal => {
+                    let (kind, _, old_diff) = old_iter.next().expect("peeked");
+                    let (_, _, new_diff) = new_iter.next().expect("peeked");
+                    let combined = old_diff + new_diff;
+                    if combined != Diff::ZERO {
+                        result.push((kind, new_ts, combined));
+                    }
+                    // If combined == 0, both entries cancel and we skip them.
+                }
+            }
+        }
+
+        // Drain remaining old entries (updating their timestamps).
+        for (kind, _, diff) in old_iter {
+            result.push((kind, new_ts, diff));
+        }
+        // Drain remaining new entries.
+        result.extend(new_iter);
+
+        self.snapshot = result;
     }
 
     /// Execute and return the results of `f` on the current catalog trace.
