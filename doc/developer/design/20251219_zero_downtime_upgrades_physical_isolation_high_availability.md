@@ -16,6 +16,13 @@ We currently have a brief window (10-30 seconds) where an environment is
 unreachable during upgrades (see Context for details). This document proposes
 the changes required to eliminate that unreachability.
 
+> [!NOTE]
+> Materialize already has a zero-downtime upgrade procedure (see Context). This
+> document is about an additional effort to bring that closer to true zero
+> downtime. When we need to differentiate, we can call this "zero-downtime
+> upgrades v2", but throughout this document we will largely use the term
+> "zero-downtime upgrades".
+
 ## Goals
 
 - True zero-downtime upgrades for DML, DQL, and DDL
