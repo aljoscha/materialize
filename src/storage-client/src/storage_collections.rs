@@ -578,6 +578,45 @@ where
     ///
     /// This will `halt!` the process if we cannot successfully acquire a
     /// critical handle with our current epoch.
+    /// Opens a SinceHandle (without a WriteHandle) for the given shard.
+    ///
+    /// This is used for tables managed by txn-wal, where the storage controller
+    /// opens its own WriteHandle for txn-wal registration, making a WriteHandle
+    /// here redundant. Skipping the redundant open_writer + fetch_recent_upper
+    /// saves ~2 persist round-trips per table.
+    async fn open_since_handle(
+        &self,
+        id: &GlobalId,
+        shard: ShardId,
+        since: Option<&Antichain<T>>,
+        persist_client: &PersistClient,
+    ) -> SinceHandleWrapper<T> {
+        if self.read_only {
+            // In read-only mode we need the relation_desc for the leased handle,
+            // so callers must use open_data_handles instead.
+            panic!("open_since_handle should not be called in read-only mode");
+        }
+
+        // We're managing the data for this shard in read-write mode, which would fence out other
+        // processes in read-only mode; it's safe to upgrade the metadata version.
+        persist_client
+            .upgrade_version::<SourceData, (), T, StorageDiff>(
+                shard,
+                Diagnostics {
+                    shard_name: id.to_string(),
+                    handle_purpose: format!("controller data for {}", id),
+                },
+            )
+            .await
+            .expect("invalid persist usage");
+
+        let since_handle = self
+            .open_critical_handle(id, shard, since, persist_client)
+            .await;
+
+        SinceHandleWrapper::Critical(since_handle)
+    }
+
     async fn open_data_handles(
         &self,
         id: &GlobalId,
@@ -788,12 +827,14 @@ where
     fn register_handles(
         &self,
         id: GlobalId,
+        shard_id: ShardId,
         is_in_txns: bool,
         since_handle: SinceHandleWrapper<T>,
-        write_handle: WriteHandle<SourceData, (), T, StorageDiff>,
+        write_handle: Option<WriteHandle<SourceData, (), T, StorageDiff>>,
     ) {
         self.send(BackgroundCmd::Register {
             id,
+            shard_id,
             is_in_txns,
             since_handle,
             write_handle,
@@ -1820,15 +1861,37 @@ where
                         description.since.as_ref()
                     };
 
-                    let (write, mut since_handle) = this
-                        .open_data_handles(
-                            &id,
-                            metadata.data_shard,
-                            since,
-                            metadata.relation_desc.clone(),
-                            persist_client,
-                        )
-                        .await;
+                    // For tables managed by txn-wal, skip opening a WriteHandle
+                    // here. The storage controller will open its own WriteHandle
+                    // for txn-wal registration, and the WriteHandle opened here
+                    // would be immediately dropped after extracting the shard_id
+                    // (already known from metadata) and upper (overwritten to
+                    // initial_txn_upper for tables). Skipping the redundant
+                    // open_writer + fetch_recent_upper saves ~2 persist
+                    // round-trips per table.
+                    let is_table = description.data_source == DataSource::Table;
+                    let (write, mut since_handle) = if is_table && !this.read_only {
+                        let since_handle = this
+                            .open_since_handle(
+                                &id,
+                                metadata.data_shard,
+                                since,
+                                persist_client,
+                            )
+                            .await;
+                        (None, since_handle)
+                    } else {
+                        let (write, since_handle) = this
+                            .open_data_handles(
+                                &id,
+                                metadata.data_shard,
+                                since,
+                                metadata.relation_desc.clone(),
+                                persist_client,
+                            )
+                            .await;
+                        (Some(write), since_handle)
+                    };
 
                     // Present tables as springing into existence at the register_ts
                     // by advancing the since. Otherwise, we could end up in a
@@ -1913,7 +1976,13 @@ where
         let mut self_collections = self.collections.lock().expect("lock poisoned");
 
         for (id, description, write_handle, since_handle, metadata) in to_register {
-            let write_frontier = write_handle.upper();
+            let write_frontier = match &write_handle {
+                Some(wh) => wh.upper().clone(),
+                // Tables use the txn-wal logical upper, not the shard upper.
+                // The write_frontier will be overwritten to initial_txn_upper
+                // below, so use it directly here.
+                None => self.initial_txn_upper.clone(),
+            };
             let data_shard_since = since_handle.since().clone();
 
             // Determine if this collection has any dependencies.
@@ -1964,7 +2033,7 @@ where
                         mz_ore::soft_assert_or_log!(
                             write_frontier.elements() == &[T::minimum()]
                                 || write_frontier.is_empty()
-                                || PartialOrder::less_than(&dependency_since, write_frontier),
+                                || PartialOrder::less_than(&dependency_since, &write_frontier),
                             "dependency ({dep}) since has advanced past dependent ({id}) upper \n
                             dependent ({id}): since {:?}, upper {:?} \n
                             dependency ({dep}): since {:?}",
@@ -2075,7 +2144,7 @@ where
                 }
             }
 
-            self.register_handles(id, is_in_txns(id, &metadata), since_handle, write_handle);
+            self.register_handles(id, metadata.data_shard, is_in_txns(id, &metadata), since_handle, write_handle);
 
             // If this collection has a dependency, install a read hold on it.
             self.install_collection_dependency_read_holds_inner(&mut *self_collections, id)?;
@@ -2234,7 +2303,7 @@ where
         };
 
         // TODO(alter_table): Support changes to sources.
-        self.register_handles(new_collection, true, since_handle, write_handle);
+        self.register_handles(new_collection, data_shard, true, since_handle, Some(write_handle));
 
         info!(%existing_collection, %new_collection, ?new_desc, "altered table");
 
@@ -2651,8 +2720,9 @@ struct BackgroundTask<T: TimelyTimestamp + Lattice + Codec64> {
 enum BackgroundCmd<T: TimelyTimestamp + Lattice + Codec64> {
     Register {
         id: GlobalId,
+        shard_id: ShardId,
         is_in_txns: bool,
-        write_handle: WriteHandle<SourceData, (), T, StorageDiff>,
+        write_handle: Option<WriteHandle<SourceData, (), T, StorageDiff>>,
         since_handle: SinceHandleWrapper<T>,
     },
     DowngradeSince(Vec<(GlobalId, Antichain<T>)>),
@@ -2768,9 +2838,9 @@ where
                     };
 
                     match cmd {
-                        BackgroundCmd::Register{ id, is_in_txns, write_handle, since_handle } => {
+                        BackgroundCmd::Register{ id, shard_id, is_in_txns, write_handle, since_handle } => {
                             debug!("registering handles for {}", id);
-                            let previous = self.shard_by_id.insert(id, write_handle.shard_id());
+                            let previous = self.shard_by_id.insert(id, shard_id);
                             if previous.is_some() {
                                 panic!("already registered a WriteHandle for collection {id}");
                             }
@@ -2782,7 +2852,7 @@ where
 
                             if is_in_txns {
                                 self.txns_shards.insert(id);
-                            } else {
+                            } else if let Some(write_handle) = write_handle {
                                 let upper = write_handle.upper().clone();
                                 if !upper.is_empty() {
                                     let fut = gen_upper_future(id, write_handle, upper);
@@ -3271,9 +3341,10 @@ mod tests {
         cmds_tx
             .send(BackgroundCmd::Register {
                 id: GlobalId::User(1),
+                shard_id,
                 is_in_txns: false,
                 since_handle: SinceHandleWrapper::Critical(since_handle),
-                write_handle,
+                write_handle: Some(write_handle),
             })
             .unwrap();
 
