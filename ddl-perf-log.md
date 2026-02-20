@@ -1520,3 +1520,132 @@ Raw data (sorted, 100 CREATE TABLE samples):
 
 - **Cumulative improvement from Session 6 baseline:** 444ms → 127ms = **71%
   reduction** (or ~76% accounting for Docker CockroachDB overhead).
+
+### Session 17: Wall-clock profiling — DDL bottleneck shifted from CPU to I/O (2026-02-20)
+
+**Goal:** Profile the optimized build after all Sessions 7-16 optimizations to
+get an updated cost breakdown and identify the next bottleneck.
+
+**Setup:** Optimized build, Docker CockroachDB, ~37k objects. Used Prometheus
+metrics (histogram deltas before/after 100-DDL batches) for wall-clock breakdown
+since CPU profiling (`perf record`) showed only 0.6ms CPU per DDL — the process
+is now almost entirely I/O bound.
+
+**Key finding: CPU profiling is no longer useful.** `perf stat` measured only
+60ms of total CPU time for 100 CREATE TABLE statements (0.6ms CPU per DDL).
+Our CPU optimizations (Sessions 7-16) have reduced CPU work per DDL to
+negligible levels. The remaining ~106ms of wall-clock time is dominated by
+async I/O waits: persist operations, timestamp oracle round-trips, storage
+controller IPC, and group commit.
+
+**Absolute timing (100 CREATE TABLE batch, median ~37k objects):**
+
+| Metric | Value |
+|--------|-------|
+| Wall-clock per DDL (batch) | 105.6 ms |
+| Wall-clock per DDL (individual psql) | 128 ms |
+| catalog_transact avg (Prometheus) | 89.1 ms |
+| apply_catalog_implications avg | 42.0 ms |
+| allocate_id avg | 3.2 ms |
+| group_commit_initiate avg | 6.7 ms |
+| catalog commit_latency avg | 5.8 ms per commit |
+
+**Wall-clock breakdown per CREATE TABLE (~106ms batch mode):**
+
+```
+Total DDL: ~106ms
+├── catalog_transact_with_ddl_transaction: 89.1ms (84%)
+│   ├── apply_catalog_implications: 42.0ms (40%)       ← NEW top cost!
+│   │   ├── get_local_write_ts (oracle): ~2.2ms
+│   │   ├── confirm_leadership (catalog): ~1ms
+│   │   ├── create_collections (storage ctrl): ~20-25ms ← dominant I/O
+│   │   ├── apply_local_write (oracle): ~2.2ms
+│   │   └── initialize_read_policies: ~10ms
+│   │       ├── oracle.read_ts(): ~0.5ms
+│   │       └── read hold setup + IPC: ~9ms
+│   └── Remaining catalog_transact: 47.1ms (45%)
+│       ├── DurableCatalogState::transaction: ~12-15ms (CPU: Snapshot clone + Transaction::new)
+│       ├── Transaction::commit (in-memory): ~3-5ms (CPU)
+│       ├── commit_transaction (persist write): ~3ms (I/O)
+│       ├── validate_resource_limits: ~2ms (CPU, mostly skipped after S16)
+│       └── transact_op + overhead: ~20ms (mixed)
+├── allocate_id: 3.2ms (3%)
+└── Non-catalog overhead: 13.3ms (13%)
+    ├── group_commit: 6.7ms
+    └── pgwire/connection: ~7ms
+```
+
+**Per-operation I/O latencies (from Prometheus):**
+
+| Operation | Avg latency | Count | Notes |
+|-----------|------------|-------|-------|
+| oracle write_ts | 2.23 ms | 2686 | CockroachDB |
+| oracle apply_write | 2.24 ms | 1652 | CockroachDB |
+| oracle read_ts | 0.48 ms | 1861 | CockroachDB |
+| persist compare_and_append | 2.88 ms | 20551 | Blob store |
+| catalog commit | 2.80 ms | 1019 | compare_and_append |
+
+**Key finding: apply_catalog_implications is 42ms = 47% of catalog_transact.**
+In Session 14's CPU profiling, it was only 6.7% because CPU profiling misses
+I/O waits. The wall-clock time is dominated by async I/O operations in the
+`create_table_collections` path:
+
+1. **Storage controller create_collections (~20-25ms):** Opens a persist
+   WriteHandle for the table's data shard and registers it with txn-wal. Each
+   of these involves a `compare_and_append` operation (~3ms each) plus async
+   channel round-trip overhead between coordinator and storage controller.
+
+2. **Timestamp oracle operations (~5ms):** `get_local_write_ts()` (2.2ms) +
+   `apply_local_write()` (2.2ms) involve CockroachDB queries via the PostgreSQL
+   timestamp oracle.
+
+3. **Initialize read policies (~10ms):** oracle.read_ts() + read hold
+   acquisition and downgrade, which sends IPC messages to storage controller.
+
+**Comparison with Session 14 (CPU profile vs wall-clock):**
+
+| Component | Session 14 (CPU %) | Session 17 (wall-clock ms) | Notes |
+|-----------|-------------------|---------------------------|-------|
+| DurableCatalogState::transaction | 19.7% | ~12-15ms | CPU-bound, correctly measured |
+| consolidation | 15.0% | ~0ms | Eliminated in Session 15 |
+| Transaction::new | 14.0% | included above | CPU-bound |
+| Transaction::commit | 10.9% | ~3-5ms | CPU-bound, Transaction drop smaller |
+| validate_resource_limits | 7.8% | ~2ms | Mostly eliminated in Session 16 |
+| apply_catalog_implications | 6.7% | **42.0ms** | **6x larger in wall-clock!** |
+| commit_transaction | 16.2% | ~3ms | Consolidation eliminated |
+
+**Why CPU profiling showed the wrong picture:** CPU profiling (perf, flamegraphs)
+only captures compute time. It misses async I/O waits where the coordinator yields
+to the tokio runtime. This is why apply_catalog_implications appeared to be only
+6.7% in Session 14 but is actually 42ms = 40% of wall-clock time. Future
+profiling should use Prometheus wall-clock histograms, not CPU sampling.
+
+**Optimization targets (ranked by wall-clock impact):**
+
+1. **Reduce create_collections latency (~20-25ms, 19-24% of DDL).** The
+   storage controller opens persist handles and registers with txn-wal. Could
+   potentially:
+   - Fire-and-forget the collection creation (don't wait for completion)
+   - Overlap with other async operations (oracle, read policy init)
+   - Pre-open persist handles lazily in the background
+
+2. **Overlap apply_catalog_implications with group_commit (~7ms).** Currently
+   sequential. If the group_commit could start before apply_catalog_implications
+   finishes (or vice versa), saves ~7ms.
+
+3. **Reduce initialize_read_policies latency (~10ms).** Read hold acquisition
+   and downgrade involves IPC to the storage controller. Could batch or defer.
+
+4. **Merge allocate_id into catalog_transact (~3ms).** Saves one persist
+   round-trip by allocating IDs within the main transaction.
+
+5. **Reduce DurableCatalogState::transaction CPU cost (~12-15ms).** This is
+   Snapshot clone + Transaction::new (proto→Rust conversion). Arc-wrapping
+   Snapshot BTreeMaps would save ~2-3ms of clone overhead. Lazy Transaction::new
+   saves little for CREATE TABLE (accesses most collections).
+
+**Summary:** The DDL optimization has reached a phase transition. After Sessions
+7-16 eliminated all major CPU bottlenecks, DDL latency is now dominated by
+sequential async I/O operations. Further improvements require architectural
+changes: parallelizing I/O, reducing round-trips, or making I/O operations
+non-blocking. The CPU work per DDL (~0.6ms) is now negligible.
