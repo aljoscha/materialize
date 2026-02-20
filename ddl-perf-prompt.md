@@ -61,12 +61,12 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 15): At ~36.5k objects (optimized build, Docker
-CockroachDB), DDL latency is CREATE TABLE median ~134ms, catalog_transact avg
-97.7ms. That's down from 444ms at the Session 6 baseline (~70% cumulative
-improvement, or ~75% accounting for ~30-40ms Docker CockroachDB overhead).
+Current status (after Session 16): At ~36.5k objects (optimized build, Docker
+CockroachDB), DDL latency is CREATE TABLE median ~127ms, catalog_transact avg
+90.2ms. That's down from 444ms at the Session 6 baseline (~71% cumulative
+improvement, or ~76% accounting for ~30-40ms Docker CockroachDB overhead).
 
-Completed optimizations (Sessions 7-9, 11, 13, 15):
+Completed optimizations (Sessions 7-9, 11, 13, 15-16):
 - Cached Snapshot in PersistHandle (Session 7)
 - Lightweight allocate_id bypassing full Transaction (Session 8)
 - Persistent CatalogState with imbl::OrdMap + Arc (Session 9) — eliminated the
@@ -80,6 +80,9 @@ Completed optimizations (Sessions 7-9, 11, 13, 15):
 - BTreeMap snapshot trace (Session 15) — replaced Vec<(T, Timestamp, Diff)> with
   BTreeMap<T, Diff>, eliminating the O(n) consolidation entirely. Consolidation
   was 15% of total CPU (~31ms) in Session 14 profiling. Now O(m log n) per commit.
+- Lazy validate_resource_limits counting (Session 16) — guard each user_*().count()
+  call with a check on whether the corresponding delta is positive. For CREATE TABLE,
+  skips ~10 unnecessary O(n) catalog scans. Was 7.8% of total CPU in Session 14.
 
 Completed diagnostics (Sessions 10, 12, 13, 14):
 - Profiled post-Session 9 optimized build at ~10k objects (Session 10)
@@ -96,14 +99,7 @@ at `/usr/lib/linux-tools/6.8.0-100-generic/perf` after setting
 `perf_event_paranoid` to 1. Use `rustfilt` for symbol demangling.
 
 Immediate next steps (ranked by estimated impact from Session 14 profiling,
-with consolidation now eliminated):
-
-- **Cache validate_resource_limits counts (~7.8% of total, ~16ms).** This
-  function calls 7+ `user_*()` methods (user_tables, user_sources, etc.), each
-  iterating ALL entries in the imbl::OrdMap with `is_*` type checks. Combined
-  `is_*` self-time is ~4.5%. Maintaining a `ResourceCounts` struct in
-  CatalogState, updated incrementally during catalog transactions, would
-  eliminate these scans entirely.
+with consolidation and validate_resource_limits now optimized):
 
 - **Arc-wrap Snapshot BTreeMaps (~5.7% of total, ~12ms).** The durable catalog's
   `Snapshot` (21 BTreeMaps) is fully cloned for each transaction. Wrapping in
