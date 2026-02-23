@@ -14,7 +14,8 @@ something isn't right --- true flexibility in version management.
 
 We currently have a brief window (10-30 seconds) where an environment is
 unreachable during upgrades (see Context for details). This document proposes
-the changes required to eliminate that unreachability.
+the changes required to eliminate that unreachability. These changes also form
+the basis for high availability and physical isolation.
 
 > [!NOTE]
 > Materialize already has a zero-downtime upgrade procedure (see Context). This
