@@ -57,7 +57,7 @@ use mz_sql_parser::ast::{
 };
 use mz_storage_types::sources::Timeline;
 use opentelemetry::trace::TraceContextExt;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{Instrument, debug_span, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -489,6 +489,18 @@ impl Coordinator {
                 Command::FrontendStatementLogging(event) => {
                     self.handle_frontend_statement_logging_event(event);
                 }
+                Command::RegisterConnectionCancelWatch { conn_id, tx } => {
+                    let rx = self
+                        .connection_cancel_watches
+                        .entry(conn_id)
+                        .or_insert_with(|| watch::channel(false))
+                        .1
+                        .clone();
+                    let _ = tx.send(rx);
+                }
+                Command::UnregisterConnectionCancelWatch { conn_id } => {
+                    self.connection_cancel_watches.remove(&conn_id);
+                }
                 Command::CreateInternalSubscribe {
                     df_desc,
                     cluster_id,
@@ -525,10 +537,8 @@ impl Coordinator {
                     write_ts,
                     tx,
                 } => {
-                    self.handle_attempt_timestamped_write(
-                        target_id, diffs, write_ts, tx,
-                    )
-                    .await;
+                    self.handle_attempt_timestamped_write(target_id, diffs, write_ts, tx)
+                        .await;
                 }
                 Command::DropInternalSubscribe { sink_id, tx } => {
                     self.drop_internal_subscribe(sink_id).await;
@@ -1800,7 +1810,7 @@ impl Coordinator {
         self.cancel_cluster_reconfigurations_for_conn(&conn_id)
             .await;
         self.cancel_pending_copy(&conn_id);
-        if let Some((tx, _rx)) = self.staged_cancellation.get_mut(&conn_id) {
+        if let Some((tx, _rx)) = self.connection_cancel_watches.get_mut(&conn_id) {
             let _ = tx.send(true);
         }
     }
