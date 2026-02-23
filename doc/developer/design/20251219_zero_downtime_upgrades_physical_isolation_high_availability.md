@@ -12,17 +12,17 @@ network routes when we're confident the new version is ready. This will enable
 us to roll out a new version, observe its behavior, and abandon the update if
 something isn't right --- true flexibility in version management.
 
-We currently have a brief window (10-30 seconds) where an environment is
-unreachable during upgrades (see Context for details). This document proposes
-the changes required to eliminate that unreachability. These changes also form
-the basis for high availability and physical isolation.
-
 > [!NOTE]
 > Materialize already has a zero-downtime upgrade procedure (see Context). This
 > document is about an additional effort to bring that closer to true zero
 > downtime. When we need to differentiate, we can call this "zero-downtime
 > upgrades v2", but throughout this document we will largely use the term
 > "zero-downtime upgrades".
+
+We currently have a brief window (10-30 seconds) where an environment is
+unreachable during upgrades (see Context for details). This document proposes
+the changes required to eliminate that unreachability. These changes also form
+the basis for high availability and physical isolation.
 
 ## Goals
 
@@ -160,7 +160,7 @@ The change from the current upgrade procedure would be this flow:
    catalog, **then halts and is restarted in read/write mode**
 5. Old `environmentd` notices the new version in the catalog but will stay
    running: it does not halt, and none of its cluster processes are reaped, it
-   can still serve queries 
+   can still serve queries
 6. New `environmentd` re-establishes connection to clusters, brings them out of
    read-only mode
 7. Cutover: once orchestration determines that the new-version `environmentd`
@@ -197,7 +197,6 @@ TODO: What's the latency incurred by us cutting over between `environmentd`s
 when everything is ready. That's how close to zero we will get with this
 approach.
 
-
 ### Get Builtin Tables Ready for Concurrent Writers
 
 There are two types of builtin tables:
@@ -222,6 +221,11 @@ for. We would need to introduce a continual process whereby currently live
 writers can reap data of stale writers. For example a new version would
 eventually want to clean out entries in `mz_sessions` that were written by
 previous versions.
+
+Another approach would be to introduce a self correcting loop that syncs
+catalog state (the desired state) to builtin tables. Similar to how we already
+have such loops at the core of the materialized views sink or for "differential
+sources" inside the storage controller.
 
 ### Get Builtin Sources Ready for Concurrent Writers
 
@@ -269,7 +273,7 @@ down on the old-version deployment to give the new version room to work.
 
 TODO: Figure out how big the impact of the above-mentioned squabbling would be.
 
-### Critical Persist Handles for Concurrent Environmentd Instances
+### Critical Persist Handles for Concurrent environmentd Instances
 
 `StorageCollections`, the component that is responsible for managing the
 critical since handles of storage collections, currently has a single critical
