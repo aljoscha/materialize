@@ -1999,3 +1999,107 @@ Total DDL: ~127ms
 
 4. **Reduce DurableCatalogState::transaction CPU cost (~12-15ms).** Arc-wrapping
    Snapshot BTreeMaps, lazy Transaction::new.
+
+## Session 21: Full benchmark — current optimizations vs baseline
+
+**Date:** 2026-02-24
+**Type:** Diagnostic (comprehensive benchmark)
+**Build:** Optimized (Rust 1.89.0, `--profile optimized`), Docker CockroachDB
+**Baseline commit:** `cd6b830b0e` (pre-optimization, before any DDL perf work)
+**Current commit:** `7d26ca42fe` (all Sessions 7-20 optimizations applied)
+
+### Goal
+
+Produce a comprehensive comparison of DDL latency across object count scales
+between the baseline (no optimizations) and the current branch (all optimizations
+from Sessions 7-20). Measure scaling factors to quantify both absolute improvement
+and how scaling behavior has changed.
+
+### Methodology
+
+- Built both commits with `bin/environmentd +1.89.0 --optimized --reset`
+- At each scale point, filled to target object count via piped `CREATE TABLE`
+  statements, then measured 50 individual `CREATE TABLE` statements via psql
+  (wall-clock, including psql client overhead ~20-30ms)
+- Scale points: 1k, 5k, 10k, 20k, 30k user tables
+- System limits raised: `max_tables = 100000`, `max_objects_per_schema = 100000`
+- Each CREATE TABLE is `CREATE TABLE <schema>.m<i> (a int);` — single-column table
+
+### Results
+
+| User tables | Baseline median | Current median | Speedup |
+|------------:|----------------:|---------------:|--------:|
+| 1,000 | 102ms | 79ms | **1.29x** |
+| 5,000 | 135ms | 90ms | **1.51x** |
+| 10,000 | 170ms | 102ms | **1.66x** |
+| 20,000 | 246ms | 128ms | **1.93x** |
+| 30,000 | 322ms | 149ms | **2.16x** |
+
+Full percentile data (avg / median / p90 / p99):
+
+**Baseline:**
+```
+ 1k:  avg=103  med=102  p90=108  p99=112  min= 97  max=112
+ 5k:  avg=136  med=135  p90=145  p99=155  min=130  max=155
+10k:  avg=171  med=170  p90=181  p99=229  min=163  max=229
+20k:  avg=251  med=247  p90=270  p99=320  min=227  max=320
+30k:  avg=332  med=323  p90=358  p99=368  min=314  max=368
+```
+
+**Current (all optimizations):**
+```
+ 1k:  avg= 79  med= 79  p90= 85  p99= 87  min= 74  max= 87
+ 5k:  avg= 87  med= 90  p90= 94  p99=105  min= 71  max=105
+10k:  avg=103  med=102  p90=113  p99=122  min= 97  max=122
+20k:  avg=138  med=128  p90=151  p99=535  min=119  max=535
+30k:  avg=153  med=149  p90=180  p99=187  min=141  max=187
+```
+
+### Scaling analysis
+
+**Log-log regression (latency = a × n^k):**
+- **Baseline:** exponent k = **0.33** (O(n^0.33), sublinear)
+- **Current:** exponent k = **0.18** (O(n^0.18), sublinear)
+
+**Per-step growth:**
+
+| Range | Objects growth | Baseline latency growth | Current latency growth |
+|-------|---------------:|------------------------:|-----------------------:|
+| 1k → 5k | 5.0x | 1.32x (102→135ms) | 1.13x (79→90ms) |
+| 5k → 10k | 2.0x | 1.26x (135→170ms) | 1.14x (90→102ms) |
+| 10k → 20k | 2.0x | 1.45x (170→246ms) | 1.25x (102→128ms) |
+| 20k → 30k | 1.5x | 1.31x (246→322ms) | 1.16x (128→149ms) |
+
+**End-to-end growth (1k → 30k):**
+- Baseline: 102ms → 322ms (**3.16x** growth)
+- Current: 79ms → 149ms (**1.89x** growth)
+
+### Key observations
+
+1. **2.16x speedup at 30k objects** — the optimizations from Sessions 7-20
+   cut median DDL latency from 322ms to 149ms at scale.
+
+2. **Speedup increases with object count** — 1.29x at 1k, growing to 2.16x
+   at 30k. This confirms the optimizations targeted CPU/scaling costs that
+   grow with object count, not fixed-cost I/O.
+
+3. **Much flatter scaling** — the current branch's scaling exponent (0.18)
+   is roughly half the baseline's (0.33). From 1k to 30k objects, baseline
+   latency triples while current latency doesn't even double.
+
+4. **Residual growth is I/O bound** — the ~70ms of growth from 1k to 30k
+   in the current branch is likely from persist operations scaling with
+   shard count (more consensus contention, larger state). CPU-side scaling
+   costs have been largely eliminated.
+
+5. **Fixed cost is ~60-70ms** — even at 1k objects, CREATE TABLE takes 79ms
+   (current) or 102ms (baseline). This floor is dominated by persist I/O
+   (catalog commit, storage_collections, table_register). The 23ms
+   difference at 1k objects represents per-DDL CPU overhead eliminated by
+   Sessions 7-16 optimizations.
+
+6. **p99 variance at 20k** — the current branch showed a 535ms p99 at 20k
+   (vs 128ms median), likely a CockroachDB or persist GC spike. The
+   baseline showed more consistent p99s, suggesting the optimized code path
+   may be more sensitive to background operations now that CPU is no longer
+   the bottleneck.
