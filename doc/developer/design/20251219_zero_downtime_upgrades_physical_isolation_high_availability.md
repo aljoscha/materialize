@@ -322,11 +322,33 @@ though.
 
 ### Work required for Physical Isolation
 
-WIP: sketch this?
+Physical isolation requires sharding the query/control workload across multiple
+`environmentd` instances, for example one per cluster or group of clusters, or
+one per database. On top of the shared foundation of concurrent catalog access
+and subscribing to changes, this requires:
+
+- **Workload routing:** A routing layer that directs client connections to the
+  correct `environmentd` instance based on the target cluster or workload. We
+  have the beginnings of this in `balancerd`.
+- **Distributed controllers:** Each instance runs its own sharded storage and
+  compute controllers for the clusters it owns.
 
 ### Work required for High Availability
 
-WIP: sketch this?
+High availability requires multiple `environmentd` instances of the same
+version running permanently, so that a failure of one instance does not cause
+downtime. On top of the shared foundation, this requires:
+
+- **Multi-controller clusterd:** The ability to connect multiple
+  `environmentd`, and therefore multiple controllers, to a given `clusterd` and
+  have them coordinate in "driving it around".
+- **Failure detection/coordination:** Health checking and liveness detection to
+  determine when an instance has failed or become unresponsive. A mechanism for
+  rerouting traffic from a failed instance to a healthy one.
+- **Handle cleanup for failed adapter instances:** When an adapter instance
+  fails, its critical persist handles must be retired by surviving instances.
+  The catalog-based handle tracking described in the Work Required section
+  provides the mechanism for this.
 
 ## Alternatives
 
