@@ -61,11 +61,11 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 20): At ~37.9k objects (optimized build, Docker
-CockroachDB), DDL latency is CREATE TABLE ~127ms (individual psql median),
-catalog_transact avg ~90ms, apply_catalog_implications avg ~42ms. That's down
-from 444ms at the Session 6 baseline. CPU work per DDL is now ~0.6ms — DDL is
-I/O bound.
+Current status (after Session 22): At ~100k objects (optimized build, Docker
+CockroachDB), DDL latency is CREATE TABLE ~264ms median (vs 1091ms baseline =
+4.1x speedup). catalog_transact ~235ms (CRDB writes dominate), coord_queue_busy
+only 29ms. At ~37.9k objects it was ~127ms. catalog_allocate_id is 3.5ms (was
+130ms baseline = 36.7x from upgrade_version skip). DDL is I/O bound.
 
 **Important: DDL is now I/O bound, not CPU bound.** Use Prometheus wall-clock
 histograms for profiling, not perf/flamegraphs. **Always verify proportions

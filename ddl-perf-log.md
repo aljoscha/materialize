@@ -2103,3 +2103,99 @@ Full percentile data (avg / median / p90 / p99):
    baseline showed more consistent p99s, suggesting the optimized code path
    may be more sensitive to background operations now that CPU is no longer
    the bottleneck.
+
+## Session 22 — Baseline vs Optimized at 100k tables
+
+**Goal:** Compare DDL performance between baseline (`main`) and optimized
+(`spike-ddl-perf`) at extreme scale: 100,020 user tables (~101k total objects).
+
+### Setup
+
+- Built both versions with `--profile=optimized` (release, lto=off, debug=1)
+  because `--release` hits a rustc 1.93.1 compiler bug (E0391 cycle with thin LTO)
+- Binaries saved to /tmp/environmentd-{optimized,baseline}, /tmp/clusterd-{optimized,baseline}
+- CockroachDB via Docker (cockroachdb/cockroach:v23.1.11)
+- Created 100k tables using optimized version (took ~4.8 hours, 99k tables at
+  ~5.7-18.8 tables/s with degradation over time)
+- Measured each version by running 20 sequential CREATE TABLE with psql `\timing`
+- Prometheus metrics captured before/after each batch
+
+### Results — psql end-to-end latency (ms)
+
+```
+                     Baseline    Optimized    Speedup
+  Mean:              1090.9ms      298.1ms      3.7x
+  Median:            1090.4ms      263.7ms      4.1x
+  Min:               1024.1ms      248.2ms      4.1x
+  Max:               1221.7ms      390.1ms      3.1x
+```
+
+### Results — Prometheus metric breakdown (per-DDL average)
+
+```
+                                    Baseline    Optimized    Speedup   Savings
+  coord_queue_busy (coord total)    219.3ms      28.7ms       7.6x    190.6ms
+  catalog_allocate_id               130.0ms       3.5ms      36.7x    126.5ms
+  append_table_duration             130.0ms      39.2ms       3.3x     90.8ms
+  group_commit_table_advancement     95.1ms         --          --       --
+  apply_catalog_implications         68.5ms      54.9ms       1.2x     13.6ms
+  group_commit_confirm_leadership     3.1ms       1.9ms       1.6x      1.2ms
+```
+
+### Time accounting
+
+**Baseline (1091ms total):**
+- catalog_transact (CRDB writes): ~872ms (inferred: total - coord_queue_busy)
+- coord_queue_busy: 219ms
+  - catalog_allocate_id: 130ms (upgrade_version CAS for 100k shards)
+  - group_commit_table_advancement: 95ms
+  - apply_catalog_implications: 69ms
+  - confirm_leadership: 3ms
+
+**Optimized (264ms median):**
+- catalog_transact (CRDB writes): ~235ms (inferred: total - coord_queue_busy)
+- coord_queue_busy: 29ms
+  - apply_catalog_implications: 55ms (includes async parts)
+  - append_table_duration: 39ms
+  - catalog_allocate_id: 4ms (skip already-current shards)
+  - confirm_leadership: 2ms
+
+### Scaling from 37.9k to 100k objects
+
+```
+                       37.9k objects    100k objects    Growth
+  Optimized median:       127ms            264ms         2.1x
+  Baseline median:         --             1091ms          --
+```
+
+The optimized version's latency roughly doubles from 37.9k to 100k objects.
+The primary growth driver is catalog_transact (CRDB writes), which scales with
+catalog size. Coordinator-side time (coord_queue_busy) remains under 29ms even
+at 100k.
+
+### Key findings
+
+1. **3.7x mean speedup, 4.1x median speedup at 100k objects.** The gap is much
+   larger than at 30k (2.16x) because our optimizations eliminate costs that
+   scale with object count.
+
+2. **catalog_allocate_id: 36.7x speedup (130ms → 3.5ms).** The upgrade_version
+   CAS skip (Session 20) is the single biggest win at 100k. Without it, every
+   DDL would CAS-update version on all ~100k shards.
+
+3. **catalog_transact (CRDB writes) dominates both versions.** At 100k objects,
+   ~872ms of baseline's 1091ms is CRDB writes. The optimized version reduced
+   this to ~235ms — likely from Sessions 7-9 optimizations (cached snapshots,
+   lightweight allocate_id, persistent CatalogState).
+
+4. **group_commit_table_advancement: eliminated.** The Session 11 optimization
+   removed the O(n) table advancement loop. On baseline at 100k, this costs
+   95ms per DDL.
+
+5. **Coordinator-side processing is now negligible.** At 100k objects, the
+   optimized coord_queue_busy is only 29ms vs 219ms baseline (7.6x improvement).
+   The bottleneck is firmly in CRDB catalog writes.
+
+6. **Table creation rate degradation during bulk loading:** Rate dropped from
+   18.8/s at 2k tables to 5.7/s at 100k tables. Average 173.6ms per table
+   over the full run. This reflects the progressive scaling of catalog_transact.
