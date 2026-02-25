@@ -266,7 +266,10 @@ impl Coordinator {
             ActiveComputeSink::Subscribe(active_subscribe) => {
                 // Skip builtin table update for internal subscribes
                 if active_subscribe.internal {
-                    Box::pin(std::future::ready(())) as BuiltinTableAppendNotify
+                    #[allow(clippy::as_conversions)]
+                    {
+                        Box::pin(std::future::ready(())) as BuiltinTableAppendNotify
+                    }
                 } else {
                     let update = self.catalog().state().pack_subscribe_update(
                         id,

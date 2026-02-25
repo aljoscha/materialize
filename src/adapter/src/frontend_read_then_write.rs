@@ -249,7 +249,7 @@ impl PeekClient {
 
         // Optimize MIR
         let (optimizer, global_mir_plan) =
-            self.optimize_mir_read_then_write(&catalog, &plan, cluster_id)?;
+            self.optimize_mir_read_then_write(catalog, &plan, cluster_id)?;
 
         // Determine timestamp and acquire read holds
         let oracle_read_ts = self.oracle_read_ts(&timeline).await;
@@ -301,9 +301,7 @@ impl PeekClient {
         let statement_timeout = *session.vars().statement_timeout();
 
         // Acquire OCC semaphore permit to limit concurrent write operations
-        let _permit = self
-            .occ_write_semaphore
-            .clone()
+        let _permit = Arc::clone(&self.occ_write_semaphore)
             .acquire_owned()
             .await
             .expect("semaphore closed");
@@ -465,7 +463,7 @@ impl PeekClient {
             .override_from(&catalog.get_cluster(cluster_id).config.features());
 
         let mut optimizer = optimize::subscribe::Optimizer::new(
-            catalog.clone(),
+            Arc::<Catalog>::clone(catalog),
             compute_instance,
             view_id,
             sink_id,
