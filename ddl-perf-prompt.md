@@ -61,16 +61,16 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 23): At ~100k objects (optimized build, Docker
-CockroachDB), single-statement DDL latency is CREATE TABLE ~264ms median (vs
-1091ms baseline = 4.1x speedup). catalog_transact ~235ms (CRDB writes dominate),
-coord_queue_busy only 29ms. DDL is I/O bound for single statements.
+Current status (after Session 24): O(n²) replay in DDL transactions is fixed.
+Per-table cost for CREATE TABLE FROM SOURCE is now constant ~98-105ms across all
+batch sizes (was 104ms at batch=10 growing to 328ms at batch=500). Single-statement
+DDL latency at ~100k objects is CREATE TABLE ~264ms median.
 
-**Multi-statement DDL transactions have O(n²) scaling** (Session 23): CREATE TABLE
-FROM SOURCE in a transaction shows per-table cost tripling from 104ms (batch=10) to
-328ms (batch=500). Root cause: `catalog_transact_with_ddl_transaction` replays ALL
-previous operations for every new statement (ddl.rs:264-270). For N statements,
-total ops processed = O(N²). At batch=500, this is 125k op processings.
+**Async purification is the dominant per-statement cost** (Session 24): Each CREATE
+TABLE FROM SOURCE spends ~69ms (69% of per-table cost) in async purification
+(`src/sql/src/pure.rs:1710`). This opens a new PostgreSQL connection, re-queries
+the full publication metadata for ALL upstream tables, and checks privileges — all
+per-statement with no reuse or caching.
 
 **Important: DDL is now I/O bound, not CPU bound.** Use Prometheus wall-clock
 histograms for profiling, not perf/flamegraphs. **Always verify proportions
@@ -86,7 +86,7 @@ optimized).
 - `open_data_handles`: ~0.7ms (2%) — write handle open
 - `sequential_loop`: ~0.0ms (0%) — CPU work
 
-Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18, 20):
+Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18, 20, 24):
 - Cached Snapshot in PersistHandle (Session 7)
 - Lightweight allocate_id bypassing full Transaction (Session 8)
 - Persistent CatalogState with imbl::OrdMap + Arc (Session 9) — eliminated the
@@ -112,8 +112,14 @@ Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18, 20):
   newly-created shards and existing shards after restart without version change,
   the version is already current. Skip the consensus CAS write entirely. Reduced
   storage_collections from ~24ms to ~21ms (~3ms savings per DDL).
+- Incremental dry-run for DDL transactions (Session 24) — eliminated O(n²)
+  operation replay. Instead of replaying all previous ops for each new statement,
+  processes only new ops against accumulated CatalogState. Per-table cost now
+  constant ~98-105ms across batch sizes (was 328ms at batch=500). Added
+  `transact_incremental_dry_run` to Catalog, `next_oid` tracking to
+  TransactionOps::DDL, `get/set_next_oid` on Transaction.
 
-Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19, 20, 23):
+Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19, 20, 23, 24):
 - Profiled post-Session 9 optimized build at ~10k objects (Session 10)
 - Profiled post-Session 11 optimized build at ~28k objects (Session 12)
 - Profiled post-Session 13 optimized build at ~36.5k objects (Session 14)
@@ -131,9 +137,11 @@ Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19, 20, 23):
 - Session 23 benchmarked CREATE TABLE FROM SOURCE in DDL transactions (optimized
   build, PostgreSQL source with 3000 upstream tables). Found O(n²) scaling:
   per-table cost triples from batch=10 (104ms) to batch=500 (328ms). Root cause:
-  ddl.rs:264-270 replays all previous ops for each new statement. 82% of time is
-  per-statement overhead (purified_statement_ready 40%, catalog_transact 32%),
-  only 4% is per-transaction (COMMIT + side effects).
+  ddl.rs:264-270 replays all previous ops for each new statement.
+- Session 24 fixed O(n²) replay, profiled remaining costs. Per-table cost now
+  constant ~98-105ms. Async purification dominates at ~69ms/table (69%): each
+  statement opens a new PG connection, re-queries full publication metadata for
+  all upstream tables, checks privileges — no reuse or caching.
 - Session 20 measured: storage_collections=21ms (was 24ms), catalog_transact=90ms
   (was 95ms), CREATE TABLE median=127ms (was 136ms). upgrade_version CAS skip
   saves ~3ms per DDL.
@@ -157,17 +165,30 @@ Profiling notes:
 
 Immediate next steps:
 
-- **Eliminate O(n²) operation replay in DDL transactions (~huge savings for
-  multi-statement DDL).** `catalog_transact_with_ddl_transaction` (ddl.rs:264-270)
-  replays ALL previous ops for every new statement. For N statements, total work
-  is O(N²). At batch=500 this causes per-table cost to triple vs batch=10.
-  Fix approach: instead of replaying all ops, maintain the accumulated catalog
-  state across statements and only process the new op against it. The `new_state`
-  returned from TransactionDryRun (ddl.rs:274) already carries forward state —
-  use it as the starting point for the next statement instead of replaying from
-  scratch. Additional O(n²) sites: update accumulation in transact.rs:645-669,
-  expression cache cloning per-op (transact.rs:656), side-effect extraction loop
-  (ddl.rs:330-442), validate_resource_limits (ddl.rs:444).
+- **Reduce async purification cost for CREATE TABLE FROM SOURCE (~69ms/table →
+  target ~5-10ms/table).** Each statement in a DDL transaction independently runs
+  `purify_create_table_from_source` (src/sql/src/pure.rs:1710) which:
+  1. Opens a NEW PostgreSQL connection via `pg_connection.validate()` (~12ms) —
+     establishes TCP, queries wal_level, max_wal_senders, replication_slots.
+  2. Calls `publication_info()` (~35ms) — 3 queries to pg_catalog fetching columns,
+     keys, and constraints for ALL tables in the publication (all 3000 tables),
+     even though only 1 table is needed.
+  3. Runs privilege/RLS/replica-identity checks (~22ms) — has_schema_privilege,
+     has_table_privilege, validate_no_rls_policies per table.
+  Fix approaches (can be combined):
+  - **Connection reuse**: Cache the validated PG client across statements in the
+    same DDL transaction. The connection is already opened for the first statement;
+    subsequent statements in the same transaction could reuse it. (~12ms saved)
+  - **Publication metadata caching**: Cache `publication_info()` results in the
+    session or coordinator. All statements in the same transaction query the same
+    publication; results don't change between statements. (~35ms saved)
+  - **Batch privilege checks**: Privilege/RLS/replica checks could be batched for
+    all tables at once instead of per-table. Or cached after first check. (~22ms)
+  - **Narrow publication_info query**: Instead of fetching metadata for all 3000
+    tables, filter the query to only the requested table's OID. This would make
+    the PG queries themselves faster and reduce data transfer.
+  The purification runs off the coordinator thread (spawned async), so changes
+  would be in `src/sql/src/pure.rs` and `src/postgres-util/src/schemas.rs`.
 
 Previously identified next steps (ranked by Session 20 wall-clock profiling):
 

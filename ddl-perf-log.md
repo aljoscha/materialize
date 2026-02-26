@@ -2278,3 +2278,94 @@ Additional O(n²) sources identified:
 - `catalog/transact.rs:656`: Expression cache cloned per-op.
 - `ddl.rs:330-442`: Side-effect extraction loop iterates all accumulated ops.
 - `ddl.rs:444`: validate_resource_limits iterates all accumulated ops.
+
+## Session 24 — Eliminate O(n²) Replay + Profile Remaining Per-Table Costs
+
+**Goal:** Fix the O(n²) operation replay in DDL transactions identified in Session
+23, then profile remaining per-table costs to identify the next bottleneck.
+
+### Fix: Incremental Dry-Run for DDL Transactions
+
+Replaced the O(n²) replay approach in `catalog_transact_with_ddl_transaction` with
+an incremental dry-run method. Instead of replaying ALL previous ops + new ops
+through the full `catalog_transact` pipeline for every new statement, the fix:
+
+1. Added `next_oid: u64` to `TransactionOps::DDL` to track OID allocator position
+   across dry runs.
+2. Added `get_next_oid()` / `set_next_oid()` on `Transaction` for OID counter
+   management across fresh storage transactions.
+3. Added `Catalog::transact_incremental_dry_run()` — opens a fresh storage
+   transaction, advances the OID allocator past previously-allocated OIDs, runs
+   `transact_inner` with ONLY the new ops against the accumulated `CatalogState`
+   from the previous dry run, then drops the transaction without committing.
+4. Rewrote `catalog_transact_with_ddl_transaction` to use the incremental method.
+   Resource limits validation still checks all accumulated ops (cheap O(N) counting).
+
+Files changed: `session.rs`, `transaction.rs`, `transact.rs`, `ddl.rs`,
+`command_handler.rs`, `sequencer/inner.rs`.
+
+### Benchmark Results (optimized build, 3000 upstream PG tables)
+
+| batch_size | Before (avg ms/tbl) | After (avg ms/tbl) | Improvement |
+|-----------|---------------------|---------------------|-------------|
+| 1 | 166 | 221 | -33% (fixed overhead dominates) |
+| 5 | 111 | 133 | -20% (overhead amortizing) |
+| 10 | 104 | 107 | ~same (baseline) |
+| 25 | 105 | 102 | +3% |
+| 50 | 115 | 99 | +14% |
+| 100 | 127 | 98 | +23% |
+| 200 | 164 | 98 | +40% |
+| 300 | 217 | 100 | +54% |
+| 500 | 328 | 105 | +68% |
+
+Per-table cost is now roughly constant (~98-105ms) across all batch sizes. The
+O(n²) scaling is completely eliminated.
+
+Small regression at batch=1 (221ms vs 166ms) is expected — the incremental path
+opens a separate storage transaction for each dry run. This constant overhead is
+trivially amortized at batch >= 10.
+
+### Profiling: Where the ~100ms Per Table Is Spent
+
+Prometheus profiling of a 50-table batch (5043ms total, 100ms/table):
+
+**Per-statement costs (run 50×):**
+
+| Component | Total(ms) | Avg(ms) | % of wall |
+|---|---|---|---|
+| async purification (off-thread) | ~3444 | ~68.9 | 68% |
+| purified_statement_ready (coord thread) | 933 | 18.7 | 19% |
+| catalog_transact_with_ddl_transaction | 658 | 13.2 | 13% |
+| catalog_allocate_id | 187 | 3.7 | 4% |
+| planning + sequencing overhead | 88 | 1.8 | 2% |
+| command-execute (parse, resolve, spawn) | 249 | 4.8 | 5% |
+
+**Per-transaction costs (run 1× at COMMIT):**
+
+| Component | Total(ms) | Per-tbl (÷50) |
+|---|---|---|
+| catalog_transact_with_side_effects | 237 | 4.7 |
+| coord_queue_busy | 179 | 3.6 |
+| apply_catalog_implications | 147 | 2.9 |
+| create_table_collections | 136 | 2.7 |
+| append_table_duration | 102 | 2.0 |
+
+### Root Cause: Async Purification Dominates (~69ms/table, 69%)
+
+Each CREATE TABLE FROM SOURCE statement triggers a full async purification
+(`src/sql/src/pure.rs:1710`, `purify_create_table_from_source`):
+
+1. **New PostgreSQL connection** (~12ms) — `pg_connection.validate()` (line 1809)
+   establishes a fresh TCP connection, queries `get_wal_level()`,
+   `get_max_wal_senders()`, `available_replication_slots()`.
+
+2. **Full publication metadata fetch** (~35ms) — `publication_info()` queries
+   pg_catalog for ALL tables in the publication (all 3000 tables' columns,
+   keys, constraints) via 3 SQL queries, every single statement.
+
+3. **Per-table privilege/RLS/replica-identity checks** (~22ms) —
+   `has_schema_privilege()`, `has_table_privilege()`, `validate_no_rls_policies()`,
+   replica identity checks.
+
+This happens for EVERY statement in the transaction — no connection reuse, no
+metadata caching, no batching of privilege checks.
