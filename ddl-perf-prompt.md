@@ -61,11 +61,16 @@ resolved one of them, please update this prompt so that we don't consider them
 anymore in our next sessions. Update the prompt in a separate git commit with a
 good description.
 
-Current status (after Session 22): At ~100k objects (optimized build, Docker
-CockroachDB), DDL latency is CREATE TABLE ~264ms median (vs 1091ms baseline =
-4.1x speedup). catalog_transact ~235ms (CRDB writes dominate), coord_queue_busy
-only 29ms. At ~37.9k objects it was ~127ms. catalog_allocate_id is 3.5ms (was
-130ms baseline = 36.7x from upgrade_version skip). DDL is I/O bound.
+Current status (after Session 23): At ~100k objects (optimized build, Docker
+CockroachDB), single-statement DDL latency is CREATE TABLE ~264ms median (vs
+1091ms baseline = 4.1x speedup). catalog_transact ~235ms (CRDB writes dominate),
+coord_queue_busy only 29ms. DDL is I/O bound for single statements.
+
+**Multi-statement DDL transactions have O(n²) scaling** (Session 23): CREATE TABLE
+FROM SOURCE in a transaction shows per-table cost tripling from 104ms (batch=10) to
+328ms (batch=500). Root cause: `catalog_transact_with_ddl_transaction` replays ALL
+previous operations for every new statement (ddl.rs:264-270). For N statements,
+total ops processed = O(N²). At batch=500, this is 125k op processings.
 
 **Important: DDL is now I/O bound, not CPU bound.** Use Prometheus wall-clock
 histograms for profiling, not perf/flamegraphs. **Always verify proportions
@@ -108,7 +113,7 @@ Completed optimizations (Sessions 7-9, 11, 13, 15-16, 18, 20):
   the version is already current. Skip the consensus CAS write entirely. Reduced
   storage_collections from ~24ms to ~21ms (~3ms savings per DDL).
 
-Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19, 20):
+Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19, 20, 23):
 - Profiled post-Session 9 optimized build at ~10k objects (Session 10)
 - Profiled post-Session 11 optimized build at ~28k objects (Session 12)
 - Profiled post-Session 13 optimized build at ~36.5k objects (Session 14)
@@ -123,6 +128,12 @@ Completed diagnostics (Sessions 10, 12, 13, 14, 17, 18, 19, 20):
   open_data_handles=0.7ms (2%). Key: debug build proportions are misleading
   (table_register appeared as 95% in debug but is only 20% in optimized).
 - Full cost breakdowns in ddl-perf-log.md
+- Session 23 benchmarked CREATE TABLE FROM SOURCE in DDL transactions (optimized
+  build, PostgreSQL source with 3000 upstream tables). Found O(n²) scaling:
+  per-table cost triples from batch=10 (104ms) to batch=500 (328ms). Root cause:
+  ddl.rs:264-270 replays all previous ops for each new statement. 82% of time is
+  per-statement overhead (purified_statement_ready 40%, catalog_transact 32%),
+  only 4% is per-transaction (COMMIT + side effects).
 - Session 20 measured: storage_collections=21ms (was 24ms), catalog_transact=90ms
   (was 95ms), CREATE TABLE median=127ms (was 136ms). upgrade_version CAS skip
   saves ~3ms per DDL.
@@ -144,7 +155,21 @@ Profiling notes:
   per-DDL averages. Use `curl -s http://localhost:6878/metrics > /tmp/before.txt`
   then compare after.
 
-Immediate next steps (ranked by Session 20 optimized-build wall-clock profiling):
+Immediate next steps:
+
+- **Eliminate O(n²) operation replay in DDL transactions (~huge savings for
+  multi-statement DDL).** `catalog_transact_with_ddl_transaction` (ddl.rs:264-270)
+  replays ALL previous ops for every new statement. For N statements, total work
+  is O(N²). At batch=500 this causes per-table cost to triple vs batch=10.
+  Fix approach: instead of replaying all ops, maintain the accumulated catalog
+  state across statements and only process the new op against it. The `new_state`
+  returned from TransactionDryRun (ddl.rs:274) already carries forward state —
+  use it as the starting point for the next statement instead of replaying from
+  scratch. Additional O(n²) sites: update accumulation in transact.rs:645-669,
+  expression cache cloning per-op (transact.rs:656), side-effect extraction loop
+  (ddl.rs:330-442), validate_resource_limits (ddl.rs:444).
+
+Previously identified next steps (ranked by Session 20 wall-clock profiling):
 
 - **Overlap storage_collections with open_data_handles + table_register
   (~8ms savings).** Currently sequential: storage_collections (~21ms) must

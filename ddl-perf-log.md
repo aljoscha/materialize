@@ -2199,3 +2199,82 @@ at 100k.
 6. **Table creation rate degradation during bulk loading:** Rate dropped from
    18.8/s at 2k tables to 5.7/s at 100k tables. Average 173.6ms per table
    over the full run. This reflects the progressive scaling of catalog_transact.
+
+## Session 23 — CREATE TABLE FROM SOURCE Transaction Benchmarking
+
+**Goal:** Benchmark multiple CREATE TABLE FROM SOURCE statements in a single DDL
+transaction to understand per-transaction scaling behavior.
+
+**Setup:** PostgreSQL (Docker) with 3000 tables, logical replication publication.
+Materialize (optimized build, local persist, Docker CockroachDB). PostgreSQL
+connection + source created, all 3000 upstream table references visible.
+
+**Benchmark: Increasing batch sizes of CREATE TABLE FROM SOURCE in one transaction**
+
+Each batch uses non-overlapping upstream references to avoid cleanup issues.
+3 repetitions per batch size.
+
+| batch_size | avg total_ms | avg per_table_ms | per-stmt trend |
+|-----------|-------------|-----------------|----------------|
+| 1 | 166 | 166 | baseline |
+| 5 | 557 | 111 | -33% |
+| 10 | 1,048 | 104 | -37% |
+| 25 | 2,631 | 105 | -37% |
+| 50 | 5,737 | 115 | -31% |
+| 100 | 12,725 | 127 | -23% |
+| 200 | 32,948 | 164 | -1% |
+| 300 | 65,339 | 217 | +31% |
+| 500 | 164,191 | 328 | +98% |
+
+Per-table cost nearly triples from batch=10 (104ms) to batch=500 (328ms).
+Superlinear scaling: not just fixed per-statement overhead, but cost grows with
+transaction size.
+
+Note: per-table cost at batch=1 (166ms) includes fixed per-transaction overhead
+(COMMIT + apply_catalog_implications ≈ 90+183=273ms amortized). At batch≥10 the
+overhead is amortized away and we see the true per-statement cost of ~105ms.
+
+**Prometheus profiling: 50-table batch (7,643ms total)**
+
+| Component | Total(ms) | Count | Avg(ms) | % |
+|---|---|---|---|---|
+| purified_statement_ready (planning+purify) | 3,094 | 50 | 61.9 | 40.5% |
+| catalog_transact_with_ddl_transaction | 2,467 | 50 | 49.3 | 32.3% |
+| &nbsp;&nbsp;of which: catalog_allocate_id | 485 | 50 | 9.7 | 6.3% |
+| &nbsp;&nbsp;of which: catalog_transact (rest) | 1,982 | 50 | 39.6 | 25.9% |
+| command-execute | 733 | 52 | 14.1 | 9.6% |
+| catalog_transact_with_side_effects (COMMIT) | 183 | 1 | 183.0 | 2.4% |
+| apply_catalog_implications (post-commit) | 90 | 1 | 90.0 | 1.2% |
+| group_commit_initiate | 50 | 9 | 5.6 | 0.7% |
+| unaccounted (queue wait, pgwire) | 1,026 | - | - | 13.4% |
+
+**Key finding: 82% of time is per-statement overhead, only 4% is per-transaction.**
+
+The DDL transaction batches the catalog COMMIT (183ms) and side effects (90ms)
+once, but planning and catalog dry-run run individually for every statement.
+
+**Root cause: O(n²) operation replay in DDL transactions**
+
+`src/adapter/src/coord/ddl.rs` lines 264-270:
+```rust
+let mut all_ops = Vec::with_capacity(ops.len() + txn_ops.len() + 1);
+all_ops.extend(txn_ops.iter().cloned());  // Clone ALL previous ops
+all_ops.extend(ops.clone());               // Clone new op
+all_ops.push(Op::TransactionDryRun);
+let result = self.catalog_transact(Some(ctx.session()), all_ops).await;
+```
+
+Every statement in a DDL transaction replays ALL previous operations from scratch.
+Statement N processes (N-1) accumulated ops + 1 new op + TransactionDryRun through
+the full catalog_transact pipeline (including validate_resource_limits, transact_op
+loop, and state cloning). Total ops processed = 1+2+...+N = O(N²).
+
+For batch=500: average replay = 250 ops → 3× the per-statement cost vs batch=10
+where average replay = 5.5 ops.
+
+Additional O(n²) sources identified:
+- `catalog/transact.rs:645-669`: Update accumulation — each op's updates are applied
+  during the loop, then ALL accumulated updates are re-applied at the end.
+- `catalog/transact.rs:656`: Expression cache cloned per-op.
+- `ddl.rs:330-442`: Side-effect extraction loop iterates all accumulated ops.
+- `ddl.rs:444`: validate_resource_limits iterates all accumulated ops.
