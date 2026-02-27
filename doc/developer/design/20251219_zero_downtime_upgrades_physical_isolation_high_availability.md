@@ -66,7 +66,9 @@ When a new version first establishes itself in the durable catalog by writing
 down its version and deploy generation, it sometimes has to modify the schema
 or contents of parts of the catalog. We call these _catalog migrations_. These
 are a large reason for why currently we can't have an older version read or
-interact with the catalog once a new version has "touched" it.
+interact with the catalog once a new version has "touched" it. The proposal
+below addresses this by having the new version defer catalog migrations until
+the old version is gone.
 
 ### High Availability
 
@@ -111,33 +113,42 @@ instances that can read/write shared state concurrently.
 
 ## Proposal
 
-The major work required for zero-downtime upgrades, and shared across high
-availability and physical isolation, is enabling multiple actors to interact
-with and modify the catalog. Multiple instances of `environmentd` need to be
-able to:
+The core idea is this: **both the old and new versions of `environmentd` run in
+full read-write mode simultaneously.** The new version constrains itself to
+only write durable data that the old version can understand, so both versions
+co-exist and operate on the same catalog concurrently. Only after orchestration
+cuts over network routes, reaps the old version's processes, and signals the
+new version does the catalog get upgraded. At that point, the new version can
+start writing data incompatible with older versions and activate features that
+depend on the newer catalog format.
 
-- subscribe to catalog changes and apply their implications
-- collaborate in writing down changes to the catalog
+This requires two foundational capabilities, shared across high availability
+and physical isolation:
 
-The foundational ideas behind this are explained in [platform v2
-architecture](20231127_pv2_uci_logical_architecture.md), and there is ongoing
-work towards allowing the adapter to subscribe to catalog changes and apply
-their implications.
+1. Multiple instances of `environmentd` need to be able to subscribe to catalog
+   changes and collaborate in writing down changes to the catalog. The
+   foundational ideas behind this are explained in [platform v2
+   architecture](20231127_pv2_uci_logical_architecture.md), and there is
+   ongoing work towards allowing the adapter to subscribe to catalog changes
+   and apply their implications.
 
-Beyond the ability for multiple actors to work with the durable catalog, for
-zero-downtime upgrades we need the ability for _multiple versions_ to interact
-with the catalog. This is currently not possible because of catalog migrations
-and because a new version fences out old versions.
+2. Multiple _versions_ need to be able to interact with the catalog. This is
+   currently not possible because catalog migrations make the catalog
+   unreadable to older versions, and because a new version fences out old
+   versions. The solution is to decouple the catalog version from the code
+   version: a new-version `environmentd` can run while the catalog format and
+   data are still at an older version, with new features and schema changes
+   gated on the catalog version having been upgraded (see [Catalog Version
+   Gating](#catalog-version-gating) below).
 
 A jumping-off point for this work is the recent work that allows multiple
-versions to work with persist shards. Here we already have forward and backward
-compatibility by tracking what versions are still "touching" a shard and
-deferring the equivalent of migrations to a moment when no older versions are
-touching the shard. For Materialize as a whole, this means that changes or new
-features need to be gated by what version the catalog currently has, and that
-catalog version can be different from the version of Materialize that is
-currently running. We would then have gating both by regular feature flags and
-by catalog version.
+versions to work with persist shards. There, we already have forward and
+backward compatibility by tracking what versions are still "touching" a shard
+and deferring migrations to a moment when no older versions are touching the
+shard. We apply the same principle to the catalog: changes and new features are
+gated on the catalog version, which can differ from the code version of any
+running `environmentd`. We would then have gating both by regular feature flags
+and by catalog version.
 
 The proposed upgrade flow requires a number of changes across different
 components. I will sketch these below, but each of the sub-sections will
@@ -155,25 +166,52 @@ The change from the current upgrade procedure would be this flow:
    processes at new version, hydrates dataflows, everything is kept in
    read-only mode
 3. Signals readiness: once clusters report hydrated and caught up
-4. Orchestrator triggers promotion: new `environmentd` opens catalog in
-   read/write mode, which writes its `deploy_generation`/`version` to the
-   catalog, **then halts and is restarted in read/write mode**
-5. Old `environmentd` notices the new version in the catalog but will stay
-   running: it does not halt, and none of its cluster processes are reaped, it
-   can still serve queries
+4. Orchestrator triggers promotion: new `environmentd` enters read/write mode,
+   writes its `deploy_generation`/`version` to the catalog. The new version
+   constrains itself to only write catalog data that is backward-compatible
+   with the old version.
+5. Old `environmentd` notices the new version in the catalog but **continues in
+   full read-write mode**: it does not halt, and none of its cluster processes
+   are reaped, it continues to serve DQL, DML, and DDL
 6. New `environmentd` re-establishes connection to clusters, brings them out of
-   read-only mode
+   read-only mode. Both versions now serve traffic in full read-write mode.
 7. Cutover: once orchestration determines that the new-version `environmentd`
-   is ready to serve queries, we update network routes
-8. Eventually: resources of old-version deployment are reaped
+   is ready to serve queries, network routes are updated to point at the new
+   version
+8. Orchestration reaps old-version deployment processes
+9. Catalog upgrade: once the old version is fully gone, the new version is
+   signaled that it may upgrade the catalog format and activate features gated
+   on the newer catalog version
 
-The big difference to before is that the fenced deployment is not immediately
-halted/reaped but can still serve queries.
+The big difference to the current procedure is that **both versions run in full
+read-write mode during the overlap window**. This is possible because the new
+version defers catalog migrations and constrains itself to only write data that
+the old version can understand.
 
 We cut over network routes once the new deployment is fully ready, so any
 residual downtime is the route change itself. During that window the old
 deployment still accepts connections. When cutting over, we drop connections
 and rely on reconnects to reach the new version.
+
+### Catalog Version Gating
+
+A central mechanism that makes the above flow work is the decoupling of the
+catalog version from the code version of any running `environmentd`. The
+catalog carries its own version, and a newer `environmentd` can run against a
+catalog that is still at an older version.
+
+New features and catalog schema changes are gated on the catalog version: they
+are only activated once the catalog has been upgraded to a version that
+includes them. The catalog version is only upgraded after the old version's
+processes have been reaped and the new version has been signaled that it is
+safe to do so. Until that point, the new version runs with all the capabilities
+of the older catalog version.
+
+This is directly analogous to how persist already handles forward and backward
+compatibility: it tracks what versions are still "touching" a shard and defers
+migrations until no older versions remain. We apply the same principle at the
+catalog level, giving us gating both by regular feature flags and by catalog
+version.
 
 ### Change How Old-Version Processes are Reaped
 
@@ -185,8 +223,9 @@ We can't have this because both versions of `environmentd` still need their
 processes alive to serve traffic.
 
 Instead we need to change the orchestration logic to determine when the
-new-version `environmentd` is ready to serve traffic, then cut over, and
-eventually reap processes of the old version.
+new-version `environmentd` is ready to serve traffic, then cut over, reap
+processes of the old version, and signal the new version that it may now upgrade
+the catalog format.
 
 ### Get Orchestration Ready for Managing Version Cutover
 
