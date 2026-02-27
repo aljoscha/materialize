@@ -469,10 +469,11 @@ impl PeekClient {
 
         // Get the relation desc for the expression
         let expr_typ = expr.typ();
-        let column_names: Vec<String> = (0..expr_typ.column_types.len())
+        let sql_typ = mz_repr::SqlRelationType::from_repr(&expr_typ);
+        let column_names: Vec<String> = (0..sql_typ.column_types.len())
             .map(|i| format!("column{}", i))
             .collect();
-        let relation_desc = RelationDesc::new(expr_typ, column_names.iter().map(|s| s.as_str()));
+        let relation_desc = RelationDesc::new(sql_typ, column_names.iter().map(|s| s.as_str()));
 
         // Create the subscribe from the query
         let from = mz_sql::plan::SubscribeFrom::Query {
