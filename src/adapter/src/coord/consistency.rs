@@ -132,10 +132,7 @@ impl Coordinator {
                 | catalog::Op::UpdateSourceReferences { source_id: id, .. } => {
                     ids.insert(*id);
                 }
-                catalog::Op::AlterMaterializedViewApplyReplacement {
-                    id,
-                    replacement_id,
-                } => {
+                catalog::Op::AlterMaterializedViewApplyReplacement { id, replacement_id } => {
                     ids.insert(*id);
                     ids.insert(*replacement_id);
                 }

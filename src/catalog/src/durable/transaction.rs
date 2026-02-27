@@ -1041,9 +1041,7 @@ impl<'a> Transaction<'a> {
             IdAllocKey {
                 name: OID_ALLOC_KEY.to_string(),
             },
-            Some(IdAllocValue {
-                next_id: next_oid,
-            }),
+            Some(IdAllocValue { next_id: next_oid }),
             self.op_id,
         )?;
         Ok(())

@@ -52,6 +52,7 @@ use crate::durable::initialize::{
     WITH_0DT_DEPLOYMENT_DDL_CHECK_INTERVAL, WITH_0DT_DEPLOYMENT_MAX_WAIT,
 };
 use crate::durable::metrics::Metrics;
+use crate::durable::objects::serialization::proto;
 use crate::durable::objects::state_update::{
     IntoStateUpdateKindJson, StateUpdate, StateUpdateKind, StateUpdateKindJson,
     TryIntoStateUpdateKind,
