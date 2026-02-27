@@ -60,8 +60,7 @@ use crate::catalog::Catalog;
 use crate::command::{Command, ExecuteResponse};
 use crate::coord::appends::TimestampedWriteResult;
 use crate::coord::sequencer::validate_read_dependencies;
-use crate::coord::timestamp_selection::TimestampProvider;
-use crate::coord::{Coordinator, ExecuteContextGuard, TargetCluster};
+use crate::coord::{ExecuteContextGuard, TargetCluster};
 use crate::error::AdapterError;
 use crate::optimize::Optimize;
 use crate::optimize::dataflows::{ComputeInstanceSnapshot, EvalTime, ExprPrep, ExprPrepOneShot};
@@ -505,11 +504,9 @@ impl PeekClient {
         &mut self,
         timeline: &TimelineContext,
     ) -> Result<Option<Timestamp>, AdapterError> {
-        let timeline = <Coordinator as TimestampProvider>::get_timeline(timeline);
-
-        match timeline {
+        match timeline.timeline() {
             Some(timeline) => {
-                let oracle = self.ensure_oracle(timeline).await?;
+                let oracle = self.ensure_oracle(timeline.clone()).await?;
                 Ok(Some(oracle.read_ts().await))
             }
             None => Ok(None),
