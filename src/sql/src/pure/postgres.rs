@@ -366,6 +366,7 @@ pub(super) async fn purify_source_exports(
     mut exclude_columns: Vec<UnresolvedItemName>,
     unresolved_source_name: &UnresolvedItemName,
     reference_policy: &SourceReferencePolicy,
+    skip_privileges: bool,
 ) -> Result<PurifiedSourceExports, PlanError> {
     let requested_exports = match requested_references.as_ref() {
         Some(requested) if matches!(reference_policy, SourceReferencePolicy::NotAllowed) => {
@@ -422,7 +423,9 @@ pub(super) async fn purify_source_exports(
         .map(|r| r.meta.postgres_desc().expect("is postgres").oid)
         .collect();
 
-    validate_requested_references_privileges(client, &table_oids).await?;
+    if !skip_privileges {
+        validate_requested_references_privileges(client, &table_oids).await?;
+    }
 
     let mut text_column_map = map_column_refs(
         retrieved_references,

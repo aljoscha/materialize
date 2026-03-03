@@ -1285,6 +1285,11 @@ impl Coordinator {
                 let now = self.now();
                 let otel_ctx = OpenTelemetryContext::obtain();
                 let current_storage_configuration = self.controller.storage.config().clone();
+                let purification_context = self
+                    .purification_contexts
+                    .entry(conn_id.clone())
+                    .or_default()
+                    .clone();
                 task::spawn(|| format!("purify:{conn_id}"), async move {
                     let transient_revision = catalog.transient_revision();
                     let catalog = catalog.for_session(ctx.session());
@@ -1306,6 +1311,7 @@ impl Coordinator {
                         now,
                         stmt,
                         &current_storage_configuration,
+                        &purification_context,
                     )
                     .await;
                     let result = result.map_err(|e| e.into());

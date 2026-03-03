@@ -99,6 +99,36 @@ pub mod mysql;
 pub mod postgres;
 pub mod sql_server;
 
+/// Cache for purification context, shared across multiple purification tasks
+/// for the same connection. This allows DDL transactions with many
+/// CREATE TABLE FROM SOURCE statements to reuse the upstream connection
+/// and metadata rather than re-fetching for each statement.
+#[derive(Clone, Default)]
+pub struct PurificationContext {
+    inner: Arc<tokio::sync::Mutex<PurificationContextInner>>,
+}
+
+impl fmt::Debug for PurificationContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PurificationContext").finish_non_exhaustive()
+    }
+}
+
+#[derive(Default)]
+struct PurificationContextInner {
+    /// Cached Postgres purification state, keyed by the source's CatalogItemId.
+    postgres: BTreeMap<CatalogItemId, PostgresPurificationCache>,
+}
+
+struct PostgresPurificationCache {
+    /// Reusable Postgres client connection.
+    client: mz_postgres_util::Client,
+    /// Cached source references (publication metadata).
+    source_references: RetrievedSourceReferences,
+    /// Whether privileges have been pre-validated for all OIDs in the publication.
+    privileges_validated: bool,
+}
+
 pub(crate) struct RequestedSourceExport<T> {
     external_reference: UnresolvedItemName,
     name: UnresolvedItemName,
@@ -286,6 +316,7 @@ pub async fn purify_statement(
     now: u64,
     stmt: Statement<Aug>,
     storage_configuration: &StorageConfiguration,
+    purification_context: &PurificationContext,
 ) -> (Result<PurifiedStatement, PlanError>, Option<ClusterId>) {
     match stmt {
         Statement::CreateSource(stmt) => {
@@ -307,7 +338,13 @@ pub async fn purify_statement(
             )
         }
         Statement::CreateTableFromSource(stmt) => (
-            purify_create_table_from_source(catalog, stmt, storage_configuration).await,
+            purify_create_table_from_source(
+                catalog,
+                stmt,
+                storage_configuration,
+                purification_context,
+            )
+            .await,
             None,
         ),
         o => unreachable!("{:?} does not need to be purified", o),
@@ -931,6 +968,7 @@ async fn purify_create_source(
                 exclude_columns,
                 source_name,
                 &reference_policy,
+                false,
             )
             .await?;
 
@@ -1468,6 +1506,7 @@ async fn purify_alter_source_add_subsources(
                 exclude_columns,
                 &unresolved_source_name,
                 &SourceReferencePolicy::Required,
+                false,
             )
             .await?;
 
@@ -1711,6 +1750,7 @@ async fn purify_create_table_from_source(
     catalog: impl SessionCatalog,
     mut stmt: CreateTableFromSourceStatement<Aug>,
     storage_configuration: &StorageConfiguration,
+    purification_context: &PurificationContext,
 ) -> Result<PurifiedStatement, PlanError> {
     let scx = StatementContext::new(None, &catalog);
     let CreateTableFromSourceStatement {
@@ -1790,8 +1830,6 @@ async fn purify_create_table_from_source(
     // Should be overriden below if a source-specific format is required.
     let mut format_options = SourceFormatOptions::Default;
 
-    let retrieved_source_references: RetrievedSourceReferences;
-
     let requested_references = external_reference.as_ref().map(|ref_name| {
         ExternalReferences::SubsetTables(vec![ExternalReferenceExport {
             reference: ref_name.clone(),
@@ -1806,16 +1844,53 @@ async fn purify_create_table_from_source(
             // Get PostgresConnection for generating subsources.
             let pg_connection = &pg_source_connection.connection;
 
-            let client = pg_connection
-                .validate(pg_source_connection.connection_id, storage_configuration)
-                .await?;
+            let source_id = item.id();
+            let mut cache = purification_context.inner.lock().await;
 
-            let reference_client = SourceReferenceClient::Postgres {
-                client: &client,
-                publication: &pg_source_connection.publication,
-                database: &pg_connection.database,
-            };
-            retrieved_source_references = reference_client.get_source_references().await?;
+            // Evict cached entry if the connection has been closed.
+            if let Some(c) = cache.postgres.get(&source_id) {
+                if c.client.is_closed() {
+                    cache.postgres.remove(&source_id);
+                }
+            }
+
+            // Populate cache on miss: connect, fetch all publication metadata,
+            // and pre-validate privileges for all upstream OIDs.
+            if !cache.postgres.contains_key(&source_id) {
+                let client = pg_connection
+                    .validate(pg_source_connection.connection_id, storage_configuration)
+                    .await?;
+
+                let reference_client = SourceReferenceClient::Postgres {
+                    client: &client,
+                    publication: &pg_source_connection.publication,
+                    database: &pg_connection.database,
+                };
+                let source_references = reference_client.get_source_references().await?;
+
+                // Pre-validate privileges for ALL publication OIDs in batch.
+                let all_oids: Vec<tokio_postgres::types::Oid> = source_references
+                    .all_references()
+                    .iter()
+                    .filter_map(|r| r.postgres_desc().map(|d| d.oid))
+                    .collect();
+                let privileges_validated =
+                    postgres::validate_requested_references_privileges(&client, &all_oids)
+                        .await
+                        .is_ok();
+
+                cache.postgres.insert(
+                    source_id,
+                    PostgresPurificationCache {
+                        client,
+                        source_references,
+                        privileges_validated,
+                    },
+                );
+            }
+
+            let cached = cache.postgres.get(&source_id).expect("just populated");
+            let skip_privileges = cached.privileges_validated;
 
             let postgres::PurifiedSourceExports {
                 source_exports,
@@ -1824,13 +1899,14 @@ async fn purify_create_table_from_source(
                 // `CREATE SOURCE` statements that automatically generate subsources
                 normalized_text_columns: _,
             } = postgres::purify_source_exports(
-                &client,
-                &retrieved_source_references,
+                &cached.client,
+                &cached.source_references,
                 &requested_references,
                 qualified_text_columns,
                 qualified_exclude_columns,
                 &unresolved_source_name,
                 &SourceReferencePolicy::Required,
+                skip_privileges,
             )
             .await?;
             // There should be exactly one source_export returned for this statement
@@ -1863,7 +1939,7 @@ async fn purify_create_table_from_source(
                 conn: &mut conn,
                 include_system_schemas: mysql::references_system_schemas(&requested_references),
             };
-            retrieved_source_references = reference_client.get_source_references().await?;
+            let retrieved_source_references = reference_client.get_source_references().await?;
 
             let mysql::PurifiedSourceExports {
                 source_exports,
@@ -1903,7 +1979,7 @@ async fn purify_create_table_from_source(
                 client: &mut client,
                 database: Arc::clone(&database),
             };
-            retrieved_source_references = reference_client.get_source_references().await?;
+            let retrieved_source_references = reference_client.get_source_references().await?;
             tracing::debug!(?retrieved_source_references, "got source references");
 
             let timeout = mz_storage_types::sources::sql_server::MAX_LSN_WAIT
@@ -1930,7 +2006,7 @@ async fn purify_create_table_from_source(
             let reference_client = SourceReferenceClient::LoadGenerator {
                 generator: &load_gen_connection.load_generator,
             };
-            retrieved_source_references = reference_client.get_source_references().await?;
+            let retrieved_source_references = reference_client.get_source_references().await?;
 
             let requested_exports = retrieved_source_references
                 .requested_source_exports(requested_references.as_ref(), &unresolved_source_name)?;
@@ -1956,7 +2032,7 @@ async fn purify_create_table_from_source(
             let reference_client = SourceReferenceClient::Kafka {
                 topic: &kafka_conn.topic,
             };
-            retrieved_source_references = reference_client.get_source_references().await?;
+            let retrieved_source_references = reference_client.get_source_references().await?;
             let requested_exports = retrieved_source_references
                 .requested_source_exports(requested_references.as_ref(), &unresolved_source_name)?;
             // There should be exactly one source_export returned

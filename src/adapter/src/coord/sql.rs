@@ -216,6 +216,7 @@ impl Coordinator {
 
     /// Clears coordinator state for a connection.
     pub(crate) async fn clear_connection(&mut self, conn_id: &ConnectionId) {
+        self.purification_contexts.remove(conn_id);
         self.staged_cancellation.remove(conn_id);
         self.retire_compute_sinks_for_conn(conn_id, ActiveComputeSinkRetireReason::Finished)
             .await;

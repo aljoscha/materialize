@@ -1805,6 +1805,11 @@ pub struct Coordinator {
     /// Plans that are currently deferred and waiting on a write lock.
     deferred_write_ops: BTreeMap<ConnectionId, DeferredOp>,
 
+    /// Cached purification contexts, keyed by connection ID.
+    /// Allows DDL transactions with many CREATE TABLE FROM SOURCE statements
+    /// to reuse upstream connections and metadata across statements.
+    purification_contexts: BTreeMap<ConnectionId, mz_sql::pure::PurificationContext>,
+
     /// Pending writes waiting for a group commit.
     pending_writes: Vec<PendingWriteTxn>,
 
@@ -4437,6 +4442,7 @@ pub fn serve(
                     introspection_subscribes: BTreeMap::new(),
                     write_locks: BTreeMap::new(),
                     deferred_write_ops: BTreeMap::new(),
+                    purification_contexts: BTreeMap::new(),
                     pending_writes: Vec::new(),
                     advance_timelines_interval,
                     secrets_controller,
