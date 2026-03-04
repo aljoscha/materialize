@@ -139,9 +139,28 @@ impl LaunchSpec {
         // According to https://www.freedesktop.org/software/systemd/man/latest/sd_booted.html
         // checking for `/run/systemd/system/` is the canonical way to determine if the system
         // was booted up with systemd.
-        match Path::new("/run/systemd/system/").try_exists()? {
+        if !Path::new("/run/systemd/system/").try_exists()? {
+            return Ok(Self::Direct);
+        }
+        // Even if systemd booted the system, `systemd-run --user` requires a user
+        // session bus. Verify one is reachable before committing to the Systemd
+        // launch path, otherwise fall back to Direct.
+        let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+            // SAFETY: getuid is always safe to call.
+            let uid = unsafe { libc::getuid() };
+            format!("/run/user/{}", uid)
+        });
+        let bus_path = std::path::PathBuf::from(&runtime_dir).join("bus");
+        match bus_path.try_exists()? {
             true => Ok(Self::Systemd),
-            false => Ok(Self::Direct),
+            false => {
+                warn!(
+                    "systemd is available but user session bus not found at {}, \
+                     falling back to direct process execution",
+                    bus_path.display()
+                );
+                Ok(Self::Direct)
+            }
         }
     }
 
