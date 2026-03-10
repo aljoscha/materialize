@@ -42,7 +42,7 @@ pattern are auto-discovered via periodic polling (WAL-only, no snapshot).
 
 ## Current Status
 
-Purification done. Next: planning (plan_create_table_group in ddl.rs).
+Storage layer done. Next: auto-discovery (periodic polling for new tables).
 
 ## Progress Log
 
@@ -56,8 +56,14 @@ Purification done. Next: planning (plan_create_table_group in ddl.rs).
 - Storage types: Added `PostgresTableGroupExportDetails` struct, protobuf message
   `ProtoPostgresTableGroupExportStatementDetails`, and `PostgresTableGroup` variant
   in `SourceExportDetails`/`SourceExportStatementDetails` with proto roundtrip.
-- Purification: Implemented `purify_create_table_group` in `src/sql/src/pure.rs`.
-  Connects to upstream PG, discovers tables, filters by schema+pattern, validates
+- Purification + Planning: Implemented `purify_create_table_group` in `src/sql/src/pure.rs`
+  (connects to upstream PG, discovers tables, filters by schema+pattern, validates
   identical schemas, generates columns with mz_source_schema/mz_source_table prepended,
-  stores details as hex-encoded protobuf. Added `PurifiedCreateTableGroup` variant
-  and message_handler dispatch.
+  stores details as hex-encoded protobuf). Implemented `plan_create_table_group` in
+  `src/sql/src/plan/statement/ddl.rs` (decodes protobuf, generates column casts,
+  builds PostgresTableGroupExportDetails, produces CreateTablePlan). Added
+  `PurifiedCreateTableGroup` variant and message_handler dispatch.
+- Storage layer: Extended SourceOutputInfo with TableGroupContext, modified render()
+  to register multiple OIDs per table group output, added cast_row_for_table_group()
+  for prepending identification columns. Updated snapshot and replication decoders
+  to handle table group outputs.

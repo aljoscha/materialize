@@ -779,7 +779,14 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
                             .and_then(|bytes| {
                                 decode_copy_row(bytes, output.casts.len(), &mut text_row)?;
                                 let datums = datum_vec.borrow_with(&text_row);
-                                super::cast_row(&output.casts, &datums, &mut final_row)?;
+                                // For table group outputs, prepend identification columns.
+                                if let Some(ctx) = &output.table_group_context {
+                                    super::cast_row_for_table_group(
+                                        &output.casts, &datums, &mut final_row, ctx,
+                                    )?;
+                                } else {
+                                    super::cast_row(&output.casts, &datums, &mut final_row)?;
+                                }
                                 Ok(SourceMessage {
                                     key: Row::default(),
                                     value: final_row.clone(),

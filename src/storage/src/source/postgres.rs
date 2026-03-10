@@ -137,6 +137,9 @@ impl SourceRender for PostgresSourceConnection {
         Vec<PressOnDropButton>,
     ) {
         // Collect the source outputs that we will be exporting into a per-table map.
+        // For regular postgres exports, each OID maps to a distinct output index.
+        // For table group exports, multiple OIDs map to the SAME output index,
+        // with each having a TableGroupContext to prepend identification columns.
         let mut table_info = BTreeMap::new();
         for (idx, (id, export)) in config.source_exports.iter().enumerate() {
             let SourceExport {
@@ -144,14 +147,6 @@ impl SourceRender for PostgresSourceConnection {
                 storage_metadata: _,
                 data_config: _,
             } = export;
-            let details = match details {
-                SourceExportDetails::Postgres(details) => details,
-                // This is an export that doesn't need any data output to it.
-                SourceExportDetails::None => continue,
-                _ => panic!("unexpected source export details: {:?}", details),
-            };
-            let desc = details.table.clone();
-            let casts = details.column_casts.clone();
             let resume_upper = Antichain::from_iter(
                 config
                     .source_resume_uppers
@@ -160,17 +155,48 @@ impl SourceRender for PostgresSourceConnection {
                     .iter()
                     .map(MzOffset::decode_row),
             );
-            let output = SourceOutputInfo {
-                desc,
-                projection: None,
-                casts,
-                resume_upper,
-                export_id: id.clone(),
+            match details {
+                SourceExportDetails::Postgres(details) => {
+                    let output = SourceOutputInfo {
+                        desc: details.table.clone(),
+                        projection: None,
+                        casts: details.column_casts.clone(),
+                        resume_upper,
+                        export_id: id.clone(),
+                        table_group_context: None,
+                    };
+                    table_info
+                        .entry(output.desc.oid)
+                        .or_insert_with(BTreeMap::new)
+                        .insert(idx, output);
+                }
+                SourceExportDetails::PostgresTableGroup(details) => {
+                    // For table groups, each initial table maps to the same
+                    // output index (idx) with its own SourceOutputInfo carrying
+                    // the table's identity for row prepending.
+                    let casts = details.column_casts.clone();
+                    for table in &details.initial_tables {
+                        let output = SourceOutputInfo {
+                            desc: table.clone(),
+                            projection: None,
+                            casts: casts.clone(),
+                            resume_upper: resume_upper.clone(),
+                            export_id: id.clone(),
+                            table_group_context: Some(TableGroupContext {
+                                schema_name: table.namespace.clone(),
+                                table_name: table.name.clone(),
+                            }),
+                        };
+                        table_info
+                            .entry(table.oid)
+                            .or_insert_with(BTreeMap::new)
+                            .insert(idx, output);
+                    }
+                }
+                // This is an export that doesn't need any data output to it.
+                SourceExportDetails::None => continue,
+                _ => panic!("unexpected source export details: {:?}", details),
             };
-            table_info
-                .entry(output.desc.oid)
-                .or_insert_with(BTreeMap::new)
-                .insert(idx, output);
         }
 
         let metrics = config.metrics.get_postgres_source_metrics(config.id);
@@ -277,6 +303,18 @@ struct SourceOutputInfo {
     casts: Vec<(CastType, MirScalarExpr)>,
     resume_upper: Antichain<MzOffset>,
     export_id: GlobalId,
+    /// Present for table group outputs. When set, the row must be prepended
+    /// with mz_source_schema and mz_source_table identification columns.
+    table_group_context: Option<TableGroupContext>,
+}
+
+/// Identifies which upstream table a row came from in a table group.
+/// This information is used to prepend mz_source_schema and mz_source_table
+/// columns to each row emitted by the table group output.
+#[derive(Clone, Debug)]
+struct TableGroupContext {
+    schema_name: String,
+    table_name: String,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -500,6 +538,29 @@ fn cast_row(
 ) -> Result<(), DefiniteError> {
     let arena = mz_repr::RowArena::new();
     let mut packer = row.packer();
+    for (_, column_cast) in casts {
+        let datum = column_cast
+            .eval(datums, &arena)
+            .map_err(DefiniteError::CastError)?;
+        packer.push(datum);
+    }
+    Ok(())
+}
+
+/// Cast a row and prepend table group identification columns (mz_source_schema, mz_source_table).
+/// Used for table group outputs where multiple upstream tables are merged into one collection.
+fn cast_row_for_table_group(
+    casts: &[(CastType, MirScalarExpr)],
+    datums: &[Datum<'_>],
+    row: &mut Row,
+    ctx: &TableGroupContext,
+) -> Result<(), DefiniteError> {
+    let arena = mz_repr::RowArena::new();
+    let mut packer = row.packer();
+    // Prepend identification columns
+    packer.push(Datum::String(&ctx.schema_name));
+    packer.push(Datum::String(&ctx.table_name));
+    // Then the data columns
     for (_, column_cast) in casts {
         let datum = column_cast
             .eval(datums, &arena)
