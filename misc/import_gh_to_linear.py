@@ -12,10 +12,9 @@ Usage:
         --repo MaterializeInc/database-issues \
         10093 6948
 
-The first issue number becomes the Linear project (title + link to GH issue).
-All issue numbers are crawled for sub-issues. The first issue's sub-issues and
-all additional issues (with their sub-issue trees) become Linear issues within
-that project.
+Each GitHub issue number is crawled for sub-issues. Every issue found
+(roots + all transitive sub-issues) becomes a Linear project under the
+given team, with its description linking back to the original GitHub issue.
 """
 
 import argparse
@@ -82,10 +81,12 @@ def crawl_issue(repo: str, number: int, visited: set[int]) -> GHIssue | None:
     return issue
 
 
-def filter_closed(issue: GHIssue) -> None:
-    issue.children = [c for c in issue.children if c.state != "closed"]
+def flatten(issue: GHIssue) -> list[GHIssue]:
+    """Flatten an issue tree into a list (pre-order)."""
+    result = [issue]
     for child in issue.children:
-        filter_closed(child)
+        result.extend(flatten(child))
+    return result
 
 
 def print_tree(issue: GHIssue, indent: int = 0) -> None:
@@ -94,13 +95,6 @@ def print_tree(issue: GHIssue, indent: int = 0) -> None:
     print(f"{prefix}[{marker}] #{issue.number}: {issue.title}")
     for child in issue.children:
         print_tree(child, indent + 1)
-
-
-def count_issues(issues: list[GHIssue]) -> int:
-    total = 0
-    for issue in issues:
-        total += 1 + count_issues(issue.children)
-    return total
 
 
 # --- Linear API ---
@@ -144,58 +138,8 @@ def linear_create_project(api_key: str, team_ids: list[str], name: str, descript
     """, {"input": {"name": name, "teamIds": team_ids, "description": description}})
     result = data["projectCreate"]
     if not result["success"]:
-        raise RuntimeError("Failed to create project")
+        raise RuntimeError(f"Failed to create project: {name}")
     return result["project"]
-
-
-def linear_create_issue(
-    api_key: str,
-    team_id: str,
-    project_id: str,
-    title: str,
-    description: str,
-    parent_id: str | None = None,
-) -> dict:
-    input_data = {
-        "teamId": team_id,
-        "projectId": project_id,
-        "title": title,
-        "description": description,
-    }
-    if parent_id:
-        input_data["parentId"] = parent_id
-
-    data = linear_gql(api_key, """
-        mutation($input: IssueCreateInput!) {
-            issueCreate(input: $input) {
-                success
-                issue { id identifier title url }
-            }
-        }
-    """, {"input": input_data})
-    result = data["issueCreate"]
-    if not result["success"]:
-        raise RuntimeError(f"Failed to create issue: {title}")
-    return result["issue"]
-
-
-def create_issues_recursive(
-    api_key: str,
-    team_id: str,
-    project_id: str,
-    issue: GHIssue,
-    parent_id: str | None = None,
-    indent: int = 0,
-) -> None:
-    prefix = "  " * indent
-    description = f"Imported from GitHub: {issue.url}"
-
-    li = linear_create_issue(api_key, team_id, project_id, issue.title, description, parent_id)
-    print(f"{prefix}  Created {li['identifier']}: {li['title']}")
-    print(f"{prefix}    -> {li['url']}")
-
-    for child in issue.children:
-        create_issues_recursive(api_key, team_id, project_id, child, li["id"], indent + 1)
 
 
 def main() -> None:
@@ -204,7 +148,7 @@ def main() -> None:
     )
     parser.add_argument(
         "issues", nargs="+", type=int, metavar="ISSUE",
-        help="GitHub issue numbers. First = project, rest = top-level issues to include.",
+        help="GitHub issue numbers to import. Each issue and its transitive sub-issues become Linear projects.",
     )
     parser.add_argument("--repo", default="MaterializeInc/database-issues")
     parser.add_argument("--team", required=True, help="Linear team key (e.g. SQL)")
@@ -230,20 +174,22 @@ def main() -> None:
         print("No issues found.", file=sys.stderr)
         sys.exit(1)
 
-    # First issue becomes the project; its children + remaining trees are the issues.
-    project_source = trees[0]
-    all_issues: list[GHIssue] = list(project_source.children) + trees[1:]
+    # Flatten all trees into a single list of issues to create as projects.
+    all_issues: list[GHIssue] = []
+    for tree in trees:
+        all_issues.extend(flatten(tree))
 
     if not args.include_closed:
         all_issues = [i for i in all_issues if i.state != "closed"]
-        for issue in all_issues:
-            filter_closed(issue)
 
-    print(f"\nProject: {project_source.title}")
-    print(f"  (from {project_source.url})")
-    print(f"\nIssues to create ({count_issues(all_issues)}):")
+    print(f"\nCrawl structure:")
+    for tree in trees:
+        print_tree(tree, indent=1)
+
+    print(f"\nProjects to create ({len(all_issues)}):")
     for issue in all_issues:
-        print_tree(issue, indent=1)
+        marker = "x" if issue.state == "closed" else " "
+        print(f"  [{marker}] #{issue.number}: {issue.title}")
 
     if args.dry_run:
         print("\n[dry run] Nothing created.")
@@ -251,17 +197,13 @@ def main() -> None:
 
     print()
     team = linear_find_team(api_key, args.team)
-    print(f"Linear team: {team['name']} ({team['key']})")
-
-    project = linear_create_project(
-        api_key, [team["id"]],
-        project_source.title,
-        f"Imported from GitHub: {project_source.url}",
-    )
-    print(f"Created project: {project['url']}\n")
+    print(f"Linear team: {team['name']} ({team['key']})\n")
 
     for issue in all_issues:
-        create_issues_recursive(api_key, team["id"], project["id"], issue)
+        description = f"Imported from GitHub: {issue.url}"
+        project = linear_create_project(api_key, [team["id"]], issue.title, description)
+        print(f"  Created project: {issue.title}")
+        print(f"    -> {project['url']}")
 
     print("\nDone!")
 
