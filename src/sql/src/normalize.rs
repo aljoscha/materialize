@@ -24,7 +24,8 @@ use mz_sql_parser::ast::{
     ContinualTaskStmt, CreateConnectionStatement, CreateContinualTaskStatement,
     CreateContinualTaskSugar, CreateIndexStatement, CreateMaterializedViewStatement,
     CreateSecretStatement, CreateSinkStatement, CreateSourceStatement, CreateSubsourceStatement,
-    CreateTableFromSourceStatement, CreateTableStatement, CreateTypeStatement, CreateViewStatement,
+    CreateTableFromSourceStatement, CreateTableGroupStatement, CreateTableStatement,
+    CreateTypeStatement, CreateViewStatement,
     CreateWebhookSourceStatement, CteBlock, Function, FunctionArgs, Ident, IfExistsBehavior,
     MutRecBlock, Op, Query, Statement, TableFactor, TableFromSourceColumns, UnresolvedItemName,
     UnresolvedSchemaName, Value, ViewDefinition,
@@ -505,6 +506,29 @@ pub fn create_statement(
             // considered part of the statement's AST/canonical representation.
             with_options
                 .retain(|o| o.name != mz_sql_parser::ast::CreateConnectionOptionName::Validate);
+        }
+
+        Statement::CreateTableGroup(CreateTableGroupStatement {
+            name,
+            columns,
+            constraints: _,
+            if_not_exists,
+            source: _,
+            schema_names: _,
+            table_pattern: _,
+            with_options: _,
+        }) => {
+            *name = allocate_name(name)?;
+            let mut normalizer = QueryNormalizer::new();
+            if let TableFromSourceColumns::Defined(columns) = columns {
+                for c in columns {
+                    normalizer.visit_column_def_mut(c);
+                }
+            }
+            if let Some(err) = normalizer.err {
+                return Err(err);
+            }
+            *if_not_exists = false;
         }
 
         _ => unreachable!(),
