@@ -201,6 +201,37 @@ impl AlterCompatible for PostgresSourceExportDetails {
     }
 }
 
+/// The details of a table group source export from a postgres source.
+/// A table group merges multiple upstream PG tables (matching a schema/pattern
+/// filter) into a single Materialize collection with identification columns.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PostgresTableGroupExportDetails {
+    /// The canonical table schema that all matched tables must conform to.
+    pub canonical_desc: PostgresTableDesc,
+    /// Upstream PG schema names to match tables in.
+    pub schema_names: Vec<String>,
+    /// Optional regex pattern for table name filtering.
+    pub table_pattern: Option<String>,
+    /// Cast expressions (shared across all tables since schemas must match).
+    pub column_casts: Vec<(CastType, MirScalarExpr)>,
+    /// Tables matched at creation time.
+    pub initial_tables: Vec<PostgresTableDesc>,
+}
+
+impl AlterCompatible for PostgresTableGroupExportDetails {
+    fn alter_compatible(&self, _id: GlobalId, _other: &Self) -> Result<(), AlterError> {
+        // compatibility checks are performed against upstream tables at runtime
+        let Self {
+            canonical_desc: _,
+            schema_names: _,
+            table_pattern: _,
+            column_casts: _,
+            initial_tables: _,
+        } = self;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PostgresSourcePublicationDetails {
     pub slot: String,

@@ -36,5 +36,6 @@ message ProtoSourceExportStatementDetails {
     mz_storage_types.sources.sql_server.ProtoSqlServerSourceExportStatementDetails sql_server = 5;
     mz_storage_types.sources.load_generator.ProtoLoadGeneratorSourceExportStatementDetails loadgen = 3;
     mz_storage_types.sources.kafka.ProtoKafkaSourceExportStatementDetails kafka = 4;
+    mz_storage_types.sources.postgres.ProtoPostgresTableGroupExportStatementDetails postgres_table_group = 6;
   }
 }

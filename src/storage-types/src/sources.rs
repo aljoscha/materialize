@@ -69,7 +69,9 @@ pub use crate::sources::envelope::SourceEnvelope;
 pub use crate::sources::kafka::KafkaSourceConnection;
 pub use crate::sources::load_generator::LoadGeneratorSourceConnection;
 pub use crate::sources::mysql::{MySqlSourceConnection, MySqlSourceExportDetails};
-pub use crate::sources::postgres::{PostgresSourceConnection, PostgresSourceExportDetails};
+pub use crate::sources::postgres::{
+    PostgresSourceConnection, PostgresSourceExportDetails, PostgresTableGroupExportDetails,
+};
 pub use crate::sources::sql_server::{SqlServerSourceConnection, SqlServerSourceExtras};
 
 include!(concat!(env!("OUT_DIR"), "/mz_storage_types.sources.rs"));
@@ -864,6 +866,7 @@ pub enum SourceExportDetails {
     None,
     Kafka(KafkaSourceExportDetails),
     Postgres(PostgresSourceExportDetails),
+    PostgresTableGroup(PostgresTableGroupExportDetails),
     MySql(MySqlSourceExportDetails),
     SqlServer(SqlServerSourceExportDetails),
     LoadGenerator(LoadGeneratorSourceExportDetails),
@@ -878,6 +881,7 @@ impl crate::AlterCompatible for SourceExportDetails {
             (Self::None, Self::None) => Ok(()),
             (Self::Kafka(s), Self::Kafka(o)) => s.alter_compatible(id, o),
             (Self::Postgres(s), Self::Postgres(o)) => s.alter_compatible(id, o),
+            (Self::PostgresTableGroup(s), Self::PostgresTableGroup(o)) => s.alter_compatible(id, o),
             (Self::MySql(s), Self::MySql(o)) => s.alter_compatible(id, o),
             (Self::LoadGenerator(s), Self::LoadGenerator(o)) => s.alter_compatible(id, o),
             _ => Err(AlterError { id }),
@@ -903,6 +907,12 @@ impl crate::AlterCompatible for SourceExportDetails {
 pub enum SourceExportStatementDetails {
     Postgres {
         table: mz_postgres_util::desc::PostgresTableDesc,
+    },
+    PostgresTableGroup {
+        canonical_desc: mz_postgres_util::desc::PostgresTableDesc,
+        schema_names: Vec<String>,
+        table_pattern: Option<String>,
+        initial_tables: Vec<mz_postgres_util::desc::PostgresTableDesc>,
     },
     MySql {
         table: mz_mysql_util::MySqlTableDesc,
@@ -962,6 +972,23 @@ impl RustType<ProtoSourceExportStatementDetails> for SourceExportStatementDetail
                     )),
                 }
             }
+            SourceExportStatementDetails::PostgresTableGroup {
+                canonical_desc,
+                schema_names,
+                table_pattern,
+                initial_tables,
+            } => ProtoSourceExportStatementDetails {
+                kind: Some(
+                    proto_source_export_statement_details::Kind::PostgresTableGroup(
+                        postgres::ProtoPostgresTableGroupExportStatementDetails {
+                            canonical_desc: Some(canonical_desc.into_proto()),
+                            schema_names: schema_names.clone(),
+                            table_pattern: table_pattern.clone(),
+                            initial_tables: initial_tables.iter().map(|t| t.into_proto()).collect(),
+                        },
+                    ),
+                ),
+            },
             SourceExportStatementDetails::Kafka {} => ProtoSourceExportStatementDetails {
                 kind: Some(proto_source_export_statement_details::Kind::Kafka(
                     kafka::ProtoKafkaSourceExportStatementDetails {},
@@ -998,6 +1025,20 @@ impl RustType<ProtoSourceExportStatementDetails> for SourceExportStatementDetail
                     .output
                     .into_rust_if_some("ProtoLoadGeneratorSourceExportStatementDetails::output")?,
             },
+            Some(Kind::PostgresTableGroup(details)) => {
+                SourceExportStatementDetails::PostgresTableGroup {
+                    canonical_desc: details.canonical_desc.into_rust_if_some(
+                        "ProtoPostgresTableGroupExportStatementDetails::canonical_desc",
+                    )?,
+                    schema_names: details.schema_names,
+                    table_pattern: details.table_pattern,
+                    initial_tables: details
+                        .initial_tables
+                        .into_iter()
+                        .map(|t| t.into_rust())
+                        .collect::<Result<_, _>>()?,
+                }
+            }
             Some(Kind::Kafka(_details)) => SourceExportStatementDetails::Kafka {},
             None => {
                 return Err(TryFromProtoError::missing_field(

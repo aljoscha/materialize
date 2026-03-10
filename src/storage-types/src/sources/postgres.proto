@@ -28,3 +28,18 @@ message ProtoPostgresSourcePublicationDetails {
 message ProtoPostgresSourceExportStatementDetails {
   mz_postgres_util.desc.ProtoPostgresTableDesc table = 1;
 }
+
+// NOTE: this message is encoded and stored as part of source export
+// statement options for table groups.
+// Be extra careful about changes, ensuring that all changes are backwards
+// compatible
+message ProtoPostgresTableGroupExportStatementDetails {
+  // The canonical schema that all matched tables must conform to
+  mz_postgres_util.desc.ProtoPostgresTableDesc canonical_desc = 1;
+  // Upstream PG schema names to match tables in
+  repeated string schema_names = 2;
+  // Optional regex pattern for table name filtering
+  optional string table_pattern = 3;
+  // Tables matched at creation time
+  repeated mz_postgres_util.desc.ProtoPostgresTableDesc initial_tables = 4;
+}

@@ -1691,6 +1691,11 @@ pub fn plan_create_subsource(
             SourceExportStatementDetails::LoadGenerator { output } => {
                 SourceExportDetails::LoadGenerator(LoadGeneratorSourceExportDetails { output })
             }
+            SourceExportStatementDetails::PostgresTableGroup { .. } => {
+                // Table group exports are planned via plan_create_table_group,
+                // not through subsource planning.
+                bail_unsupported!("table groups cannot be created as subsources")
+            }
             SourceExportStatementDetails::Kafka {} => {
                 bail_unsupported!("subsources cannot reference Kafka sources")
             }
@@ -1847,6 +1852,10 @@ pub fn plan_create_table_from_source(
         }),
         SourceExportStatementDetails::LoadGenerator { output } => {
             SourceExportDetails::LoadGenerator(LoadGeneratorSourceExportDetails { output })
+        }
+        SourceExportStatementDetails::PostgresTableGroup { .. } => {
+            // Table groups are planned via plan_create_table_group, not here.
+            sql_bail!("internal error: table group details in plan_create_table_from_source")
         }
         SourceExportStatementDetails::Kafka {} => {
             if !include_metadata.is_empty()
