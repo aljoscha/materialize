@@ -97,6 +97,9 @@ def print_tree(issue: GHIssue, indent: int = 0) -> None:
         print_tree(child, indent + 1)
 
 
+MAX_PROJECT_NAME_LEN = 80
+
+
 # --- Linear API ---
 
 
@@ -127,6 +130,48 @@ def linear_find_team(api_key: str, team_key: str) -> dict:
     return teams[0]
 
 
+def linear_fetch_existing_projects(api_key: str, team_id: str) -> dict[str, dict]:
+    """Fetch all existing projects for a team. Returns {name: project} mapping."""
+    projects: dict[str, dict] = {}
+    has_more = True
+    cursor = None
+    while has_more:
+        variables: dict = {}
+        if cursor:
+            query = """
+                query($filter: ProjectFilter, $after: String) {
+                    projects(filter: $filter, after: $after, first: 100) {
+                        nodes { id name url }
+                        pageInfo { hasNextPage endCursor }
+                    }
+                }
+            """
+            variables = {"filter": {"accessibleTeams": {"id": {"eq": team_id}}}, "after": cursor}
+        else:
+            query = """
+                query($filter: ProjectFilter) {
+                    projects(filter: $filter, first: 100) {
+                        nodes { id name url }
+                        pageInfo { hasNextPage endCursor }
+                    }
+                }
+            """
+            variables = {"filter": {"accessibleTeams": {"id": {"eq": team_id}}}}
+        data = linear_gql(api_key, query, variables)
+        for node in data["projects"]["nodes"]:
+            projects[node["name"]] = node
+        page_info = data["projects"]["pageInfo"]
+        has_more = page_info["hasNextPage"]
+        cursor = page_info["endCursor"]
+    return projects
+
+
+def truncate_name(name: str) -> str:
+    if len(name) <= MAX_PROJECT_NAME_LEN:
+        return name
+    return name[: MAX_PROJECT_NAME_LEN - 1] + "…"
+
+
 def linear_create_project(api_key: str, team_ids: list[str], name: str, description: str) -> dict:
     data = linear_gql(api_key, """
         mutation($input: ProjectCreateInput!) {
@@ -135,7 +180,7 @@ def linear_create_project(api_key: str, team_ids: list[str], name: str, descript
                 project { id name url }
             }
         }
-    """, {"input": {"name": name, "teamIds": team_ids, "description": description}})
+    """, {"input": {"name": truncate_name(name), "teamIds": team_ids, "description": description}})
     result = data["projectCreate"]
     if not result["success"]:
         raise RuntimeError(f"Failed to create project: {name}")
@@ -189,7 +234,9 @@ def main() -> None:
     print(f"\nProjects to create ({len(all_issues)}):")
     for issue in all_issues:
         marker = "x" if issue.state == "closed" else " "
-        print(f"  [{marker}] #{issue.number}: {issue.title}")
+        name = truncate_name(issue.title)
+        suffix = " [truncated]" if name != issue.title else ""
+        print(f"  [{marker}] #{issue.number}: {name}{suffix}")
 
     if args.dry_run:
         print("\n[dry run] Nothing created.")
@@ -197,13 +244,29 @@ def main() -> None:
 
     print()
     team = linear_find_team(api_key, args.team)
-    print(f"Linear team: {team['name']} ({team['key']})\n")
+    print(f"Linear team: {team['name']} ({team['key']})")
 
+    print("Fetching existing projects...")
+    existing = linear_fetch_existing_projects(api_key, team["id"])
+    print(f"Found {len(existing)} existing projects.\n")
+
+    created = 0
+    skipped = 0
     for issue in all_issues:
+        name = truncate_name(issue.title)
+        if name in existing:
+            print(f"  [skip] {name}")
+            print(f"    -> {existing[name]['url']}")
+            skipped += 1
+            continue
         description = f"Imported from GitHub: {issue.url}"
         project = linear_create_project(api_key, [team["id"]], issue.title, description)
-        print(f"  Created project: {issue.title}")
+        existing[name] = project
+        print(f"  [new]  {name}")
         print(f"    -> {project['url']}")
+        created += 1
+
+    print(f"\nCreated {created}, skipped {skipped} (already existed).")
 
     print("\nDone!")
 
