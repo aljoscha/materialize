@@ -2647,14 +2647,17 @@ pub fn plan_create_table_group(
         check_partition_by(&desc, partition_by)?;
     }
 
-    // Build a synthetic external_reference for display in system tables.
-    // Table groups don't map to a single upstream table, so we use the
-    // schema names and optional pattern as a descriptive identifier.
-    let ref_parts: Vec<Ident> = schema_names
-        .iter()
-        .map(|s| Ident::new_unchecked(s))
-        .collect();
-    let external_reference = UnresolvedItemName(ref_parts);
+    // Build a synthetic 3-part external_reference for display in system tables.
+    // Normal PG tables use database.schema.table. For table groups (which span
+    // multiple upstream tables), we use a synthetic reference with schemas
+    // joined as the "schema" part so that builtin_table_updates sees the
+    // expected 3-part format for postgres source exports.
+    let schemas_joined = schema_names.join(",");
+    let external_reference = UnresolvedItemName(vec![
+        Ident::new_unchecked("postgres"),
+        Ident::new_unchecked(&schemas_joined),
+        Ident::new_unchecked(&name.item),
+    ]);
 
     let if_not_exists = *if_not_exists;
 
