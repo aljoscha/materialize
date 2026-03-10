@@ -42,7 +42,23 @@ pattern are auto-discovered via periodic polling (WAL-only, no snapshot).
 
 ## Current Status
 
-Storage layer done. Next: auto-discovery (periodic polling for new tables).
+Core implementation complete. Remaining: known gaps below, then test coverage.
+
+## Known Gaps
+
+1. **Schema change re-addition**: Design doc says "If the table's schema is later
+   changed back to be compatible, periodic polling re-adds it." This doesn't work
+   because the schema validator removes the table from `table_info` in the
+   replication loop, but `spawn_table_group_discovery` maintains a separate
+   `known_oids` set that doesn't learn about the removal. The table stays in
+   `known_oids`, so it's never re-detected as "new". Fix: the discovery task needs
+   a way to learn about schema-validator removals (e.g. a shared set, or a channel
+   from the replication loop back to the discovery task).
+
+2. **Incompatible auto-discovered tables**: Design doc says "Incompatible tables
+   are skipped with a warning in source status." Currently only trace-logged, no
+   `HealthStatusMessage` emitted. Fix: send a `HealthStatusMessage` with a warning
+   when an incompatible table is skipped during discovery.
 
 ## Progress Log
 
@@ -67,3 +83,7 @@ Storage layer done. Next: auto-discovery (periodic polling for new tables).
   to register multiple OIDs per table group output, added cast_row_for_table_group()
   for prepending identification columns. Updated snapshot and replication decoders
   to handle table group outputs.
+- Auto-discovery: Added TableGroupInfo and spawn_table_group_discovery for periodic
+  polling of upstream PG tables. Discovery task validates new tables against canonical
+  schema, adds/removes from table_info via channel. Replication loop processes
+  discovery results on keepalive messages.

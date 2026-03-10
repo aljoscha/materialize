@@ -141,6 +141,8 @@ impl SourceRender for PostgresSourceConnection {
         // For table group exports, multiple OIDs map to the SAME output index,
         // with each having a TableGroupContext to prepend identification columns.
         let mut table_info = BTreeMap::new();
+        // Collect table group metadata for auto-discovery of new upstream tables.
+        let mut table_groups = Vec::new();
         for (idx, (id, export)) in config.source_exports.iter().enumerate() {
             let SourceExport {
                 details,
@@ -192,6 +194,15 @@ impl SourceRender for PostgresSourceConnection {
                             .or_insert_with(BTreeMap::new)
                             .insert(idx, output);
                     }
+                    // Store group metadata for auto-discovery.
+                    table_groups.push(TableGroupInfo {
+                        output_index: idx,
+                        canonical_desc: details.canonical_desc.clone(),
+                        schema_names: details.schema_names.clone(),
+                        table_pattern: details.table_pattern.clone(),
+                        casts,
+                        export_id: id.clone(),
+                    });
                 }
                 // This is an export that doesn't need any data output to it.
                 SourceExportDetails::None => continue,
@@ -215,6 +226,7 @@ impl SourceRender for PostgresSourceConnection {
             config.clone(),
             self,
             table_info,
+            table_groups,
             rewinds,
             slot_ready,
             resume_uppers,
@@ -293,28 +305,46 @@ impl SourceRender for PostgresSourceConnection {
 }
 
 #[derive(Clone, Debug)]
-struct SourceOutputInfo {
+pub(crate) struct SourceOutputInfo {
     /// The expected upstream schema of this output.
-    desc: PostgresTableDesc,
+    pub(crate) desc: PostgresTableDesc,
     /// A projection of the upstream columns into the columns expected by this output. This field
     /// is recalculated every time we observe an upstream schema change. On dataflow initialization
     /// this field is None since we haven't yet observed any schemas.
-    projection: Option<Vec<usize>>,
-    casts: Vec<(CastType, MirScalarExpr)>,
-    resume_upper: Antichain<MzOffset>,
-    export_id: GlobalId,
+    pub(crate) projection: Option<Vec<usize>>,
+    pub(crate) casts: Vec<(CastType, MirScalarExpr)>,
+    pub(crate) resume_upper: Antichain<MzOffset>,
+    pub(crate) export_id: GlobalId,
     /// Present for table group outputs. When set, the row must be prepended
     /// with mz_source_schema and mz_source_table identification columns.
-    table_group_context: Option<TableGroupContext>,
+    pub(crate) table_group_context: Option<TableGroupContext>,
 }
 
 /// Identifies which upstream table a row came from in a table group.
 /// This information is used to prepend mz_source_schema and mz_source_table
 /// columns to each row emitted by the table group output.
 #[derive(Clone, Debug)]
-struct TableGroupContext {
-    schema_name: String,
-    table_name: String,
+pub(crate) struct TableGroupContext {
+    pub(crate) schema_name: String,
+    pub(crate) table_name: String,
+}
+
+/// Metadata for a table group, used for auto-discovery of new tables.
+/// Stored alongside table_info and passed to the replication reader.
+#[derive(Clone, Debug)]
+pub(crate) struct TableGroupInfo {
+    /// The output index for this table group's persist shard.
+    pub(crate) output_index: usize,
+    /// The canonical schema that new tables must match.
+    pub(crate) canonical_desc: PostgresTableDesc,
+    /// Upstream PG schema names to match tables in.
+    pub(crate) schema_names: Vec<String>,
+    /// Optional regex pattern for filtering table names.
+    pub(crate) table_pattern: Option<String>,
+    /// Column casts shared across all tables in the group.
+    pub(crate) casts: Vec<(CastType, MirScalarExpr)>,
+    /// The export id for this table group.
+    pub(crate) export_id: GlobalId,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]

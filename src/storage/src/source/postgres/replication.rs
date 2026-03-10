@@ -116,7 +116,10 @@ use tracing::{error, trace};
 use crate::metrics::source::postgres::PgSourceMetrics;
 use crate::source::RawSourceCreationConfig;
 use crate::source::postgres::verify_schema;
-use crate::source::postgres::{DefiniteError, ReplicationError, SourceOutputInfo, TransientError};
+use crate::source::postgres::{
+    DefiniteError, ReplicationError, SourceOutputInfo, TableGroupContext, TableGroupInfo,
+    TransientError,
+};
 use crate::source::probe;
 use crate::source::types::{Probe, SignaledFuture, SourceMessage, StackedCollection};
 
@@ -147,6 +150,7 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
     config: RawSourceCreationConfig,
     connection: PostgresSourceConnection,
     table_info: BTreeMap<u32, BTreeMap<usize, SourceOutputInfo>>,
+    table_groups: Vec<TableGroupInfo>,
     rewind_stream: StreamVec<G, RewindRequest>,
     slot_ready_stream: StreamVec<G, Infallible>,
     committed_uppers: impl futures::Stream<Item = Antichain<MzOffset>> + 'static,
@@ -424,6 +428,23 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
                 table_info.clone(),
             );
 
+            // If there are table groups, spawn a discovery task that periodically
+            // polls for new upstream tables matching the group patterns.
+            let mut discovery_rx = if !table_groups.is_empty() {
+                let client = connection_config
+                    .connect("table group discovery", ssh_tunnel_manager)
+                    .await?;
+                Some(spawn_table_group_discovery(
+                    client,
+                    &config,
+                    connection.publication.clone(),
+                    table_info.clone(),
+                    table_groups,
+                ))
+            } else {
+                None
+            };
+
             // Instead of downgrading the capability for every transaction we process we only do it
             // if we're about to yield, which is checked at the bottom of the loop. This avoids
             // creating excessive progress tracking traffic when there are multiple small
@@ -524,6 +545,37 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
                                         Diff::ONE,
                                     );
                                     data_output.give_fueled(&data_cap_set[0], update).await;
+                                }
+                            }
+                        }
+                        // Process any newly discovered tables for table groups.
+                        if let Some(ref mut rx) = discovery_rx {
+                            while let Ok(result) = rx.try_recv() {
+                                match result {
+                                    TableGroupDiscoveryResult::NewTable { oid, output_index, info } => {
+                                        trace!(
+                                            %id,
+                                            "timely-{worker_id} discovered new table oid={oid} \
+                                             for table group output {output_index}"
+                                        );
+                                        table_info
+                                            .entry(oid)
+                                            .or_insert_with(BTreeMap::new)
+                                            .insert(output_index, info);
+                                    }
+                                    TableGroupDiscoveryResult::RemovedTable { oid, output_index } => {
+                                        trace!(
+                                            %id,
+                                            "timely-{worker_id} table oid={oid} removed from \
+                                             table group output {output_index}"
+                                        );
+                                        if let Some(outputs) = table_info.get_mut(&oid) {
+                                            outputs.remove(&output_index);
+                                            if outputs.is_empty() {
+                                                table_info.remove(&oid);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1156,6 +1208,187 @@ fn spawn_schema_validator(
             tokio::time::sleep(wait).await;
         }
     });
+
+    rx
+}
+
+/// A result from the table group discovery task.
+enum TableGroupDiscoveryResult {
+    /// A new upstream table was discovered that matches a table group pattern.
+    NewTable {
+        oid: u32,
+        output_index: usize,
+        info: SourceOutputInfo,
+    },
+    /// An upstream table was removed (dropped or no longer matches).
+    RemovedTable {
+        oid: u32,
+        output_index: usize,
+    },
+}
+
+/// Spawns a background task that periodically discovers new upstream tables
+/// matching table group patterns. Uses `publication_info` to find all tables
+/// in the publication, then checks each table group's schema/pattern filters.
+fn spawn_table_group_discovery(
+    client: Client,
+    config: &RawSourceCreationConfig,
+    publication: String,
+    initial_table_info: BTreeMap<u32, BTreeMap<usize, SourceOutputInfo>>,
+    table_groups: Vec<TableGroupInfo>,
+) -> mpsc::UnboundedReceiver<TableGroupDiscoveryResult> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let source_id = config.id;
+    let config_set = Arc::clone(config.config.config_set());
+
+    // Track known OIDs per table group to detect additions and removals.
+    let mut known_oids: BTreeMap<usize, std::collections::BTreeSet<u32>> = BTreeMap::new();
+    for group in &table_groups {
+        let mut oids = std::collections::BTreeSet::new();
+        for (&oid, outputs) in initial_table_info.iter() {
+            if outputs.contains_key(&group.output_index) {
+                oids.insert(oid);
+            }
+        }
+        known_oids.insert(group.output_index, oids);
+    }
+
+    // Compile regex patterns once.
+    let compiled_groups: Vec<_> = table_groups
+        .iter()
+        .map(|g| {
+            let regex = g
+                .table_pattern
+                .as_ref()
+                .map(|p| regex::Regex::new(p).expect("pattern was validated during purification"));
+            (g.clone(), regex)
+        })
+        .collect();
+
+    mz_ore::task::spawn(
+        || format!("table-group-discovery:{}", source_id),
+        async move {
+            while !tx.is_closed() {
+                let discovery_start = Instant::now();
+
+                // Fetch ALL tables in the publication (not filtered by OID).
+                let upstream_info =
+                    match mz_postgres_util::publication_info(&*client, &publication, None).await {
+                        Ok(info) => info,
+                        Err(error) => {
+                            trace!(
+                                %source_id,
+                                "table group discovery failed to fetch publication info: {error}",
+                            );
+                            // Retry on next interval.
+                            let interval = PG_SCHEMA_VALIDATION_INTERVAL.get(&config_set);
+                            tokio::time::sleep(interval).await;
+                            continue;
+                        }
+                    };
+
+                for (group, regex) in &compiled_groups {
+                    let schema_set: std::collections::BTreeSet<&str> =
+                        group.schema_names.iter().map(|s| s.as_str()).collect();
+                    let group_known = known_oids.entry(group.output_index).or_default();
+
+                    // Find tables matching the group's filter criteria.
+                    let matching_oids: std::collections::BTreeSet<u32> = upstream_info
+                        .iter()
+                        .filter(|(_, desc)| {
+                            // Must be in one of the specified schemas.
+                            if !schema_set.contains(desc.namespace.as_str()) {
+                                return false;
+                            }
+                            // Must match the table pattern if specified.
+                            if let Some(re) = regex {
+                                if !re.is_match(&desc.name) {
+                                    return false;
+                                }
+                            }
+                            true
+                        })
+                        .map(|(&oid, _)| oid)
+                        .collect();
+
+                    // Detect new tables.
+                    for &oid in matching_oids.difference(group_known) {
+                        let desc = &upstream_info[&oid];
+
+                        // Validate schema against the canonical desc.
+                        let compatible = desc
+                            .columns
+                            .len()
+                            == group.canonical_desc.columns.len()
+                            && desc.columns.iter().zip(group.canonical_desc.columns.iter()).all(
+                                |(a, b)| a.name == b.name && a.type_oid == b.type_oid,
+                            );
+
+                        if !compatible {
+                            trace!(
+                                %source_id,
+                                "table group discovery: table {}.{} (oid={oid}) has \
+                                 incompatible schema, skipping",
+                                desc.namespace,
+                                desc.name,
+                            );
+                            continue;
+                        }
+
+                        let info = SourceOutputInfo {
+                            desc: desc.clone(),
+                            projection: None,
+                            casts: group.casts.clone(),
+                            // New tables don't need to be snapshotted; they start
+                            // receiving WAL data from the discovery point.
+                            resume_upper: Antichain::from_elem(MzOffset::from(0)),
+                            export_id: group.export_id.clone(),
+                            table_group_context: Some(TableGroupContext {
+                                schema_name: desc.namespace.clone(),
+                                table_name: desc.name.clone(),
+                            }),
+                        };
+
+                        trace!(
+                            %source_id,
+                            "table group discovery: new table {}.{} (oid={oid}) added \
+                             to output {}",
+                            desc.namespace,
+                            desc.name,
+                            group.output_index,
+                        );
+
+                        let _ = tx.send(TableGroupDiscoveryResult::NewTable {
+                            oid,
+                            output_index: group.output_index,
+                            info,
+                        });
+                    }
+
+                    // Detect removed tables.
+                    for &oid in group_known.difference(&matching_oids) {
+                        trace!(
+                            %source_id,
+                            "table group discovery: table oid={oid} removed from output {}",
+                            group.output_index,
+                        );
+                        let _ = tx.send(TableGroupDiscoveryResult::RemovedTable {
+                            oid,
+                            output_index: group.output_index,
+                        });
+                    }
+
+                    // Update known set.
+                    *group_known = matching_oids;
+                }
+
+                let interval = PG_SCHEMA_VALIDATION_INTERVAL.get(&config_set);
+                let elapsed = discovery_start.elapsed();
+                let wait = interval.saturating_sub(elapsed);
+                tokio::time::sleep(wait).await;
+            }
+        },
+    );
 
     rx
 }
