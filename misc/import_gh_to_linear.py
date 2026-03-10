@@ -131,34 +131,38 @@ def linear_find_team(api_key: str, team_key: str) -> dict:
 
 
 def linear_fetch_existing_projects(api_key: str, team_id: str) -> dict[str, dict]:
-    """Fetch all existing projects for a team. Returns {name: project} mapping."""
+    """Fetch all existing projects for a team. Returns {name: project} mapping.
+    Each project includes an 'external_link_urls' set for idempotency checks."""
     projects: dict[str, dict] = {}
     has_more = True
     cursor = None
     while has_more:
-        variables: dict = {}
         if cursor:
             query = """
                 query($filter: ProjectFilter, $after: String) {
                     projects(filter: $filter, after: $after, first: 100) {
-                        nodes { id name url }
+                        nodes { id name url externalLinks { nodes { url } } }
                         pageInfo { hasNextPage endCursor }
                     }
                 }
             """
-            variables = {"filter": {"accessibleTeams": {"id": {"eq": team_id}}}, "after": cursor}
         else:
             query = """
                 query($filter: ProjectFilter) {
                     projects(filter: $filter, first: 100) {
-                        nodes { id name url }
+                        nodes { id name url externalLinks { nodes { url } } }
                         pageInfo { hasNextPage endCursor }
                     }
                 }
             """
-            variables = {"filter": {"accessibleTeams": {"id": {"eq": team_id}}}}
+        variables: dict = {"filter": {"accessibleTeams": {"id": {"eq": team_id}}}}
+        if cursor:
+            variables["after"] = cursor
         data = linear_gql(api_key, query, variables)
         for node in data["projects"]["nodes"]:
+            node["external_link_urls"] = {
+                link["url"] for link in node.get("externalLinks", {}).get("nodes", [])
+            }
             projects[node["name"]] = node
         page_info = data["projects"]["pageInfo"]
         has_more = page_info["hasNextPage"]
@@ -170,6 +174,18 @@ def truncate_name(name: str) -> str:
     if len(name) <= MAX_PROJECT_NAME_LEN:
         return name
     return name[: MAX_PROJECT_NAME_LEN - 1] + "…"
+
+
+def linear_add_project_link(api_key: str, project_id: str, url: str, label: str) -> None:
+    data = linear_gql(api_key, """
+        mutation($input: EntityExternalLinkCreateInput!) {
+            entityExternalLinkCreate(input: $input) {
+                success
+            }
+        }
+    """, {"input": {"projectId": project_id, "url": url, "label": label}})
+    if not data["entityExternalLinkCreate"]["success"]:
+        raise RuntimeError(f"Failed to add link to project: {url}")
 
 
 def linear_create_project(api_key: str, team_ids: list[str], name: str, description: str) -> dict:
@@ -198,6 +214,8 @@ def main() -> None:
     parser.add_argument("--repo", default="MaterializeInc/database-issues")
     parser.add_argument("--team", required=True, help="Linear team key (e.g. SQL)")
     parser.add_argument("--include-closed", action="store_true", help="Include closed issues")
+    parser.add_argument("--patch-links", action="store_true",
+                        help="Add GitHub URL as a resource link to existing projects that are missing it")
     parser.add_argument("--dry-run", action="store_true", help="Only print what would be created")
     args = parser.parse_args()
 
@@ -252,21 +270,37 @@ def main() -> None:
 
     created = 0
     skipped = 0
+    patched = 0
     for issue in all_issues:
         name = truncate_name(issue.title)
         if name in existing:
-            print(f"  [skip] {name}")
-            print(f"    -> {existing[name]['url']}")
+            proj = existing[name]
+            if args.patch_links and issue.url not in proj.get("external_link_urls", set()):
+                linear_add_project_link(api_key, proj["id"], issue.url, "GitHub Issue")
+                proj["external_link_urls"].add(issue.url)
+                print(f"  [link] {name}")
+                print(f"    added {issue.url}")
+                patched += 1
+            else:
+                print(f"  [skip] {name}")
+            print(f"    -> {proj['url']}")
             skipped += 1
             continue
         description = f"Imported from GitHub: {issue.url}"
         project = linear_create_project(api_key, [team["id"]], issue.title, description)
+        # Also add the GitHub link as a resource on newly created projects.
+        linear_add_project_link(api_key, project["id"], issue.url, "GitHub Issue")
+        project["external_link_urls"] = {issue.url}
         existing[name] = project
         print(f"  [new]  {name}")
         print(f"    -> {project['url']}")
         created += 1
 
-    print(f"\nCreated {created}, skipped {skipped} (already existed).")
+    summary = [f"Created {created}"]
+    if patched:
+        summary.append(f"patched {patched}")
+    summary.append(f"skipped {skipped - patched}")
+    print(f"\n{', '.join(summary)}.")
 
     print("\nDone!")
 
