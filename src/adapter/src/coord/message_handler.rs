@@ -495,7 +495,8 @@ impl Coordinator {
             ),
             o @ (PurifiedStatement::PurifiedAlterSource { .. }
             | PurifiedStatement::PurifiedCreateSink(..)
-            | PurifiedStatement::PurifiedCreateTableFromSource { .. }) => {
+            | PurifiedStatement::PurifiedCreateTableFromSource { .. }
+            | PurifiedStatement::PurifiedCreateTableGroup { .. }) => {
                 // Unify these into a `Statement`.
                 let stmt = match o {
                     PurifiedStatement::PurifiedAlterSource { alter_source_stmt } => {
@@ -503,6 +504,9 @@ impl Coordinator {
                     }
                     PurifiedStatement::PurifiedCreateTableFromSource { stmt } => {
                         Statement::CreateTableFromSource(stmt)
+                    }
+                    PurifiedStatement::PurifiedCreateTableGroup { stmt } => {
+                        Statement::CreateTableGroup(stmt)
                     }
                     PurifiedStatement::PurifiedCreateSink(stmt) => Statement::CreateSink(stmt),
                     PurifiedStatement::PurifiedCreateSource { .. }

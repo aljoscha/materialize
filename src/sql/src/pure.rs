@@ -41,7 +41,8 @@ use mz_sql_parser::ast::{
     AlterSourceAction, AlterSourceAddSubsourceOptionName, AlterSourceStatement, AvroDocOn,
     ColumnName, CreateMaterializedViewStatement, CreateSinkConnection, CreateSinkOptionName,
     CreateSinkStatement, CreateSourceOptionName, CreateSubsourceOption, CreateSubsourceOptionName,
-    CreateTableFromSourceStatement, CsrConfigOption, CsrConfigOptionName, CsrConnection,
+    CreateTableFromSourceStatement, CreateTableGroupStatement, CsrConfigOption,
+    CsrConfigOptionName, CsrConnection,
     CsrSeedAvro, CsrSeedProtobuf, CsrSeedProtobufSchema, DeferredItemName, DocOnIdentifier,
     DocOnSchema, Expr, Function, FunctionArgs, Ident, KafkaSourceConfigOption,
     KafkaSourceConfigOptionName, LoadGenerator, LoadGeneratorOption, LoadGeneratorOptionName,
@@ -49,7 +50,8 @@ use mz_sql_parser::ast::{
     PgConfigOption, PgConfigOptionName, RawItemName, ReaderSchemaSelectionStrategy,
     RefreshAtOptionValue, RefreshEveryOptionValue, RefreshOptionValue, SourceEnvelope,
     SqlServerConfigOption, SqlServerConfigOptionName, Statement, TableFromSourceColumns,
-    TableFromSourceOption, TableFromSourceOptionName, UnresolvedItemName,
+    TableFromSourceOption, TableFromSourceOptionName, UnresolvedItemName, Value,
+    WithOptionValue, ColumnDef,
 };
 use mz_sql_server_util::desc::SqlServerTableDesc;
 use mz_storage_types::configuration::StorageConfiguration;
@@ -72,7 +74,7 @@ use uuid::Uuid;
 use crate::ast::{
     AlterSourceAddSubsourceOption, AvroSchema, CreateSourceConnection, CreateSourceStatement,
     CreateSubsourceStatement, CsrConnectionAvro, CsrConnectionProtobuf, ExternalReferenceExport,
-    ExternalReferences, Format, FormatSpecifier, ProtobufSchema, Value, WithOptionValue,
+    ExternalReferences, Format, FormatSpecifier, ProtobufSchema,
 };
 use crate::catalog::{CatalogItemType, SessionCatalog};
 use crate::kafka_util::{KafkaSinkConfigOptionExtracted, KafkaSourceConfigOptionExtracted};
@@ -237,6 +239,9 @@ pub enum PurifiedStatement {
     PurifiedCreateTableFromSource {
         stmt: CreateTableFromSourceStatement<Aug>,
     },
+    PurifiedCreateTableGroup {
+        stmt: CreateTableGroupStatement<Aug>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +313,10 @@ pub async fn purify_statement(
         }
         Statement::CreateTableFromSource(stmt) => (
             purify_create_table_from_source(catalog, stmt, storage_configuration).await,
+            None,
+        ),
+        Statement::CreateTableGroup(stmt) => (
+            purify_create_table_group(catalog, stmt, storage_configuration).await,
             None,
         ),
         o => unreachable!("{:?} does not need to be purified", o),
@@ -2210,6 +2219,366 @@ async fn purify_create_table_from_source(
     // available references table in the catalog, so plumb this through.
     // available_source_references: retrieved_source_references.available_source_references(),
     Ok(PurifiedStatement::PurifiedCreateTableFromSource { stmt })
+}
+
+/// Purify a CREATE TABLE GROUP statement by:
+/// 1. Connecting to the upstream PG and discovering tables matching the schema/pattern filter
+/// 2. Validating all matched tables have the same schema
+/// 3. Populating columns (prepended with mz_source_schema, mz_source_table identification columns)
+/// 4. Storing matched table details for the storage layer
+async fn purify_create_table_group(
+    catalog: impl SessionCatalog,
+    mut stmt: CreateTableGroupStatement<Aug>,
+    storage_configuration: &StorageConfiguration,
+) -> Result<PurifiedStatement, PlanError> {
+    let scx = StatementContext::new(None, &catalog);
+
+    let CreateTableGroupStatement {
+        name: _,
+        columns,
+        constraints,
+        if_not_exists: _,
+        source: source_name,
+        schema_names,
+        table_pattern,
+        with_options,
+    } = &mut stmt;
+
+    // Columns and constraints are populated during purification, not specified by the user.
+    if matches!(columns, TableFromSourceColumns::Defined(_)) {
+        sql_bail!("CREATE TABLE GROUP column definitions cannot be specified directly");
+    }
+    if !constraints.is_empty() {
+        sql_bail!("CREATE TABLE GROUP constraint definitions cannot be specified directly");
+    }
+
+    // Get the source item and validate it's a postgres ingestion source.
+    let item = scx.get_item_by_resolved_name(source_name)?;
+    let desc = match item.source_desc()? {
+        Some(desc) => desc.clone().into_inline_connection(scx.catalog),
+        None => sql_bail!("CREATE TABLE GROUP requires an ingestion-based source"),
+    };
+
+    // Table groups only work with Postgres sources.
+    let pg_source_connection = match &desc.connection {
+        GenericSourceConnection::Postgres(pg) => pg,
+        _ => sql_bail!("CREATE TABLE GROUP is only supported for PostgreSQL sources"),
+    };
+
+    let pg_connection = &pg_source_connection.connection;
+    let client = pg_connection
+        .validate(pg_source_connection.connection_id, storage_configuration)
+        .await?;
+
+    // Discover all tables in the publication.
+    let all_tables =
+        mz_postgres_util::publication_info(&client, &pg_source_connection.publication, None)
+            .await?;
+
+    // Compile the optional table name regex pattern.
+    let table_regex = match table_pattern.as_deref() {
+        Some(pattern) => Some(regex::Regex::new(pattern).map_err(|e| {
+            sql_err!("invalid TABLE PATTERN regex '{}': {}", pattern, e)
+        })?),
+        None => None,
+    };
+
+    // Filter tables by schema names and optional table pattern.
+    let schema_set: BTreeSet<&str> = schema_names.iter().map(|s| s.as_str()).collect();
+    let matched_tables: Vec<_> = all_tables
+        .into_values()
+        .filter(|table| {
+            if !schema_set.contains(table.namespace.as_str()) {
+                return false;
+            }
+            if let Some(ref regex) = table_regex {
+                return regex.is_match(&table.name);
+            }
+            true
+        })
+        .collect();
+
+    if matched_tables.is_empty() {
+        sql_bail!(
+            "no tables match the specified SCHEMAS and TABLE PATTERN in publication '{}'",
+            pg_source_connection.publication
+        );
+    }
+
+    // Pick the first table as the canonical schema and validate all others match.
+    let canonical = &matched_tables[0];
+    for table in &matched_tables[1..] {
+        // Validate same columns (by name, type, nullability).
+        let canonical_cols: BTreeMap<&str, &mz_postgres_util::desc::PostgresColumnDesc> =
+            canonical.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+        let other_cols: BTreeMap<&str, &mz_postgres_util::desc::PostgresColumnDesc> =
+            table.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+
+        if canonical_cols.len() != other_cols.len() {
+            sql_bail!(
+                "table {}.{} has {} columns but canonical table {}.{} has {} columns",
+                table.namespace,
+                table.name,
+                other_cols.len(),
+                canonical.namespace,
+                canonical.name,
+                canonical_cols.len(),
+            );
+        }
+
+        for (col_name, canonical_col) in &canonical_cols {
+            match other_cols.get(col_name) {
+                None => sql_bail!(
+                    "table {}.{} is missing column '{}' present in canonical table {}.{}",
+                    table.namespace,
+                    table.name,
+                    col_name,
+                    canonical.namespace,
+                    canonical.name,
+                ),
+                Some(other_col) => {
+                    if canonical_col.type_oid != other_col.type_oid {
+                        sql_bail!(
+                            "column '{}' in table {}.{} has type OID {} but canonical table {}.{} has type OID {}",
+                            col_name,
+                            table.namespace,
+                            table.name,
+                            other_col.type_oid,
+                            canonical.namespace,
+                            canonical.name,
+                            canonical_col.type_oid,
+                        );
+                    }
+                    if canonical_col.nullable != other_col.nullable {
+                        sql_bail!(
+                            "column '{}' in table {}.{} has different nullability than canonical table {}.{}",
+                            col_name,
+                            table.namespace,
+                            table.name,
+                            canonical.namespace,
+                            canonical.name,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Validate same primary key structure.
+        let canonical_pks: Vec<_> = canonical.keys.iter().filter(|k| k.is_primary).collect();
+        let other_pks: Vec<_> = table.keys.iter().filter(|k| k.is_primary).collect();
+        let canonical_pk_cols: Vec<Vec<u16>> =
+            canonical_pks.iter().map(|k| k.cols.clone()).collect();
+        let other_pk_cols: Vec<Vec<u16>> = other_pks.iter().map(|k| k.cols.clone()).collect();
+
+        // Map PK column numbers to names for comparison (since col_num may differ
+        // across tables even if the column name is the same).
+        let canonical_pk_col_names: Vec<Vec<&str>> = canonical_pk_cols
+            .iter()
+            .map(|cols| {
+                cols.iter()
+                    .map(|num| {
+                        canonical
+                            .columns
+                            .iter()
+                            .find(|c| c.col_num == *num)
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("?")
+                    })
+                    .collect()
+            })
+            .collect();
+        let other_pk_col_names: Vec<Vec<&str>> = other_pk_cols
+            .iter()
+            .map(|cols| {
+                cols.iter()
+                    .map(|num| {
+                        table
+                            .columns
+                            .iter()
+                            .find(|c| c.col_num == *num)
+                            .map(|c| c.name.as_str())
+                            .unwrap_or("?")
+                    })
+                    .collect()
+            })
+            .collect();
+
+        if canonical_pk_col_names != other_pk_col_names {
+            sql_bail!(
+                "table {}.{} has a different primary key structure than canonical table {}.{}",
+                table.namespace,
+                table.name,
+                canonical.namespace,
+                canonical.name,
+            );
+        }
+    }
+
+    // Extract text_columns and exclude_columns from WITH options.
+    let crate::plan::statement::ddl::TableFromSourceOptionExtracted {
+        text_columns,
+        exclude_columns,
+        retain_history: _,
+        details,
+        partition_by: _,
+        seen: _,
+    } = with_options.clone().try_into()?;
+    assert_none!(details, "details cannot be explicitly set");
+
+    let text_column_set: BTreeSet<&str> = text_columns.iter().map(|c| c.as_str()).collect();
+    let exclude_column_set: BTreeSet<&str> = exclude_columns.iter().map(|c| c.as_str()).collect();
+
+    // Generate column definitions from the canonical schema.
+    // Prepend identification columns: mz_source_schema (text), mz_source_table (text).
+    let mut gen_columns = vec![];
+
+    // mz_source_schema column
+    let text_type = scx.resolve_type(mz_pgrepr::Type::Text)?;
+    gen_columns.push(ColumnDef {
+        name: Ident::new("mz_source_schema")?,
+        data_type: text_type.clone(),
+        collation: None,
+        options: vec![mz_sql_parser::ast::ColumnOptionDef {
+            name: None,
+            option: mz_sql_parser::ast::ColumnOption::NotNull,
+        }],
+    });
+
+    // mz_source_table column
+    gen_columns.push(ColumnDef {
+        name: Ident::new("mz_source_table")?,
+        data_type: text_type,
+        collation: None,
+        options: vec![mz_sql_parser::ast::ColumnOptionDef {
+            name: None,
+            option: mz_sql_parser::ast::ColumnOption::NotNull,
+        }],
+    });
+
+    // Data columns from canonical schema.
+    let mut unsupported_cols = vec![];
+    for c in canonical.columns.iter() {
+        if exclude_column_set.contains(c.name.as_str()) {
+            continue;
+        }
+
+        let ty = if text_column_set.contains(c.name.as_str()) {
+            mz_pgrepr::Type::Text
+        } else {
+            match mz_pgrepr::Type::from_oid_and_typmod(c.type_oid, c.type_mod) {
+                Ok(t) => t,
+                Err(_) => {
+                    unsupported_cols.push((c.name.clone(), mz_repr::adt::system::Oid(c.type_oid)));
+                    continue;
+                }
+            }
+        };
+
+        let data_type = scx.resolve_type(ty)?;
+        let mut options = vec![];
+        if !c.nullable {
+            options.push(mz_sql_parser::ast::ColumnOptionDef {
+                name: None,
+                option: mz_sql_parser::ast::ColumnOption::NotNull,
+            });
+        }
+
+        gen_columns.push(ColumnDef {
+            name: Ident::new(c.name.clone())?,
+            data_type,
+            collation: None,
+            options,
+        });
+    }
+
+    if !unsupported_cols.is_empty() {
+        unsupported_cols.sort();
+        Err(PgSourcePurificationError::UnrecognizedTypes {
+            cols: unsupported_cols,
+        })?;
+    }
+
+    // Generate constraints. Prepend identification columns to the primary key.
+    let mut gen_constraints = vec![];
+    for key in canonical.keys.iter() {
+        let mut key_columns = vec![];
+
+        if key.is_primary {
+            // Prepend mz_source_schema and mz_source_table to PK
+            key_columns.push(Ident::new("mz_source_schema")?);
+            key_columns.push(Ident::new("mz_source_table")?);
+        }
+
+        for col_num in &key.cols {
+            let col_name = canonical
+                .columns
+                .iter()
+                .find(|col| col.col_num == *col_num)
+                .expect("key column must exist")
+                .name
+                .clone();
+            key_columns.push(Ident::new(col_name)?);
+        }
+
+        let constraint = mz_sql_parser::ast::TableConstraint::Unique {
+            name: Some(Ident::new(key.name.clone())?),
+            columns: key_columns,
+            is_primary: key.is_primary,
+            nulls_not_distinct: key.nulls_not_distinct,
+        };
+
+        if key.is_primary {
+            gen_constraints.insert(0, constraint);
+        } else {
+            gen_constraints.push(constraint);
+        }
+    }
+
+    // Store details as hex-encoded protobuf.
+    let gen_details = SourceExportStatementDetails::PostgresTableGroup {
+        canonical_desc: canonical.clone(),
+        schema_names: schema_names.clone(),
+        table_pattern: table_pattern.clone(),
+        initial_tables: matched_tables,
+    };
+
+    // Populate the statement.
+    *columns = TableFromSourceColumns::Defined(gen_columns);
+    *constraints = gen_constraints;
+
+    // Update TEXT COLUMNS / EXCLUDE COLUMNS in with_options if present.
+    if let Some(text_cols_option) = with_options
+        .iter_mut()
+        .find(|option| option.name == TableFromSourceOptionName::TextColumns)
+    {
+        let mut sorted = text_columns.clone();
+        sorted.sort();
+        text_cols_option.value = Some(WithOptionValue::Sequence(
+            sorted.into_iter().map(WithOptionValue::Ident::<Aug>).collect(),
+        ));
+    }
+    if let Some(exclude_cols_option) = with_options
+        .iter_mut()
+        .find(|option| option.name == TableFromSourceOptionName::ExcludeColumns)
+    {
+        let mut sorted = exclude_columns.clone();
+        sorted.sort();
+        exclude_cols_option.value = Some(WithOptionValue::Sequence(
+            sorted
+                .into_iter()
+                .map(WithOptionValue::Ident::<Aug>)
+                .collect(),
+        ));
+    }
+
+    with_options.push(TableFromSourceOption {
+        name: TableFromSourceOptionName::Details,
+        value: Some(WithOptionValue::Value(Value::String(hex::encode(
+            gen_details.into_proto().encode_to_vec(),
+        )))),
+    });
+
+    Ok(PurifiedStatement::PurifiedCreateTableGroup { stmt })
 }
 
 enum SourceFormatOptions {

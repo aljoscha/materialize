@@ -109,7 +109,7 @@ use mz_storage_types::sources::mysql::{
 };
 use mz_storage_types::sources::postgres::{
     PostgresSourceConnection, PostgresSourcePublicationDetails,
-    ProtoPostgresSourcePublicationDetails,
+    PostgresTableGroupExportDetails, ProtoPostgresSourcePublicationDetails,
 };
 use mz_storage_types::sources::sql_server::{
     ProtoSqlServerSourceExtras, SqlServerSourceExportDetails,
@@ -2560,13 +2560,138 @@ fn get_unnamed_key_envelope(
 }
 
 pub fn plan_create_table_group(
-    _scx: &StatementContext,
-    _stmt: CreateTableGroupStatement<Aug>,
+    scx: &StatementContext,
+    stmt: CreateTableGroupStatement<Aug>,
 ) -> Result<Plan, PlanError> {
-    // TODO: Implement table group planning. This will be similar to
-    // plan_create_table_from_source but handles multiple upstream tables
-    // merged into a single collection.
-    sql_bail!("CREATE TABLE GROUP is not yet implemented");
+    if !scx.catalog.system_vars().enable_create_table_from_source() {
+        sql_bail!("CREATE TABLE ... FROM SOURCE is not supported");
+    }
+
+    let CreateTableGroupStatement {
+        name,
+        columns,
+        constraints,
+        if_not_exists,
+        source,
+        schema_names,
+        table_pattern: _,
+        with_options,
+    } = &stmt;
+
+    let TableFromSourceOptionExtracted {
+        text_columns,
+        exclude_columns: _,
+        retain_history,
+        partition_by,
+        details,
+        seen: _,
+    } = with_options.clone().try_into()?;
+
+    let source_item = scx.get_item_by_resolved_name(source)?;
+    let ingestion_id = source_item.id();
+
+    // Decode the details option stored on the statement, which contains
+    // information created during the purification process.
+    let details = details
+        .as_ref()
+        .ok_or_else(|| sql_err!("internal error: table group missing details"))?;
+    let details = hex::decode(details).map_err(|e| sql_err!("{}", e))?;
+    let details =
+        ProtoSourceExportStatementDetails::decode(&*details).map_err(|e| sql_err!("{}", e))?;
+    let details =
+        SourceExportStatementDetails::from_proto(details).map_err(|e| sql_err!("{}", e))?;
+
+    let details = match details {
+        SourceExportStatementDetails::PostgresTableGroup {
+            canonical_desc,
+            schema_names,
+            table_pattern,
+            initial_tables,
+        } => SourceExportDetails::PostgresTableGroup(PostgresTableGroupExportDetails {
+            column_casts: crate::pure::postgres::generate_column_casts(
+                scx,
+                &canonical_desc,
+                &text_columns,
+            )?,
+            canonical_desc,
+            schema_names,
+            table_pattern,
+            initial_tables,
+        }),
+        _ => {
+            sql_bail!("internal error: unexpected details variant for table group")
+        }
+    };
+
+    // Columns are populated during purification (TableFromSourceColumns::Defined).
+    let desc = match columns {
+        TableFromSourceColumns::Defined(columns) => {
+            plan_source_export_desc(scx, name, columns, constraints)?
+        }
+        _ => {
+            sql_bail!("internal error: table group columns not populated during purification")
+        }
+    };
+
+    let names: Vec<_> = desc.iter_names().cloned().collect();
+    if let Some(dup) = names.iter().duplicates().next() {
+        sql_bail!("column {} specified more than once", dup.quoted());
+    }
+
+    let name = scx.allocate_qualified_name(normalize::unresolved_item_name(name.clone())?)?;
+
+    let timeline = Timeline::EpochMilliseconds;
+
+    if let Some(partition_by) = partition_by {
+        scx.require_feature_flag(&ENABLE_COLLECTION_PARTITION_BY)?;
+        check_partition_by(&desc, partition_by)?;
+    }
+
+    // Build a synthetic external_reference for display in system tables.
+    // Table groups don't map to a single upstream table, so we use the
+    // schema names and optional pattern as a descriptive identifier.
+    let ref_parts: Vec<Ident> = schema_names
+        .iter()
+        .map(|s| Ident::new_unchecked(s))
+        .collect();
+    let external_reference = UnresolvedItemName(ref_parts);
+
+    let if_not_exists = *if_not_exists;
+
+    let data_source = DataSourceDesc::IngestionExport {
+        ingestion_id,
+        external_reference,
+        details,
+        // Postgres table groups use None envelope and no encoding, like subsources.
+        // Data arrives as text-encoded columns and is cast via column_casts.
+        data_config: SourceExportDataConfig {
+            envelope: SourceEnvelope::None(NoneEnvelope {
+                key_envelope: KeyEnvelope::None,
+                key_arity: 0,
+            }),
+            encoding: None,
+        },
+    };
+
+    let create_sql = normalize::create_statement(scx, Statement::CreateTableGroup(stmt))?;
+
+    let compaction_window = plan_retain_history_option(scx, retain_history)?;
+    let table = Table {
+        create_sql,
+        desc: VersionedRelationDesc::new(desc),
+        temporary: false,
+        compaction_window,
+        data_source: TableDataSource::DataSource {
+            desc: data_source,
+            timeline,
+        },
+    };
+
+    Ok(Plan::CreateTable(CreateTablePlan {
+        name,
+        table,
+        if_not_exists,
+    }))
 }
 
 pub fn describe_create_view(

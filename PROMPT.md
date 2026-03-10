@@ -42,7 +42,7 @@ pattern are auto-discovered via periodic polling (WAL-only, no snapshot).
 
 ## Current Status
 
-Parser/AST done. Next: storage types (protobuf + Rust types).
+Purification done. Next: planning (plan_create_table_group in ddl.rs).
 
 ## Progress Log
 
@@ -53,3 +53,11 @@ Parser/AST done. Next: storage types (protobuf + Rust types).
   parsing for `CREATE TABLE GROUP ... FROM SOURCE (SCHEMAS (...), TABLE PATTERN '...')`
   and `DROP TABLE GROUP`. Reuses `TableFromSourceOption` for WITH clause. Stubs added
   in planning layer. Purification registration done.
+- Storage types: Added `PostgresTableGroupExportDetails` struct, protobuf message
+  `ProtoPostgresTableGroupExportStatementDetails`, and `PostgresTableGroup` variant
+  in `SourceExportDetails`/`SourceExportStatementDetails` with proto roundtrip.
+- Purification: Implemented `purify_create_table_group` in `src/sql/src/pure.rs`.
+  Connects to upstream PG, discovers tables, filters by schema+pattern, validates
+  identical schemas, generates columns with mz_source_schema/mz_source_table prepended,
+  stores details as hex-encoded protobuf. Added `PurifiedCreateTableGroup` variant
+  and message_handler dispatch.
