@@ -64,12 +64,12 @@ use mz_sql_parser::ast::{
     CreateSinkOptionName, CreateSinkStatement, CreateSourceConnection, CreateSourceOption,
     CreateSourceOptionName, CreateSourceStatement, CreateSubsourceOption,
     CreateSubsourceOptionName, CreateSubsourceStatement, CreateTableFromSourceStatement,
-    CreateTableStatement, CreateTypeAs, CreateTypeListOption, CreateTypeListOptionName,
-    CreateTypeMapOption, CreateTypeMapOptionName, CreateTypeStatement, CreateViewStatement,
-    CreateWebhookSourceStatement, CsrConfigOption, CsrConfigOptionName, CsrConnection,
-    CsrConnectionAvro, CsrConnectionProtobuf, CsrSeedProtobuf, CsvColumns, DeferredItemName,
-    DocOnIdentifier, DocOnSchema, DropObjectsStatement, DropOwnedStatement, Expr, Format,
-    FormatSpecifier, IcebergSinkConfigOption, Ident, IfExistsBehavior, IndexOption,
+    CreateTableGroupStatement, CreateTableStatement, CreateTypeAs, CreateTypeListOption,
+    CreateTypeListOptionName, CreateTypeMapOption, CreateTypeMapOptionName, CreateTypeStatement,
+    CreateViewStatement, CreateWebhookSourceStatement, CsrConfigOption, CsrConfigOptionName,
+    CsrConnection, CsrConnectionAvro, CsrConnectionProtobuf, CsrSeedProtobuf, CsvColumns,
+    DeferredItemName, DocOnIdentifier, DocOnSchema, DropObjectsStatement, DropOwnedStatement, Expr,
+    Format, FormatSpecifier, IcebergSinkConfigOption, Ident, IfExistsBehavior, IndexOption,
     IndexOptionName, KafkaSinkConfigOption, KeyConstraint, LoadGeneratorOption,
     LoadGeneratorOptionName, MaterializedViewOption, MaterializedViewOptionName, MySqlConfigOption,
     MySqlConfigOptionName, NetworkPolicyOption, NetworkPolicyOptionName,
@@ -501,6 +501,13 @@ pub fn plan_create_table(
 pub fn describe_create_table_from_source(
     _: &StatementContext,
     _: CreateTableFromSourceStatement<Aug>,
+) -> Result<StatementDesc, PlanError> {
+    Ok(StatementDesc::new(None))
+}
+
+pub fn describe_create_table_group(
+    _: &StatementContext,
+    _: CreateTableGroupStatement<Aug>,
 ) -> Result<StatementDesc, PlanError> {
     Ok(StatementDesc::new(None))
 }
@@ -2541,6 +2548,16 @@ fn get_unnamed_key_envelope(
     } else {
         Ok(KeyEnvelope::Named("key".to_string()))
     }
+}
+
+pub fn plan_create_table_group(
+    _scx: &StatementContext,
+    _stmt: CreateTableGroupStatement<Aug>,
+) -> Result<Plan, PlanError> {
+    // TODO: Implement table group planning. This will be similar to
+    // plan_create_table_from_source but handles multiple upstream tables
+    // merged into a single collection.
+    sql_bail!("CREATE TABLE GROUP is not yet implemented");
 }
 
 pub fn describe_create_view(

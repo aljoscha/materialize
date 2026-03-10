@@ -58,6 +58,7 @@ pub enum Statement<T: AstInfo> {
     CreateContinualTask(CreateContinualTaskStatement<T>),
     CreateTable(CreateTableStatement<T>),
     CreateTableFromSource(CreateTableFromSourceStatement<T>),
+    CreateTableGroup(CreateTableGroupStatement<T>),
     CreateIndex(CreateIndexStatement<T>),
     CreateType(CreateTypeStatement<T>),
     CreateRole(CreateRoleStatement),
@@ -137,6 +138,7 @@ impl<T: AstInfo> AstDisplay for Statement<T> {
             Statement::CreateContinualTask(stmt) => f.write_node(stmt),
             Statement::CreateTable(stmt) => f.write_node(stmt),
             Statement::CreateTableFromSource(stmt) => f.write_node(stmt),
+            Statement::CreateTableGroup(stmt) => f.write_node(stmt),
             Statement::CreateIndex(stmt) => f.write_node(stmt),
             Statement::CreateRole(stmt) => f.write_node(stmt),
             Statement::CreateSecret(stmt) => f.write_node(stmt),
@@ -219,6 +221,7 @@ pub fn statement_kind_label_value(kind: StatementKind) -> &'static str {
         StatementKind::CreateContinualTask => "create_continual_task",
         StatementKind::CreateTable => "create_table",
         StatementKind::CreateTableFromSource => "create_table_from_source",
+        StatementKind::CreateTableGroup => "create_table_group",
         StatementKind::CreateIndex => "create_index",
         StatementKind::CreateType => "create_type",
         StatementKind::CreateRole => "create_role",
@@ -1825,6 +1828,91 @@ impl<T: AstInfo> AstDisplay for CreateTableFromSourceStatement<T> {
     }
 }
 impl_display_t!(CreateTableFromSourceStatement);
+
+/// `CREATE TABLE GROUP .. FROM SOURCE`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CreateTableGroupStatement<T: AstInfo> {
+    /// Name of the table group
+    pub name: UnresolvedItemName,
+    /// Column definitions (populated during purification from upstream schema,
+    /// plus the prepended mz_source_schema and mz_source_table columns)
+    pub columns: TableFromSourceColumns<T>,
+    /// Table constraints (e.g. primary key)
+    pub constraints: Vec<TableConstraint<T>>,
+    pub if_not_exists: bool,
+    /// The source to read from
+    pub source: T::ItemName,
+    /// Upstream PG schema names to match tables in
+    pub schema_names: Vec<String>,
+    /// Optional regex pattern for filtering table names
+    pub table_pattern: Option<String>,
+    /// WITH options (TEXT COLUMNS, EXCLUDE COLUMNS, DETAILS, etc.)
+    pub with_options: Vec<TableFromSourceOption<T>>,
+}
+
+impl<T: AstInfo> AstDisplay for CreateTableGroupStatement<T> {
+    fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
+        let Self {
+            name,
+            columns,
+            constraints,
+            if_not_exists,
+            source,
+            schema_names,
+            table_pattern,
+            with_options,
+        } = self;
+        f.write_str("CREATE TABLE GROUP ");
+        if *if_not_exists {
+            f.write_str("IF NOT EXISTS ");
+        }
+        f.write_node(name);
+
+        if !matches!(columns, TableFromSourceColumns::NotSpecified) || !constraints.is_empty() {
+            f.write_str(" (");
+            match columns {
+                TableFromSourceColumns::NotSpecified => unreachable!(),
+                TableFromSourceColumns::Named(columns) => {
+                    f.write_node(&display::comma_separated(columns))
+                }
+                TableFromSourceColumns::Defined(columns) => {
+                    f.write_node(&display::comma_separated(columns))
+                }
+            };
+            if !constraints.is_empty() {
+                f.write_str(", ");
+                f.write_node(&display::comma_separated(constraints));
+            }
+            f.write_str(")");
+        }
+
+        f.write_str(" FROM SOURCE ");
+        f.write_node(source);
+        f.write_str(" (SCHEMAS (");
+        for (i, schema) in schema_names.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ");
+            }
+            f.write_str("'");
+            f.write_str(&display::escape_single_quote_string(schema));
+            f.write_str("'");
+        }
+        f.write_str(")");
+        if let Some(pattern) = table_pattern {
+            f.write_str(", TABLE PATTERN '");
+            f.write_str(&display::escape_single_quote_string(pattern));
+            f.write_str("'");
+        }
+        f.write_str(")");
+
+        if !with_options.is_empty() {
+            f.write_str(" WITH (");
+            f.write_node(&display::comma_separated(with_options));
+            f.write_str(")");
+        }
+    }
+}
+impl_display_t!(CreateTableGroupStatement);
 
 /// `CREATE INDEX`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4270,6 +4358,7 @@ pub enum ObjectType {
     Subsource,
     ContinualTask,
     NetworkPolicy,
+    TableGroup,
 }
 
 impl ObjectType {
@@ -4286,7 +4375,8 @@ impl ObjectType {
             | ObjectType::Connection
             | ObjectType::Func
             | ObjectType::Subsource
-            | ObjectType::ContinualTask => true,
+            | ObjectType::ContinualTask
+            | ObjectType::TableGroup => true,
             ObjectType::Database
             | ObjectType::Schema
             | ObjectType::Cluster
@@ -4318,6 +4408,7 @@ impl AstDisplay for ObjectType {
             ObjectType::Subsource => "SUBSOURCE",
             ObjectType::ContinualTask => "CONTINUAL TASK",
             ObjectType::NetworkPolicy => "NETWORK POLICY",
+            ObjectType::TableGroup => "TABLE GROUP",
         })
     }
 }

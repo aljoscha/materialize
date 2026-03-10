@@ -1581,6 +1581,9 @@ impl From<mz_sql_parser::ast::ObjectType> for ObjectType {
             mz_sql_parser::ast::ObjectType::Func => ObjectType::Func,
             mz_sql_parser::ast::ObjectType::ContinualTask => ObjectType::ContinualTask,
             mz_sql_parser::ast::ObjectType::NetworkPolicy => ObjectType::NetworkPolicy,
+            // Table groups are implemented as tables with IngestionExport data sources,
+            // so they map to the Table catalog object type.
+            mz_sql_parser::ast::ObjectType::TableGroup => ObjectType::Table,
         }
     }
 }

@@ -287,6 +287,7 @@ impl Plan {
             StatementKind::CreateWebhookSource => &[PlanKind::CreateSource, PlanKind::CreateTable],
             StatementKind::CreateTable => &[PlanKind::CreateTable],
             StatementKind::CreateTableFromSource => &[PlanKind::CreateTable],
+            StatementKind::CreateTableGroup => &[PlanKind::CreateTable],
             StatementKind::CreateType => &[PlanKind::CreateType],
             StatementKind::CreateView => &[PlanKind::CreateView],
             StatementKind::Deallocate => &[PlanKind::Deallocate],

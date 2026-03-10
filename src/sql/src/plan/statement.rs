@@ -159,6 +159,7 @@ pub fn describe(
         Statement::CreateTableFromSource(stmt) => {
             ddl::describe_create_table_from_source(&scx, stmt)?
         }
+        Statement::CreateTableGroup(stmt) => ddl::describe_create_table_group(&scx, stmt)?,
         Statement::CreateType(stmt) => ddl::describe_create_type(&scx, stmt)?,
         Statement::CreateView(stmt) => ddl::describe_create_view(&scx, stmt)?,
         Statement::CreateMaterializedView(stmt) => {
@@ -356,6 +357,7 @@ pub fn plan(
         Statement::CreateSubsource(stmt) => ddl::plan_create_subsource(scx, stmt),
         Statement::CreateTable(stmt) => ddl::plan_create_table(scx, stmt),
         Statement::CreateTableFromSource(stmt) => ddl::plan_create_table_from_source(scx, stmt),
+        Statement::CreateTableGroup(stmt) => ddl::plan_create_table_group(scx, stmt),
         Statement::CreateType(stmt) => ddl::plan_create_type(scx, stmt),
         Statement::CreateView(stmt) => ddl::plan_create_view(scx, stmt),
         Statement::CreateMaterializedView(stmt) => ddl::plan_create_materialized_view(scx, stmt),
@@ -1081,6 +1083,7 @@ impl<T: mz_sql_parser::ast::AstInfo> From<&Statement<T>> for StatementClassifica
             Statement::CreateSubsource(_) => DDL,
             Statement::CreateTable(_) => DDL,
             Statement::CreateTableFromSource(_) => DDL,
+            Statement::CreateTableGroup(_) => DDL,
             Statement::CreateType(_) => DDL,
             Statement::CreateView(_) => DDL,
             Statement::CreateMaterializedView(_) => DDL,

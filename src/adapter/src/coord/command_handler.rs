@@ -1140,6 +1140,7 @@ impl Coordinator {
                     Statement::AlterObjectRename(_)
                     | Statement::AlterObjectSwap(_)
                     | Statement::CreateTableFromSource(_)
+                    | Statement::CreateTableGroup(_)
                     | Statement::CreateSource(_) => {
                         let state = self.catalog().for_session(ctx.session()).state().clone();
                         let revision = self.catalog().transient_revision();
@@ -1546,6 +1547,7 @@ impl Coordinator {
                 | Statement::AlterSource(_)
                 | Statement::CreateSink(_)
                 | Statement::CreateTableFromSource(_)
+                | Statement::CreateTableGroup(_)
         ) {
             return false;
         }

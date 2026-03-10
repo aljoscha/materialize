@@ -42,10 +42,14 @@ pattern are auto-discovered via periodic polling (WAL-only, no snapshot).
 
 ## Current Status
 
-Design doc written. Implementation not started.
+Parser/AST done. Next: storage types (protobuf + Rust types).
 
 ## Progress Log
 
 (Update after each milestone — what was implemented, key decisions made.)
 
 - Design doc created: `doc/developer/design/20260310_table_groups.md`
+- Parser AST + Parser: Added `CreateTableGroupStatement`, `TableGroup` ObjectType,
+  parsing for `CREATE TABLE GROUP ... FROM SOURCE (SCHEMAS (...), TABLE PATTERN '...')`
+  and `DROP TABLE GROUP`. Reuses `TableFromSourceOption` for WITH clause. Stubs added
+  in planning layer. Purification registration done.

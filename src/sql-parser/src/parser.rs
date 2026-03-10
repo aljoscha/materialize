@@ -1947,7 +1947,10 @@ impl<'a> Parser<'a> {
             || self.peek_keywords(&[TEMP, TABLE])
             || self.peek_keywords(&[TEMPORARY, TABLE])
         {
-            if self.peek_keywords_lookahead(&[FROM, SOURCE])
+            if self.peek_keywords(&[TABLE, GROUP]) {
+                self.parse_create_table_group()
+                    .map_parser_err(StatementKind::CreateTableGroup)
+            } else if self.peek_keywords_lookahead(&[FROM, SOURCE])
                 || self.peek_keywords_lookahead(&[FROM, WEBHOOK])
             {
                 self.parse_create_table_from_source()
@@ -4943,7 +4946,8 @@ impl<'a> Parser<'a> {
             | ObjectType::Type
             | ObjectType::Secret
             | ObjectType::Connection
-            | ObjectType::ContinualTask => {
+            | ObjectType::ContinualTask
+            | ObjectType::TableGroup => {
                 let names = self.parse_comma_separated(|parser| {
                     Ok(UnresolvedObjectName::Item(parser.parse_item_name()?))
                 })?;
@@ -5193,6 +5197,58 @@ impl<'a> Parser<'a> {
                 with_options,
             },
         ))
+    }
+
+    /// Parse `CREATE TABLE GROUP <name> [IF NOT EXISTS]
+    ///     FROM SOURCE <source>
+    ///     (SCHEMAS ('<schema1>', ...) [, TABLE PATTERN '<regex>'])
+    ///     [WITH (TEXT COLUMNS (<col>, ...), EXCLUDE COLUMNS (<col>, ...))]`
+    fn parse_create_table_group(&mut self) -> Result<Statement<Raw>, ParserError> {
+        self.expect_keywords(&[TABLE, GROUP])?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.parse_item_name()?;
+
+        // Parse optional column definitions (populated during purification)
+        let (columns, constraints) = self.parse_table_from_source_columns()?;
+
+        self.expect_keywords(&[FROM, SOURCE])?;
+        let source = self.parse_raw_name()?;
+
+        // Parse (SCHEMAS (...) [, TABLE PATTERN '...'])
+        self.expect_token(&Token::LParen)?;
+        self.expect_keyword(SCHEMAS)?;
+        self.expect_token(&Token::LParen)?;
+        let schema_names =
+            self.parse_comma_separated(|parser| Ok(parser.parse_literal_string()?))?;
+        self.expect_token(&Token::RParen)?;
+
+        let table_pattern = if self.consume_token(&Token::Comma) {
+            self.expect_keywords(&[TABLE, PATTERN])?;
+            Some(self.parse_literal_string()?)
+        } else {
+            None
+        };
+        self.expect_token(&Token::RParen)?;
+
+        let with_options = if self.parse_keyword(WITH) {
+            self.expect_token(&Token::LParen)?;
+            let options = self.parse_comma_separated(Parser::parse_table_from_source_option)?;
+            self.expect_token(&Token::RParen)?;
+            options
+        } else {
+            vec![]
+        };
+
+        Ok(Statement::CreateTableGroup(CreateTableGroupStatement {
+            name,
+            columns,
+            constraints,
+            if_not_exists,
+            source,
+            schema_names,
+            table_pattern,
+            with_options,
+        }))
     }
 
     fn parse_table_from_source_option(
@@ -5741,7 +5797,7 @@ impl<'a> Parser<'a> {
             ObjectType::NetworkPolicy => self
                 .parse_alter_network_policy()
                 .map_parser_err(StatementKind::AlterNetworkPolicy),
-            ObjectType::Func | ObjectType::Subsource => parser_err!(
+            ObjectType::Func | ObjectType::Subsource | ObjectType::TableGroup => parser_err!(
                 self,
                 self.peek_prev_pos(),
                 format!("Unsupported ALTER on {object_type}")
@@ -7323,7 +7379,8 @@ impl<'a> Parser<'a> {
             | ObjectType::Secret
             | ObjectType::Connection
             | ObjectType::Func
-            | ObjectType::ContinualTask => UnresolvedObjectName::Item(self.parse_item_name()?),
+            | ObjectType::ContinualTask
+            | ObjectType::TableGroup => UnresolvedObjectName::Item(self.parse_item_name()?),
             ObjectType::Role => UnresolvedObjectName::Role(self.parse_identifier()?),
             ObjectType::Cluster => UnresolvedObjectName::Cluster(self.parse_identifier()?),
             ObjectType::ClusterReplica => {
@@ -8147,7 +8204,7 @@ impl<'a> Parser<'a> {
                         on_object,
                     }
                 }
-                ObjectType::Func => {
+                ObjectType::Func | ObjectType::TableGroup => {
                     return parser_err!(
                         self,
                         self.peek_prev_pos(),
@@ -9607,7 +9664,8 @@ impl<'a> Parser<'a> {
             | ObjectType::ClusterReplica
             | ObjectType::Role
             | ObjectType::Func
-            | ObjectType::Subsource => {
+            | ObjectType::Subsource
+            | ObjectType::TableGroup => {
                 parser_err!(
                     self,
                     self.peek_prev_pos(),
@@ -9647,7 +9705,13 @@ impl<'a> Parser<'a> {
                 CONTINUAL,
                 NETWORK,
             ])? {
-                TABLE => ObjectType::Table,
+                TABLE => {
+                    if self.parse_keyword(GROUP) {
+                        ObjectType::TableGroup
+                    } else {
+                        ObjectType::Table
+                    }
+                }
                 VIEW => ObjectType::View,
                 MATERIALIZED => {
                     if let Err(e) = self.expect_keyword(VIEW) {
@@ -9712,7 +9776,13 @@ impl<'a> Parser<'a> {
                 SCHEMA,
                 FUNCTION,
             ])? {
-                TABLE => ObjectType::Table,
+                TABLE => {
+                    if self.parse_keyword(GROUP) {
+                        ObjectType::TableGroup
+                    } else {
+                        ObjectType::Table
+                    }
+                }
                 VIEW => ObjectType::View,
                 MATERIALIZED => {
                     if self.parse_keyword(VIEW) {

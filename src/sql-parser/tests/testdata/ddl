@@ -3473,3 +3473,38 @@ DROP NETWORK POLICY if exists q
 DROP NETWORK POLICY IF EXISTS q
 =>
 DropObjects(DropObjectsStatement { object_type: NetworkPolicy, if_exists: true, names: [NetworkPolicy(Ident("q"))], cascade: false })
+
+parse-statement
+CREATE TABLE GROUP all_events FROM SOURCE pg_src (SCHEMAS ('public'), TABLE PATTERN '^events_')
+----
+CREATE TABLE GROUP all_events FROM SOURCE pg_src (SCHEMAS ('public'), TABLE PATTERN '^events_')
+=>
+CreateTableGroup(CreateTableGroupStatement { name: UnresolvedItemName([Ident("all_events")]), columns: NotSpecified, constraints: [], if_not_exists: false, source: Name(UnresolvedItemName([Ident("pg_src")])), schema_names: ["public"], table_pattern: Some("^events_"), with_options: [] })
+
+parse-statement
+CREATE TABLE GROUP all_orders FROM SOURCE pg_src (SCHEMAS ('tenant_a', 'tenant_b'))
+----
+CREATE TABLE GROUP all_orders FROM SOURCE pg_src (SCHEMAS ('tenant_a', 'tenant_b'))
+=>
+CreateTableGroup(CreateTableGroupStatement { name: UnresolvedItemName([Ident("all_orders")]), columns: NotSpecified, constraints: [], if_not_exists: false, source: Name(UnresolvedItemName([Ident("pg_src")])), schema_names: ["tenant_a", "tenant_b"], table_pattern: None, with_options: [] })
+
+parse-statement
+CREATE TABLE GROUP IF NOT EXISTS tg FROM SOURCE s (SCHEMAS ('public')) WITH (TEXT COLUMNS (a, b))
+----
+CREATE TABLE GROUP IF NOT EXISTS tg FROM SOURCE s (SCHEMAS ('public')) WITH (TEXT COLUMNS = (a, b))
+=>
+CreateTableGroup(CreateTableGroupStatement { name: UnresolvedItemName([Ident("tg")]), columns: NotSpecified, constraints: [], if_not_exists: true, source: Name(UnresolvedItemName([Ident("s")])), schema_names: ["public"], table_pattern: None, with_options: [TableFromSourceOption { name: TextColumns, value: Some(Sequence([Ident(Ident("a")), Ident(Ident("b"))])) }] })
+
+parse-statement
+DROP TABLE GROUP tg
+----
+DROP TABLE GROUP tg
+=>
+DropObjects(DropObjectsStatement { object_type: TableGroup, if_exists: false, names: [Item(UnresolvedItemName([Ident("tg")]))], cascade: false })
+
+parse-statement
+DROP TABLE GROUP IF EXISTS tg CASCADE
+----
+DROP TABLE GROUP IF EXISTS tg CASCADE
+=>
+DropObjects(DropObjectsStatement { object_type: TableGroup, if_exists: true, names: [Item(UnresolvedItemName([Ident("tg")]))], cascade: true })
