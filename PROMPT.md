@@ -42,7 +42,10 @@ pattern are auto-discovered via periodic polling (WAL-only, no snapshot).
 
 ## Current Status
 
-Core implementation complete. Remaining: known gaps below, then test coverage.
+Core implementation complete. Current focus: **make `test/test-table-groups.sh`
+pass end-to-end**. Build Materialize (`bin/environmentd --reset -- --all-features
+--unsafe-mode`), run the test script, read any errors, fix the code, rebuild, and
+repeat until the script runs cleanly. Each fix should be a separate jj change.
 
 ## Known Gaps
 
