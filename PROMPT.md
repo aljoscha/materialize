@@ -1,134 +1,51 @@
-I'm working on diagnosing and fixing coordinator blocking caused by periodic
-storage usage collection (`storage_usage_update`). We have a design doc at
-@misc/storage-usage-coord-blocking.md and a session log at
-@storage-usage-log.md where we record findings for continuity across sessions.
+I'm implementing "Table Groups" for PostgreSQL sources in Materialize. The full
+design doc is at @doc/developer/design/20260310_table_groups.md — read it to
+understand what needs to be implemented and to see what's next.
 
-The problem: every collection interval (default 1 hour), the coordinator
-processes `Message::StorageUsageUpdate` on its main thread. This calls
-`storage_usage_update` (message_handler.rs:239), which routes N shard updates
-through `catalog_transact_inner` — incurring 2 oracle round-trips, N
-`transact_op` calls, a persist write (id allocator bump), a persist read
-(sync_updates), and a group commit wait. In environments with hundreds or
-thousands of shards, this blocks the coordinator for seconds.
-
-The shard-size fetch itself (`storage_usage_fetch`) runs off-thread and is not
-the problem. The fix is to stop routing updates through `catalog_transact_inner`
-and instead append builtin table rows directly.
-
-Figure out where coordinator time is going, confirm with measurements, and fix
-it. Use profiling, metrics, code analysis, and custom logging as needed.
+Summary: Table groups let users match multiple upstream PG tables by schema name
++ regex pattern, merging them into a single Materialize collection with typed
+columns and `mz_source_schema`/`mz_source_table` identification columns
+prepended. All matched tables must have the same schema. New tables matching the
+pattern are auto-discovered via periodic polling (WAL-only, no snapshot).
 
 ## Workflow
 
-* Each solid progress (baseline measurement, diagnosis finding, optimization)
-  gets committed as a jj change with a good description, then continue to the
-  next step.
-* Before committing, verify that what you produced is high quality and works.
+* Each logical unit of work gets committed as a jj change with a good
+  description, then continue to the next step.
+* Before committing, verify that what you produced compiles (`cargo check`) and
+  is high quality and works.
 * Code should be simple and clean, well-commented explaining what/how/why.
 * Minimal changes — if we iterate and try multiple things, clean up to the
   minimum required fix at the end.
+* Minimal changes — don't refactor surrounding code unnecessarily.
 * **Read this file again after each context compaction.**
-* Update @storage-usage-log.md after each milestone with a new session entry.
-* Update this file's "Current status" and "Immediate next steps" sections after
-  each milestone.
-* Update the design doc (@misc/storage-usage-coord-blocking.md) if experimental
-  findings contradict or refine it.
-
-## Steps
-
-1. Reproduce/measure the problem (establish baselines at various shard counts)
-2. Profile and diagnose where time is spent on the coordinator thread
-3. Fix the bottleneck (following the design doc proposal or better)
-4. Re-measure to confirm improvement
-5. Repeat — there may be multiple layers of bottlenecks
-
-## Setup
-
-```bash
-# Build — always use --optimized for measurements. Debug builds are too slow
-# (the off-thread shard fetch dominates, starving collection cycles) so cycle
-# timing data from debug builds is unreliable. Use debug only for compilation
-# checks during development, not for running measurements.
-bin/environmentd --optimized
-
-# Connect
-psql -U materialize -h localhost -p 6875 materialize
-psql -U mz_system -h localhost -p 6877 materialize  # for ALTER SYSTEM SET
-
-# Trigger frequent collection (default is 3600s) — this is a startup flag, not
-# an ALTER SYSTEM SET variable:
-#   bin/environmentd --optimized -- --storage-usage-collection-interval-sec=10s
-
-# Prometheus metrics
-curl -s http://localhost:6878/metrics > /tmp/metrics.txt
-```
-
-To create many shards, create many tables (each table = 1 shard):
-```bash
-for i in $(seq 1 5000); do
-  echo "CREATE TABLE su_$i (a int);"
-done > /tmp/bulk_create.sql
-psql -U materialize -h localhost -p 6875 materialize -f /tmp/bulk_create.sql
-```
-
-Don't use `--reset` between runs — reuse existing state.
-
-## Key Metrics
-
-| Metric | What it measures |
-|--------|-----------------|
-| `mz_slow_message_handling{message_kind="storage_usage_update"}` | Wall-clock time of `storage_usage_update` on the coord thread |
-| `mz_slow_message_handling{message_kind="storage_usage_fetch"}` | Time to dispatch the fetch (should be near-zero, fetch is off-thread) |
-| `mz_storage_usage_collection_time_seconds` | Off-thread shard scan duration (not the problem) |
-| `mz_catalog_transact_seconds` | Catalog transaction time (includes the persist write/read) |
-
-Capture before/after a collection cycle:
-```bash
-curl -s http://localhost:6878/metrics | grep -E 'mz_slow_message_handling|storage_usage_collection' > /tmp/before.txt
-# wait for a collection cycle
-curl -s http://localhost:6878/metrics | grep -E 'mz_slow_message_handling|storage_usage_collection' > /tmp/after.txt
-```
+* Update this file's "Progress log" section after each milestone.
+* Consult the design doc (@doc/developer/design/20260310_table_groups.md) to
+  determine what to implement next.
 
 ## Key Code Paths
 
-| Component | Location |
-|-----------|----------|
-| `storage_usage_update` | `src/adapter/src/coord/message_handler.rs:239` |
-| `storage_usage_fetch` | `src/adapter/src/coord/message_handler.rs:208` |
-| `schedule_storage_usage_collection` | `src/adapter/src/coord/message_handler.rs:316` |
-| `Op::WeirdStorageUsageUpdates` | `src/adapter/src/catalog/transact.rs:240` |
-| Op processing (allocate_id + pack) | `src/adapter/src/catalog/transact.rs:2582` |
-| `builtin_table_update().execute()` | `src/adapter/src/coord/appends.rs:797` |
-| `pack_storage_usage_update` | `src/adapter/src/catalog/builtin_table_updates.rs:2082` |
-| `VersionedStorageUsage` | `src/audit-log/src/lib.rs` |
-| Collection interval config | `src/environmentd/src/environmentd/main.rs:381` |
-
-## Cost Breakdown on Coordinator Thread (from design doc, unverified)
-
-| Cost | Source |
-|------|--------|
-| 2 oracle round-trips | `get_local_write_ts()` in `storage_usage_update` and `catalog_transact_inner` |
-| N `transact_op` calls | Loop in `transact_inner` (increment counter + pack row each) |
-| Persist write | `commit_transaction` (compare_and_append for id_allocator bump) |
-| Persist read | `sync_updates` after commit |
-| Group commit wait | `builtin_table_update().execute()` |
+| Area | Location |
+|------|----------|
+| Parser AST | `src/sql-parser/src/ast/defs/statement.rs` |
+| Parser | `src/sql-parser/src/parser.rs` |
+| Planning | `src/sql/src/plan/statement/ddl.rs` |
+| Purification | `src/sql/src/pure/postgres.rs` |
+| Storage types | `src/storage-types/src/sources/postgres.rs` |
+| Source exports | `src/storage-types/src/sources.rs` |
+| PG ingestion | `src/storage/src/source/postgres.rs` |
+| Snapshot | `src/storage/src/source/postgres/snapshot.rs` |
+| Replication | `src/storage/src/source/postgres/replication.rs` |
+| Sequencer | `src/adapter/src/coord/sequencer/inner.rs` |
+| Catalog | `src/catalog/` |
+| Protobuf | `src/storage-types/src/sources/postgres.proto` |
 
 ## Current Status
 
-All work complete. Baseline → fix → cleanup done.
-- 10k shards: ~499ms → ~20ms (25x improvement). Verified data correctness.
-- Dead code cleaned up: Op::WeirdStorageUsageUpdates, durable id allocator,
-  instrumentation logging all removed.
-- `VersionedStorageUsage` `id` field left as-is (versioned persisted type).
+Design doc written. Implementation not started.
 
-## Completed Steps
+## Progress Log
 
-1. ~~**Baseline measurement.**~~ Done. ~499ms/cycle at 10k shards.
-2. ~~**Instrument.**~~ Done. 91% in transact_inner op loop.
-3. ~~**Implement the fix.**~~ Done. 25x speedup (499ms → 20ms).
-4. ~~**Re-measure.**~~ Done. Confirmed.
-5. ~~**Clean up dead code.**~~ Done.
+(Update after each milestone — what was implemented, key decisions made.)
 
-## Work-in-progress log (update after each milestone)
-
-- (nothing yet)
+- Design doc created: `doc/developer/design/20260310_table_groups.md`
