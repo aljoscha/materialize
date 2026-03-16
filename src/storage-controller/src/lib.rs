@@ -69,7 +69,7 @@ use mz_storage_client::metrics::StorageControllerMetrics;
 use mz_storage_client::statistics::{
     ControllerSinkStatistics, ControllerSourceStatistics, WebhookStatistics,
 };
-use mz_storage_client::storage_collections::StorageCollections;
+use mz_storage_client::storage_collections::{CollectionFrontiers, StorageCollections};
 use mz_storage_types::configuration::StorageConfiguration;
 use mz_storage_types::connections::ConnectionContext;
 use mz_storage_types::connections::inline::InlinedConnection;
@@ -3546,14 +3546,14 @@ where
     ///
     /// This method is invoked by `Controller::maintain`, which we expect to be called once per
     /// second during normal operation.
-    fn update_frontier_introspection(&mut self) {
+    fn update_frontier_introspection_from(&mut self, all_frontiers: &[CollectionFrontiers<T>]) {
         let mut global_frontiers = BTreeMap::new();
         let mut replica_frontiers = BTreeMap::new();
 
-        for collection_frontiers in self.storage_collections.active_collection_frontiers() {
+        for collection_frontiers in all_frontiers {
             let id = collection_frontiers.id;
-            let since = collection_frontiers.read_capabilities;
-            let upper = collection_frontiers.write_frontier;
+            let since = collection_frontiers.read_capabilities.clone();
+            let upper = collection_frontiers.write_frontier.clone();
 
             let instance = self
                 .collections
@@ -3659,7 +3659,7 @@ where
     ///
     /// This method is invoked by `Controller::maintain`, which we expect to be called once per
     /// second during normal operation.
-    fn refresh_wallclock_lag(&mut self) {
+    fn refresh_wallclock_lag_from(&mut self, all_frontiers: &[CollectionFrontiers<T>]) {
         let now_ms = (self.now)();
         let histogram_period =
             WallclockLagHistogramPeriod::from_epoch_millis(now_ms, self.config.config_set());
@@ -3669,7 +3669,7 @@ where
             None => Duration::ZERO,
         };
 
-        for frontiers in self.storage_collections.active_collection_frontiers() {
+        for frontiers in all_frontiers {
             let id = frontiers.id;
             let Some(collection) = self.collections.get_mut(&id) else {
                 continue;
@@ -3804,8 +3804,12 @@ where
     /// This method is invoked roughly once per second during normal operation. It is a good place
     /// for tasks that need to run periodically, such as state cleanup or updating of metrics.
     fn maintain(&mut self) {
-        self.update_frontier_introspection();
-        self.refresh_wallclock_lag();
+        // Fetch all frontiers once and share between the two maintenance tasks.
+        // This avoids calling active_collection_frontiers() twice (each is O(N)
+        // with Antichain clones per collection).
+        let all_frontiers = self.storage_collections.active_collection_frontiers();
+        self.update_frontier_introspection_from(&all_frontiers);
+        self.refresh_wallclock_lag_from(&all_frontiers);
 
         // Perform instance maintenance work.
         for instance in self.instances.values_mut() {
