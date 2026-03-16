@@ -123,4 +123,29 @@ Skip tables with no actual writes when constructing the appends vector.
 
 ## Findings
 
-(Not yet started — investigation not started)
+### B1 confirmed and fixed
+
+The table advancement loop at `appends.rs:512-516` was the single largest
+contributor to O(N) scaling. Metric deltas at 20k tables showed
+`group_commit_initiate` at **19.2ms/call**, with the table iteration itself
+at 5.3ms and the downstream consolidation/mapping of 20k entries accounting
+for the remainder.
+
+**Fix:** Removed the loop entirely. With txn-wal, table uppers are advanced
+through the txns shard (`commit_at`), so empty entries were unnecessary.
+
+**Result:** `group_commit_initiate` → **5.3ms/call** (73% reduction).
+Overall O(N) scaling ~29ms → ~10ms at 20k tables.
+
+### B2 confirmed — not yet fixed
+
+`advance_timelines` (specifically `ReadHolds::downgrade`) measured at
+**6.0ms/call** at 20k tables. This is the remaining dominant O(N) bottleneck.
+Each of the ~20k holds requires: Antichain allocation (clone), ChangeBatch
+allocation + 2 entries, and unbounded channel send (linked list node alloc).
+~60k allocations per cycle.
+
+### B3 confirmed as non-issue
+
+`ids_in_timeline` only runs for non-EpochMilliseconds timelines. Not a factor
+for user tables.

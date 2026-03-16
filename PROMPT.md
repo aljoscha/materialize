@@ -105,21 +105,22 @@ psql -U mz_system -h localhost -p 6877 materialize -f misc/coord-scaling-repro.s
 
 ## Current Status
 
-Not yet started. Need to reproduce and profile.
+B1 fixed: removed O(N) table advancement loop from group_commit.
+`group_commit_initiate` reduced from 19.2ms to 5.3ms at 20k tables.
+Overall O(N) scaling reduced from ~29ms to ~10ms (66% reduction).
+
+B2 (advance_timelines → ReadHolds::downgrade) is the remaining dominant
+bottleneck: 6.0ms/call at 20k tables.
 
 ## Immediate Next Steps
 
-1. Build optimized. Run the reproducer to confirm the issue.
-2. Identify the dominant cost center using one or more of:
-   - **Profiling** (samply) for flamegraphs showing where CPU time goes.
-   - **Metrics** (`curl -s http://localhost:6878/metrics`) — look at
-     `mz_message_handling`, `group_commit_table_advancement_seconds`,
-     `group_commit_confirm_leadership_seconds`, `append_table_duration_seconds`,
-     etc. Compare before/after creating many tables.
-   - **Tracing** — enable OpenTelemetry tracing and look at span durations
-     for `coord::group_commit`, `group_commit_apply`, `advance_timelines`,
-     etc. to see which spans grow with table count. (See the query-tracing
-     skill for setup details if needed.)
-   - **Targeted instrumentation** — add `Instant::now()` / `elapsed()` timers
-     around suspected O(N) code if the above aren't conclusive.
-3. Record findings.
+1. Fix B2: `advance_timelines` → `ReadHolds::downgrade` iterates all ~20k
+   holds every ~1s. Each iteration allocates: Antichain clone, ChangeBatch,
+   channel send node (~60k allocs total). Options:
+   - **Batch channel sends**: change `change_tx` to accept `Vec<(GlobalId,
+     ChangeBatch)>` so 20k changes go in one channel message.
+   - **Lazy downgrade**: only downgrade holds when compaction needs them.
+   - **Shared timeline frontier**: replace per-object holds with a single
+     timeline hold.
+2. Re-measure after B2 fix.
+3. Check for additional O(N) bottlenecks (e.g., `controller_ready(storage)`).
