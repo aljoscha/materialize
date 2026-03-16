@@ -1,135 +1,124 @@
-I'm working on diagnosing and fixing coordinator blocking caused by periodic
-storage usage collection (`storage_usage_update`). We have a design doc at
-@misc/storage-usage-coord-blocking.md and a session log at
-@storage-usage-log.md where we record findings for continuity across sessions.
+We're investigating database-issues#11251: coordinator per-query latency
+scales linearly with the number of catalog objects (tables). At 20k tables,
+even `SELECT 1` takes ~25ms (vs ~3ms at 1k tables). INSERT/COMMIT/DDL are
+similarly affected.
 
-The problem: every collection interval (default 1 hour), the coordinator
-processes `Message::StorageUsageUpdate` on its main thread. This calls
-`storage_usage_update` (message_handler.rs:239), which routes N shard updates
-through `catalog_transact_inner` — incurring 2 oracle round-trips, N
-`transact_op` calls, a persist write (id allocator bump), a persist read
-(sync_updates), and a group commit wait. In environments with hundreds or
-thousands of shards, this blocks the coordinator for seconds.
-
-The shard-size fetch itself (`storage_usage_fetch`) runs off-thread and is not
-the problem. The fix is to stop routing updates through `catalog_transact_inner`
-and instead append builtin table rows directly.
-
-Figure out where coordinator time is going, confirm with measurements, and fix
-it. Use profiling, metrics, code analysis, and custom logging as needed.
+Design doc: @misc/coord-linear-scaling.md
+Session log: @coord-scaling-log.md
 
 ## Workflow
 
 * Each solid progress (baseline measurement, diagnosis finding, optimization)
-  gets committed as a jj change with a good description, then continue to the
+  gets committed as a git commit with a good description, then continue to the
   next step.
 * Before committing, verify that what you produced is high quality and works.
 * Code should be simple and clean, well-commented explaining what/how/why.
 * Minimal changes — if we iterate and try multiple things, clean up to the
   minimum required fix at the end.
 * **Read this file again after each context compaction.**
-* Update @storage-usage-log.md after each milestone with a new session entry.
-* Update this file's "Current status" and "Immediate next steps" sections after
-  each milestone.
-* Update the design doc (@misc/storage-usage-coord-blocking.md) if experimental
-  findings contradict or refine it.
+* Update @coord-scaling-log.md after each milestone with a new session entry.
+* Update this file's "Current status" and "Immediate next steps" after each
+  milestone.
+* Update @misc/coord-linear-scaling.md if experimental findings contradict
+  or refine it.
 
 ## Steps
 
-1. Reproduce/measure the problem (establish baselines at various shard counts)
-2. Profile and diagnose where time is spent on the coordinator thread
-3. Fix the bottleneck (following the design doc proposal or better)
+1. Reproduce/measure the problem (establish baselines at various table counts)
+2. Profile and diagnose where time is spent on the coordinator thread per query
+3. Fix the bottleneck(s) (following design doc proposals or better)
 4. Re-measure to confirm improvement
 5. Repeat — there may be multiple layers of bottlenecks
 
 ## Setup
 
 ```bash
-# Build — always use --optimized for measurements. Debug builds are too slow
-# (the off-thread shard fetch dominates, starving collection cycles) so cycle
-# timing data from debug builds is unreliable. Use debug only for compilation
-# checks during development, not for running measurements.
+# Build — use --optimized for measurements. Debug builds have different
+# hot-path characteristics.
 bin/environmentd --optimized
 
 # Connect
 psql -U materialize -h localhost -p 6875 materialize
 psql -U mz_system -h localhost -p 6877 materialize  # for ALTER SYSTEM SET
 
-# Trigger frequent collection (default is 3600s) — this is a startup flag, not
-# an ALTER SYSTEM SET variable:
-#   bin/environmentd --optimized -- --storage-usage-collection-interval-sec=10s
-
 # Prometheus metrics
 curl -s http://localhost:6878/metrics > /tmp/metrics.txt
 ```
 
-To create many shards, create many tables (each table = 1 shard):
+The reproducer script is at @misc/coord-scaling-repro.sql. Run it with:
 ```bash
-for i in $(seq 1 5000); do
-  echo "CREATE TABLE su_$i (a int);"
-done > /tmp/bulk_create.sql
-psql -U materialize -h localhost -p 6875 materialize -f /tmp/bulk_create.sql
+psql -U mz_system -h localhost -p 6877 materialize -f misc/coord-scaling-repro.sql
 ```
-
-Don't use `--reset` between runs — reuse existing state.
 
 ## Key Metrics
 
 | Metric | What it measures |
 |--------|-----------------|
-| `mz_slow_message_handling{message_kind="storage_usage_update"}` | Wall-clock time of `storage_usage_update` on the coord thread |
-| `mz_slow_message_handling{message_kind="storage_usage_fetch"}` | Time to dispatch the fetch (should be near-zero, fetch is off-thread) |
-| `mz_storage_usage_collection_time_seconds` | Off-thread shard scan duration (not the problem) |
-| `mz_catalog_transact_seconds` | Catalog transaction time (includes the persist write/read) |
-
-Capture before/after a collection cycle:
-```bash
-curl -s http://localhost:6878/metrics | grep -E 'mz_slow_message_handling|storage_usage_collection' > /tmp/before.txt
-# wait for a collection cycle
-curl -s http://localhost:6878/metrics | grep -E 'mz_slow_message_handling|storage_usage_collection' > /tmp/after.txt
-```
+| `mz_message_handling{kind="..."}` | Wall-clock time per message type on the coord thread |
+| `mz_message_batch` | Number of messages batched per select-loop iteration |
+| `mz_catalog_transact_seconds` | Catalog transaction time |
 
 ## Key Code Paths
 
 | Component | Location |
 |-----------|----------|
-| `storage_usage_update` | `src/adapter/src/coord/message_handler.rs:239` |
-| `storage_usage_fetch` | `src/adapter/src/coord/message_handler.rs:208` |
-| `schedule_storage_usage_collection` | `src/adapter/src/coord/message_handler.rs:316` |
-| `Op::WeirdStorageUsageUpdates` | `src/adapter/src/catalog/transact.rs:240` |
-| Op processing (allocate_id + pack) | `src/adapter/src/catalog/transact.rs:2582` |
-| `builtin_table_update().execute()` | `src/adapter/src/coord/appends.rs:797` |
-| `pack_storage_usage_update` | `src/adapter/src/catalog/builtin_table_updates.rs:2082` |
-| `VersionedStorageUsage` | `src/audit-log/src/lib.rs` |
-| Collection interval config | `src/environmentd/src/environmentd/main.rs:381` |
+| Coordinator main loop | `src/adapter/src/coord.rs:3506` (fn serve) |
+| Message handling | `src/adapter/src/coord/message_handler.rs:53` |
+| Group commit | `src/adapter/src/coord/appends.rs:328` |
+| advance_timelines | `src/adapter/src/coord/timeline.rs:299` |
+| ids_in_timeline (iterates ALL entries) | `src/adapter/src/catalog/timeline.rs:70` |
+| ReadHolds::downgrade (iterates all holds) | `src/adapter/src/coord/read_policy.rs:87` |
+| least_valid_write / storage_frontiers | `src/adapter/src/coord/timestamp_selection.rs:544` |
+| timedomain_for (iterates schema items) | `src/adapter/src/coord/timeline.rs:363` |
+| initialize_read_policies (adds per-obj hold) | `src/adapter/src/coord/read_policy.rs:273` |
+| sequence_peek (SELECT path) | `src/adapter/src/coord/sequencer/inner/peek.rs:122` |
+| sequence_insert (INSERT path) | `src/adapter/src/coord/sequencer/inner.rs:2476` |
+| sequence_peek_timestamp | `src/adapter/src/coord/sequencer/inner/peek.rs:1065` |
+| controller.process() | `src/controller/src/lib.rs:520` |
+| PlanValidity::check | `src/adapter/src/coord/validity.rs:78` |
 
-## Cost Breakdown on Coordinator Thread (from design doc, unverified)
+## Hypothesized Bottlenecks (unverified — need profiling to confirm)
 
-| Cost | Source |
-|------|--------|
-| 2 oracle round-trips | `get_local_write_ts()` in `storage_usage_update` and `catalog_transact_inner` |
-| N `transact_op` calls | Loop in `transact_inner` (increment counter + pack row each) |
-| Persist write | `commit_transaction` (compare_and_append for id_allocator bump) |
-| Persist read | `sync_updates` after commit |
-| Group commit wait | `builtin_table_update().execute()` |
+### B1 (HIGH): Table advancement in group_commit — ON COORD THREAD
+   `src/adapter/src/coord/appends.rs:515-517`
+   Every group commit iterates ALL catalog entries, filters for tables, and
+   adds empty advancement entries. With 20k tables → 20k map entries that
+   are then consolidated, mapped to GlobalIds, and sent to persist.
+   Group commits happen on every INSERT, every DDL, and every ~1s (timer).
+   This is why even SELECT 1 gets slower: a concurrent/recent group commit
+   blocks the coord thread for O(N) time.
+
+### B2 (MEDIUM): advance_timelines → ReadHolds::downgrade
+   `src/adapter/src/coord/timeline.rs:299`, `read_policy.rs:87`
+   After every group commit, iterates all read holds (one per table/source/
+   MV/index in each timeline) calling try_downgrade → ChangeBatch → channel
+   send for each. 20k tables = 20k iterations.
+
+### B3 (LOW): ids_in_timeline iterates all catalog entries
+   `src/adapter/src/catalog/timeline.rs:70`
+   Only for non-EpochMilliseconds timelines. Probably not a factor.
+
+### B4 (OFF-THREAD): Persist table worker processes all N empty entries
+   `src/storage-controller/src/persist_handles.rs:396`
+   Not on coord thread but adds end-to-end latency.
 
 ## Current Status
 
-All work complete. Baseline → fix → cleanup done.
-- 10k shards: ~499ms → ~20ms (25x improvement). Verified data correctness.
-- Dead code cleaned up: Op::WeirdStorageUsageUpdates, durable id allocator,
-  instrumentation logging all removed.
-- `VersionedStorageUsage` `id` field left as-is (versioned persisted type).
+Not yet started. Need to reproduce and profile.
 
-## Completed Steps
+## Immediate Next Steps
 
-1. ~~**Baseline measurement.**~~ Done. ~499ms/cycle at 10k shards.
-2. ~~**Instrument.**~~ Done. 91% in transact_inner op loop.
-3. ~~**Implement the fix.**~~ Done. 25x speedup (499ms → 20ms).
-4. ~~**Re-measure.**~~ Done. Confirmed.
-5. ~~**Clean up dead code.**~~ Done.
-
-## Work-in-progress log (update after each milestone)
-
-- (nothing yet)
-
+1. Build optimized. Run the reproducer to confirm the issue.
+2. Identify the dominant cost center using one or more of:
+   - **Profiling** (samply) for flamegraphs showing where CPU time goes.
+   - **Metrics** (`curl -s http://localhost:6878/metrics`) — look at
+     `mz_message_handling`, `group_commit_table_advancement_seconds`,
+     `group_commit_confirm_leadership_seconds`, `append_table_duration_seconds`,
+     etc. Compare before/after creating many tables.
+   - **Tracing** — enable OpenTelemetry tracing and look at span durations
+     for `coord::group_commit`, `group_commit_apply`, `advance_timelines`,
+     etc. to see which spans grow with table count. (See the query-tracing
+     skill for setup details if needed.)
+   - **Targeted instrumentation** — add `Instant::now()` / `elapsed()` timers
+     around suspected O(N) code if the above aren't conclusive.
+3. Record findings.
