@@ -89,3 +89,16 @@ coord thread. At 20k tables, this takes **29.3ms per call** (~1 call/s).
 This is the largest remaining O(N) bottleneck on the coordinator thread.
 Next step: investigate what work happens inside `controller.process()` for
 the storage path.
+
+### controller_ready(storage) root cause identified
+`StorageController::maintain()` (called every 1s) calls
+`active_collection_frontiers()` which iterates all N storage collections,
+cloning 3 Antichain<T> per collection (60k clones at 20k collections).
+Then two loops iterate the results for introspection and wallclock lag.
+Combined: O(N) with heavy allocation overhead, ~30ms at 20k collections.
+
+**Fix needed:** make introspection incremental (only diff changed
+frontiers) rather than full-scan.
+
+Shared the `active_collection_frontiers()` result between both loops to
+eliminate one redundant lock + clone pass (minor improvement).

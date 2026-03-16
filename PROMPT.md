@@ -117,11 +117,17 @@ New bottleneck identified: `controller_ready(storage)` = **29ms/call** at
 
 ## Immediate Next Steps
 
-1. Investigate `controller_ready(storage)` — 29ms/call at 20k tables.
-   This processes storage controller events. With 20k storage collections,
-   likely iterating all of them on each call. Look at `Controller::process()`
-   and specifically the storage controller's `process()` method.
+1. **Fix `controller_ready(storage)` — 29-40ms/call at 20k tables.**
+   Root cause: `maintain()` calls `active_collection_frontiers()` which
+   iterates ALL collections, clones 3 Antichain<T> per collection, and
+   builds a Vec. Then `update_frontier_introspection_from` iterates again
+   building BTreeMaps and diffing against previous state. And
+   `refresh_wallclock_lag_from` iterates a third time. Total: O(N)
+   per maintain() call with heavy allocation overhead.
+   **Fix approach: make introspection incremental.** Only process
+   collections whose frontiers have actually changed since the last
+   maintain() call. Track a `last_introspection_frontiers` map and diff
+   incrementally.
 2. Investigate `oracle.read_ts()` — 6-7ms/call. This is the batching
-   timestamp oracle calling PostgreSQL. May be inherent latency or could
-   be an O(N) issue in the oracle implementation.
+   timestamp oracle calling PostgreSQL. May be inherent latency.
 3. Re-measure after fixing the dominant bottleneck(s).
