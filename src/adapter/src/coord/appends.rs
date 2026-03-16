@@ -509,14 +509,13 @@ impl Coordinator {
             }
         }
 
-        // Add table advancements for all tables.
-        let table_advancement_start = Instant::now();
-        for table in self.catalog().entries().filter(|entry| entry.is_table()) {
-            appends.entry(table.id()).or_default();
-        }
+        // Previously, we added empty entries for ALL tables here to advance
+        // their uppers. With txn-wal, table uppers are advanced through the
+        // txns shard (via commit_at), so this O(N) iteration is unnecessary.
+        // We only need to include tables that have actual pending writes.
         self.metrics
             .group_commit_table_advancement_seconds
-            .observe(table_advancement_start.elapsed().as_secs_f64());
+            .observe(0.0);
 
         // Consolidate all Rows for a given table. We do not consolidate the
         // staged batches, that's up to whoever staged them.

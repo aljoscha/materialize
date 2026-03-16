@@ -34,7 +34,8 @@ Session log: @coord-scaling-log.md
 
 ```bash
 # Build — use --optimized for measurements. Debug builds have different
-# hot-path characteristics.
+# hot-path characteristics. Do NOT use --release (much slower to compile);
+# --optimized is sufficient.
 bin/environmentd --optimized
 
 # Connect
