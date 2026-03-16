@@ -117,17 +117,13 @@ New bottleneck identified: `controller_ready(storage)` = **29ms/call** at
 
 ## Immediate Next Steps
 
-1. **Fix `controller_ready(storage)` — 29-40ms/call at 20k tables.**
-   Root cause: `maintain()` calls `active_collection_frontiers()` which
-   iterates ALL collections, clones 3 Antichain<T> per collection, and
-   builds a Vec. Then `update_frontier_introspection_from` iterates again
-   building BTreeMaps and diffing against previous state. And
-   `refresh_wallclock_lag_from` iterates a third time. Total: O(N)
-   per maintain() call with heavy allocation overhead.
-   **Fix approach: make introspection incremental.** Only process
-   collections whose frontiers have actually changed since the last
-   maintain() call. Track a `last_introspection_frontiers` map and diff
-   incrementally.
-2. Investigate `oracle.read_ts()` — 6-7ms/call. This is the batching
-   timestamp oracle calling PostgreSQL. May be inherent latency.
-3. Re-measure after fixing the dominant bottleneck(s).
+1. Investigate the ~30ms `controller_ready(storage)` overhead. Disabling
+   ALL of `maintain()` still shows 30ms, so the cost is from the storage
+   controller's `ready()`/`process()` loop itself — possibly tracing
+   overhead, instance response processing, or async task coordination.
+   This needs profiling (samply/perf) to identify the specific cost.
+2. Consider the remaining latency floor: oracle.read_ts() (~6ms) +
+   group_commit coord work (~5ms) + persist write (~5ms) = ~16ms
+   minimum. The B1 fix brought the average from ~35ms toward this floor.
+   Further improvements may require architectural changes (e.g., async
+   group commit, cached oracle reads).

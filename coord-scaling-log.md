@@ -102,3 +102,26 @@ frontiers) rather than full-scan.
 
 Shared the `active_collection_frontiers()` result between both loops to
 eliminate one redundant lock + clone pass (minor improvement).
+
+### Key discovery: controller_ready(storage) overhead is NOT from maintain()
+Disabled ALL of `maintain()` (empty function body): `controller_ready(storage)`
+still shows 30ms/call. The cost is from the storage controller's `ready()`/
+`process()` coordination loop itself — possibly tracing span creation, instance
+response processing, or async task coordination overhead. This is NOT an O(N)
+issue with table count; it's a constant overhead per call.
+
+### Optimizations committed
+1. **B1 fix:** Remove O(N) table advancement loop from group_commit
+   (`group_commit_initiate`: 19.2ms → 5.3ms)
+2. **Incremental frontier introspection:** Only fetch frontiers for
+   collections with changed write frontiers, avoiding O(N) scan.
+3. **Direct wallclock lag:** Read write frontiers from self.collections
+   directly instead of through active_collection_frontiers() mutex.
+
+### Remaining latency analysis at 20k tables
+- `group_commit_initiate`: ~5.5ms (reduced from 19.2ms by B1 fix)
+- `advance_timelines`: ~6.4ms (dominated by oracle.read_ts(), NOT downgrade)
+- `controller_ready(storage)`: ~30ms (constant overhead, not O(N))
+- Persist write latency: ~5ms (off-thread but affects end-to-end)
+- Average INSERT latency: ~27ms (down from ~35ms baseline)
+- O(N) scaling component: ~10ms (down from ~29ms)
