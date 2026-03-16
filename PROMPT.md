@@ -3,6 +3,7 @@ scales linearly with the number of catalog objects (tables). At 20k tables,
 even `SELECT 1` takes ~25ms (vs ~3ms at 1k tables). INSERT/COMMIT/DDL are
 similarly affected.
 
+Issue text: @issue.md
 Design doc: @misc/coord-linear-scaling.md
 Session log: @coord-scaling-log.md
 

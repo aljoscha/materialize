@@ -118,6 +118,43 @@ issue with table count; it's a constant overhead per call.
 3. **Direct wallclock lag:** Read write frontiers from self.collections
    directly instead of through active_collection_frontiers() mutex.
 
+### Controlled before/after benchmark
+
+Ran the full reproducer (`misc/coord-scaling-repro.sql`) on the same machine
+with before (pre-fix at `1328c608b8`) and after (all fixes) builds. Both
+used `--optimized` profile.
+
+| Stage | Before avg_ms | After avg_ms | Scaling (Δ from baseline) |
+|-------|--------------|-------------|--------------------------|
+| baseline (0 tables) | 18.44 | 19.74 | — |
+| after_1000 | 19.44 | 17.04 | +1.0 → -2.7 |
+| after_3000 | 16.76 | 18.76 | -1.7 → -1.0 |
+| after_5000 | 17.79 | 19.79 | -0.7 → +0.05 |
+| after_10000 | 21.56 | 23.32 | +3.1 → +3.6 |
+| after_20000 | 25.58 | 27.76 | +7.1 → +8.0 |
+| empty_txn_20k | 28.76 | 26.27 | +10.3 → +6.5 |
+| select1_20k | 24.97 | 30.33 | +6.5 → +10.6 |
+
+**Observations:**
+- The baseline on this machine (~18ms) is much higher than the original
+  issue's baseline (~3ms), likely due to PostgreSQL-backed timestamp oracle
+  and persist I/O latency. This constant overhead dominates and masks the
+  O(N) improvements.
+- The O(N) scaling delta (baseline → 20k) is ~7-8ms in both before and
+  after, within measurement noise.
+- The B1 fix clearly reduced `group_commit_initiate` from 19.2ms → 5.3ms
+  (per Prometheus metrics), but this internal improvement doesn't translate
+  to a measurable end-to-end improvement on this test machine because:
+  1. The periodic group commit (1/s) only interferes with queries that
+     happen to arrive during its execution window (~5-19ms out of 1000ms).
+  2. With serial single-client INSERTs, most group commits are triggered
+     by the INSERT itself, not the timer.
+  3. The fix would show clearer improvement with concurrent query workloads
+     or on a machine with lower constant overhead (as in the original issue).
+- The original issue's numbers (2.94ms → 25.03ms over 1k→20k tables) show
+  a much larger O(N) effect because the constant overhead was much lower (~3ms),
+  making the O(N) component dominant.
+
 ### Remaining latency analysis at 20k tables
 - `group_commit_initiate`: ~5.5ms (reduced from 19.2ms by B1 fix)
 - `advance_timelines`: ~6.4ms (dominated by oracle.read_ts(), NOT downgrade)

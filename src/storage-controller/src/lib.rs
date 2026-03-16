@@ -69,7 +69,7 @@ use mz_storage_client::metrics::StorageControllerMetrics;
 use mz_storage_client::statistics::{
     ControllerSinkStatistics, ControllerSourceStatistics, WebhookStatistics,
 };
-use mz_storage_client::storage_collections::{CollectionFrontiers, StorageCollections};
+use mz_storage_client::storage_collections::StorageCollections;
 use mz_storage_types::configuration::StorageConfiguration;
 use mz_storage_types::connections::ConnectionContext;
 use mz_storage_types::connections::inline::InlinedConnection;
@@ -230,10 +230,6 @@ pub struct Controller<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + Tim
     maintenance_ticker: tokio::time::Interval,
     /// Whether maintenance work was scheduled.
     maintenance_scheduled: bool,
-    /// Collection IDs whose write frontiers have changed since the last
-    /// introspection update. Used to make `update_frontier_introspection`
-    /// incremental instead of scanning all collections every cycle.
-    introspection_dirty: BTreeSet<GlobalId>,
 
     /// Shared transmit channel for replicas to send responses.
     instance_response_tx: mpsc::UnboundedSender<(Option<ReplicaId>, StorageResponse<T>)>,
@@ -2218,7 +2214,6 @@ where
             match resp {
                 (_replica_id, StorageResponse::FrontierUpper(id, upper)) => {
                     self.update_write_frontier(id, &upper);
-                    self.introspection_dirty.insert(id);
                     updated_frontiers.insert(id, upper);
                 }
                 (replica_id, StorageResponse::DroppedId(id)) => {
@@ -2675,7 +2670,6 @@ where
             migrated_storage_collections,
             maintenance_ticker: _,
             maintenance_scheduled,
-            introspection_dirty: _,
             instance_response_tx: _,
             instance_response_rx: _,
             persist_warm_task: _,
@@ -2886,7 +2880,6 @@ where
             migrated_storage_collections: BTreeSet::new(),
             maintenance_ticker,
             maintenance_scheduled: false,
-            introspection_dirty: BTreeSet::new(),
             instance_response_rx,
             instance_response_tx,
             persist_warm_task,
@@ -3553,14 +3546,14 @@ where
     ///
     /// This method is invoked by `Controller::maintain`, which we expect to be called once per
     /// second during normal operation.
-    fn update_frontier_introspection_from(&mut self, all_frontiers: &[CollectionFrontiers<T>]) {
+    fn update_frontier_introspection(&mut self) {
         let mut global_frontiers = BTreeMap::new();
         let mut replica_frontiers = BTreeMap::new();
 
-        for collection_frontiers in all_frontiers {
+        for collection_frontiers in self.storage_collections.active_collection_frontiers() {
             let id = collection_frontiers.id;
-            let since = collection_frontiers.read_capabilities.clone();
-            let upper = collection_frontiers.write_frontier.clone();
+            let since = collection_frontiers.read_capabilities;
+            let upper = collection_frontiers.write_frontier;
 
             let instance = self
                 .collections
@@ -3666,12 +3659,7 @@ where
     ///
     /// This method is invoked by `Controller::maintain`, which we expect to be called once per
     /// second during normal operation.
-    ///
-    /// Unlike the previous implementation, this reads write frontiers directly
-    /// from `self.collections` (already on the storage controller) instead of
-    /// calling `active_collection_frontiers()` which would acquire a mutex lock
-    /// and clone Antichain<T> for every collection — an O(N) allocation cost.
-    fn refresh_wallclock_lag_direct(&mut self) {
+    fn refresh_wallclock_lag(&mut self) {
         let now_ms = (self.now)();
         let histogram_period =
             WallclockLagHistogramPeriod::from_epoch_millis(now_ms, self.config.config_set());
@@ -3681,25 +3669,18 @@ where
             None => Duration::ZERO,
         };
 
-        // Iterate self.collections directly to get write frontiers without
-        // going through storage_collections (which would require a mutex lock
-        // and O(N) Antichain clones).
-        let collection_ids: Vec<GlobalId> = self.collections.keys().copied().collect();
-        for id in collection_ids {
-            let collection = self.collections.get_mut(&id).unwrap();
-
-            let write_frontier = match &collection.extra_state {
-                CollectionStateExtra::Ingestion(i) => &i.write_frontier,
-                CollectionStateExtra::Export(e) => &e.write_frontier,
-                CollectionStateExtra::None => continue,
+        for frontiers in self.storage_collections.active_collection_frontiers() {
+            let id = frontiers.id;
+            let Some(collection) = self.collections.get_mut(&id) else {
+                continue;
             };
 
-            // Approximate the unreadable check: if the write frontier is empty
-            // or at the minimum timestamp, the collection is likely unreadable.
-            let lag = if write_frontier.is_empty() {
+            let collection_unreadable =
+                PartialOrder::less_equal(&frontiers.write_frontier, &frontiers.read_capabilities);
+            let lag = if collection_unreadable {
                 WallclockLag::Undefined
             } else {
-                let lag = frontier_lag(write_frontier);
+                let lag = frontier_lag(&frontiers.write_frontier);
                 WallclockLag::Seconds(lag.as_secs())
             };
 
@@ -3823,28 +3804,8 @@ where
     /// This method is invoked roughly once per second during normal operation. It is a good place
     /// for tasks that need to run periodically, such as state cleanup or updating of metrics.
     fn maintain(&mut self) {
-        // Only fetch frontiers for collections with changed write frontiers,
-        // avoiding an O(N) scan of all collections on every maintenance cycle.
-        let dirty_ids = std::mem::take(&mut self.introspection_dirty);
-        if !dirty_ids.is_empty() || self.recorded_frontiers.is_empty() {
-            let frontiers = if self.recorded_frontiers.is_empty() {
-                // First call: need all frontiers for bootstrap.
-                self.storage_collections.active_collection_frontiers()
-            } else {
-                // Incremental: only fetch frontiers for collections whose
-                // write frontiers have changed. This avoids an O(N) scan
-                // with Antichain clones for all collections.
-                self.storage_collections
-                    .collections_frontiers(dirty_ids.into_iter().collect())
-                    .unwrap_or_default()
-            };
-            self.update_frontier_introspection_from(&frontiers);
-        }
-
-        // Wallclock lag: iterate self.collections directly to avoid
-        // active_collection_frontiers() which acquires a mutex lock and
-        // clones Antichain<T> for every collection.
-        self.refresh_wallclock_lag_direct();
+        self.update_frontier_introspection();
+        self.refresh_wallclock_lag();
 
         // Perform instance maintenance work.
         for instance in self.instances.values_mut() {
