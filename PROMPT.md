@@ -107,20 +107,21 @@ psql -U mz_system -h localhost -p 6877 materialize -f misc/coord-scaling-repro.s
 
 B1 fixed: removed O(N) table advancement loop from group_commit.
 `group_commit_initiate` reduced from 19.2ms to 5.3ms at 20k tables.
-Overall O(N) scaling reduced from ~29ms to ~10ms (66% reduction).
 
-B2 (advance_timelines → ReadHolds::downgrade) is the remaining dominant
-bottleneck: 6.0ms/call at 20k tables.
+B2 investigated: `advance_timelines` is 6ms/call, but **the cost is NOT
+ReadHolds::downgrade** — it's `oracle.read_ts().await` (~6-7ms). Disabling
+the downgrade entirely still shows 6.9ms. The per-hold downgrade adds <1ms.
+
+New bottleneck identified: `controller_ready(storage)` = **29ms/call** at
+20k tables. This is the actual dominant O(N) bottleneck on the coord thread.
 
 ## Immediate Next Steps
 
-1. Fix B2: `advance_timelines` → `ReadHolds::downgrade` iterates all ~20k
-   holds every ~1s. Each iteration allocates: Antichain clone, ChangeBatch,
-   channel send node (~60k allocs total). Options:
-   - **Batch channel sends**: change `change_tx` to accept `Vec<(GlobalId,
-     ChangeBatch)>` so 20k changes go in one channel message.
-   - **Lazy downgrade**: only downgrade holds when compaction needs them.
-   - **Shared timeline frontier**: replace per-object holds with a single
-     timeline hold.
-2. Re-measure after B2 fix.
-3. Check for additional O(N) bottlenecks (e.g., `controller_ready(storage)`).
+1. Investigate `controller_ready(storage)` — 29ms/call at 20k tables.
+   This processes storage controller events. With 20k storage collections,
+   likely iterating all of them on each call. Look at `Controller::process()`
+   and specifically the storage controller's `process()` method.
+2. Investigate `oracle.read_ts()` — 6-7ms/call. This is the batching
+   timestamp oracle calling PostgreSQL. May be inherent latency or could
+   be an O(N) issue in the oracle implementation.
+3. Re-measure after fixing the dominant bottleneck(s).

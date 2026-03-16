@@ -76,3 +76,16 @@ Post-fix metric deltas at 20k tables:
 - ~60k heap allocations per cycle = ~6ms
 - Fixing this requires either batching channel sends, lazy downgrade, or
   architectural change to shared timeline frontier
+
+### Key finding: advance_timelines cost is NOT from ReadHolds::downgrade
+Disabled the downgrade entirely (experiment) — `advance_timelines` still
+takes 6.9ms per call. The cost is `oracle.read_ts().await` (~6-7ms), which
+is the batching timestamp oracle calling PostgreSQL. The per-hold downgrade
+adds <1ms of overhead. B2 is not worth fixing.
+
+### New dominant bottleneck: controller_ready(storage) = 29ms/call
+`controller_ready(storage)` processes storage controller events on the
+coord thread. At 20k tables, this takes **29.3ms per call** (~1 call/s).
+This is the largest remaining O(N) bottleneck on the coordinator thread.
+Next step: investigate what work happens inside `controller.process()` for
+the storage path.
