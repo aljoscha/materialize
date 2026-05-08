@@ -130,3 +130,61 @@ DDL `p50` (ms):
   `check_items` re-parsing every entry's `create_sql` (still O(N) but
   not yet addressed).
 
+### Iteration 3 — production-like sanity check (`MZ_SOFT_ASSERTIONS=0`)
+
+Source: `results-archive/results_1778272949.envd_scalability.csv`. Same
+binary as iteration 2 but with `soft_assertions=False` on the Materialized
+service so `MZ_SOFT_ASSERTIONS=0` is set in the container env. This is what
+real cloud envd looks like.
+
+DDL `p50` (ms), comparing iteration 2 (asserts on, with fix) to iteration 3 (asserts off):
+
+| N      | mvs softon (fix) | mvs softoff | tables softon (fix) | tables softoff |
+|--------|-----------------:|------------:|--------------------:|---------------:|
+| 1      |               93 |          94 |                  56 |             58 |
+| 10     |               97 |          99 |                  62 |             61 |
+| 100    |              114 |         111 |                  63 |             58 |
+| 1000   |               67 |          55 |                  69 |             60 |
+| 3000   |              100 |          63 |                  91 |             65 |
+| 5000   |              122 |          69 |                 114 |             71 |
+| 10000  |              186 |          81 |                 149 |             88 |
+
+* Soft-asserts-off DDL is much flatter, as predicted: tables 58→88 ms
+  going 1→10000 (~1.5×), mvs 94→81 ms (essentially flat — the high
+  early-N is JIT/cache-cold variance again).
+* Peeks unchanged, ~13 ms across the board.
+* So the bulk of what looked like a production scalability bug in the
+  original baseline was an mzcompose/CI testing artifact:
+  `MZ_SOFT_ASSERTIONS=1` makes `Coordinator::check_consistency` run
+  after every catalog transaction, and that check was O(N²) in the
+  number of catalog entries. Iteration 1 made it O(N), and the
+  iteration-3 numbers prove production envd doesn't go through that
+  path at all.
+* There is still a small residual O(N) component (~30 ms going
+  1→10000 tables, ~3 µs per existing object). Worth a follow-up but
+  not an emergency — peek path is unaffected and the absolute numbers
+  are tiny next to anything user-visible at 10000-object scale.
+
+## Summary of fix and remaining work
+
+Committed:
+* `48142d683a` adds the iteration-2 results.
+* `bb9c84a64c` makes `CatalogState::check_object_dependencies` O(N) by
+  building edge sets in a single pass instead of doing
+  `Vec::contains` inside an O(N) outer loop. This collapses the
+  dominant O(N²) cost in `check_consistency` while preserving all
+  emitted error variants.
+
+Skipped for this round (lower-priority follow-ups):
+* `check_items` still re-parses every entry's `create_sql` on every
+  consistency check. Removing or caching that would close most of
+  the residual ~50 ms-at-N=10000 gap in the soft-asserts-on case.
+  This is purely a testing/CI win — production never reaches the
+  function.
+* The ~30 ms-at-N=10000 production-side residual (visible in
+  iteration 3) is unattributed. Suspects: durable catalog commit
+  cost in CockroachDB scaling with metadata-table size, or
+  `apply_catalog_implications` doing something proportional to N.
+  Would need a separate flamegraph from a soft-asserts-off run to
+  pin down — out of scope for this investigation.
+
