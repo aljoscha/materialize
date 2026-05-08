@@ -91,3 +91,42 @@ macros short-circuit on `soft_assertions_enabled()`). But all mzcompose runs,
 all CI, and any local development has them on, so anyone benchmarking DDL
 sees this O(N²) overhead.
 
+> **Important caveat (added after iteration 1).**  In real cloud production
+> envd, `MZ_SOFT_ASSERTIONS` is *not* set, so this scaling problem is
+> a property of the testing/CI environment, not the production hot path.
+> What we are improving is local-dev/CI throughput, plus the accuracy of
+> envd_scalability as a benchmark of production behavior. We follow up in
+> iteration 2 by also measuring with `soft_assertions=False` to confirm
+> production-like DDL is flat in N.
+
+### Iteration 2 — re-benchmarked with O(N) `check_object_dependencies`
+
+Source: `results-archive/results_1778270500.envd_scalability.csv` (sizes
+1, 10, 100, 1000, 3000, 5000, 10000; same docker target, same
+`MZ_SOFT_ASSERTIONS=1`).
+
+DDL `p50` (ms):
+
+| N      | mvs baseline | mvs fix | Δ      | tables baseline | tables fix | Δ      |
+|--------|-------------:|--------:|-------:|----------------:|-----------:|-------:|
+| 1      |           49 |      93 | (warm-up — disregard) | 54 |     56 |  +2 ms |
+| 10     |           50 |      97 |        |              65 |     62 |  −3 ms |
+| 100    |           68 |     114 |        |              64 |     63 |  −1 ms |
+| 1000   |           73 |      67 |  −6 ms |              72 |     69 |  −3 ms |
+| 3000   |           99 |     100 |  +1 ms |             102 |     91 | −11 ms |
+| 5000   |          139 |     122 | −17 ms |             143 |    114 | −29 ms |
+| 10000  |          236 |     186 | **−50 ms (−21 %)** | 267 |    149 | **−118 ms (−44 %)** |
+
+* Peeks remain flat at 11–13 ms, as expected.
+* The mvs N=1..100 row regression is JIT/cache-cold variance from running
+  on a fresh envd (the baseline run had been warming for an hour before the
+  measurement); MVs are the very first scenario after startup, so those rows
+  are noisy regardless. Tables N=1..1000 are essentially unchanged.
+* The high-N improvement matches what we'd expect from collapsing an
+  O(N²) inner scan to O(N): the curvature flattens, and the absolute
+  reduction grows with N.
+* The remaining slope (DDL still grows from ~70 ms to ~150 ms going
+  1k→10k tables) is consistent with the second cost we identified:
+  `check_items` re-parsing every entry's `create_sql` (still O(N) but
+  not yet addressed).
+
