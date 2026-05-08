@@ -371,78 +371,105 @@ impl CatalogState {
     ///   CatalogEntry in their own "uses" collection.
     ///
     fn check_object_dependencies(&self) -> Result<(), Vec<ObjectDependencyInconsistency>> {
+        use std::collections::HashSet;
+
         let mut dependency_inconsistencies = vec![];
 
+        // Build edge sets in a single pass. For each pair we record the edge
+        // both as we observed it from the source's outgoing list and as we
+        // observed it from the target's incoming list, so we can verify the
+        // two views agree without doing O(N) `Vec::contains` per edge (which
+        // turns the whole check into O(N^2) when popular system items appear
+        // in many `referenced_by` / `used_by` lists).
+        let mut references_fwd: HashSet<(CatalogItemId, CatalogItemId)> = HashSet::new();
+        let mut references_bwd: HashSet<(CatalogItemId, CatalogItemId)> = HashSet::new();
+        let mut uses_fwd: HashSet<(CatalogItemId, CatalogItemId)> = HashSet::new();
+        let mut uses_bwd: HashSet<(CatalogItemId, CatalogItemId)> = HashSet::new();
+
         for (id, entry) in &self.entry_by_id {
+            // Outgoing edges from this entry's `references` and `uses` lists.
             for referenced_id in entry.references().items() {
-                let Some(referenced_entry) = self.entry_by_id.get(referenced_id) else {
+                if let Some(referenced_entry) = self.entry_by_id.get(referenced_id) {
+                    // Self-references aren't expected to be reflected in
+                    // `referenced_by`, matching the prior behavior.
+                    if referenced_entry.id() != *id {
+                        references_fwd.insert((*id, *referenced_id));
+                    }
+                } else {
                     dependency_inconsistencies.push(ObjectDependencyInconsistency::MissingUses {
                         object_a: *id,
                         object_b: *referenced_id,
                     });
-                    continue;
-                };
-                if !referenced_entry.referenced_by().contains(id) && referenced_entry.id() != *id {
-                    dependency_inconsistencies.push(
-                        ObjectDependencyInconsistency::InconsistentUsedBy {
-                            object_a: *id,
-                            object_b: *referenced_id,
-                        },
-                    );
                 }
             }
             for used_id in entry.uses() {
-                let Some(used_entry) = self.entry_by_id.get(&used_id) else {
+                if let Some(used_entry) = self.entry_by_id.get(&used_id) {
+                    if used_entry.id() != *id {
+                        uses_fwd.insert((*id, used_id));
+                    }
+                } else {
                     dependency_inconsistencies.push(ObjectDependencyInconsistency::MissingUses {
                         object_a: *id,
                         object_b: used_id,
                     });
-                    continue;
-                };
-                if !used_entry.used_by().contains(id) && used_entry.id() != *id {
-                    dependency_inconsistencies.push(
-                        ObjectDependencyInconsistency::InconsistentUsedBy {
-                            object_a: *id,
-                            object_b: used_id,
-                        },
-                    );
                 }
             }
-
+            // Incoming edges from this entry's `referenced_by` and `used_by`
+            // lists. `entry.referenced_by()` listing `refby` means
+            // `refby.references()` should list `entry` — i.e. the edge
+            // (refby, entry).
             for referenced_by in entry.referenced_by() {
-                let Some(referenced_by_entry) = self.entry_by_id.get(referenced_by) else {
+                if self.entry_by_id.contains_key(referenced_by) {
+                    references_bwd.insert((*referenced_by, *id));
+                } else {
                     dependency_inconsistencies.push(ObjectDependencyInconsistency::MissingUsedBy {
                         object_a: *id,
                         object_b: *referenced_by,
                     });
-                    continue;
-                };
-                if !referenced_by_entry.references().contains_item(id) {
-                    dependency_inconsistencies.push(
-                        ObjectDependencyInconsistency::InconsistentUses {
-                            object_a: *id,
-                            object_b: *referenced_by,
-                        },
-                    );
                 }
             }
             for used_by in entry.used_by() {
-                let Some(used_by_entry) = self.entry_by_id.get(used_by) else {
+                if self.entry_by_id.contains_key(used_by) {
+                    uses_bwd.insert((*used_by, *id));
+                } else {
                     dependency_inconsistencies.push(ObjectDependencyInconsistency::MissingUsedBy {
                         object_a: *id,
                         object_b: *used_by,
                     });
-                    continue;
-                };
-                if !used_by_entry.uses().contains(id) {
-                    dependency_inconsistencies.push(
-                        ObjectDependencyInconsistency::InconsistentUses {
-                            object_a: *id,
-                            object_b: *used_by,
-                        },
-                    );
                 }
             }
+        }
+
+        // Edge in forward but not backward: source's outgoing list claims a
+        // reference, but the target's incoming list does not record it.
+        for &(a, b) in references_fwd.difference(&references_bwd) {
+            dependency_inconsistencies.push(ObjectDependencyInconsistency::InconsistentUsedBy {
+                object_a: a,
+                object_b: b,
+            });
+        }
+        for &(a, b) in uses_fwd.difference(&uses_bwd) {
+            dependency_inconsistencies.push(ObjectDependencyInconsistency::InconsistentUsedBy {
+                object_a: a,
+                object_b: b,
+            });
+        }
+        // Edge in backward but not forward: target's incoming list records a
+        // reference that the source's outgoing list doesn't claim. Argument
+        // order matches the prior call site: object_a was the entry whose
+        // `referenced_by` / `used_by` we were iterating (the edge target),
+        // object_b was the iterated source.
+        for &(a, b) in references_bwd.difference(&references_fwd) {
+            dependency_inconsistencies.push(ObjectDependencyInconsistency::InconsistentUses {
+                object_a: b,
+                object_b: a,
+            });
+        }
+        for &(a, b) in uses_bwd.difference(&uses_fwd) {
+            dependency_inconsistencies.push(ObjectDependencyInconsistency::InconsistentUses {
+                object_a: b,
+                object_b: a,
+            });
         }
 
         if dependency_inconsistencies.is_empty() {
