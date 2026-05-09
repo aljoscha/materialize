@@ -593,9 +593,14 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
 
         let mut updates: BTreeMap<_, Vec<_>> = BTreeMap::new();
 
-        // Reset the amortized consolidation tracker so it picks up the
-        // current snapshot size as its baseline.
-        self.size_at_last_consolidation = None;
+        // The amortized consolidation tracker (`size_at_last_consolidation`)
+        // persists across `sync_inner` calls so that the doubling rule
+        // bounds the trace cumulatively. The trailing consolidation that
+        // used to run unconditionally at the end of every sync is gone —
+        // resetting the tracker per sync would mean the doubling check
+        // never fires across many small syncs (each sync only adds a
+        // handful of entries, never enough to double its own starting
+        // size on its own).
 
         while self.upper < target_upper {
             let listen_events = self.listen.fetch_next().await;
@@ -635,8 +640,19 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
             }
         }
         assert_eq!(updates, BTreeMap::new(), "all updates should be applied");
-        // Always consolidate at the end to ensure the snapshot is clean.
-        self.consolidate();
+        // Consolidate only if the trace has grown enough to warrant the
+        // O(N log N) sort. `maybe_consolidate` already triggers on the
+        // doubling rule inside the loop above; what's left is the
+        // common case where a single transaction added a handful of
+        // entries to a multi-thousand-entry trace. Sorting the whole
+        // trace per transaction is O(K * N log N) work amortized over
+        // K transactions; deferring it to the next doubling-trigger
+        // makes it amortized O(N log N) instead.
+        //
+        // Callers that genuinely need a consolidated trace at this
+        // point (e.g. `current_snapshot`, snapshot transfer in
+        // `open_inner`) call `consolidate()` explicitly.
+        self.maybe_consolidate();
         Ok(())
     }
 
@@ -764,17 +780,6 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
         }
         differential_dataflow::consolidation::consolidate_updates(&mut self.snapshot);
         self.is_consolidated = true;
-    }
-
-    /// Execute and return the results of `f` on the current catalog trace.
-    ///
-    /// Will return an error if the catalog has been fenced out.
-    async fn with_trace<R>(
-        &mut self,
-        f: impl FnOnce(&Vec<(T, Timestamp, Diff)>) -> Result<R, CatalogError>,
-    ) -> Result<R, CatalogError> {
-        self.sync_to_current_upper().await?;
-        f(&self.snapshot)
     }
 
     /// Open a read handle to the catalog.
@@ -1731,20 +1736,17 @@ impl ReadOnlyDurableCatalogState for PersistCatalogState {
 
     #[mz_ore::instrument(level = "debug")]
     async fn get_next_id(&mut self, id_type: &str) -> Result<u64, CatalogError> {
-        self.with_trace(|trace| {
-            Ok(trace
-                .into_iter()
-                .rev()
-                .filter_map(|(kind, _, _)| match kind {
-                    StateUpdateKind::IdAllocator(key, value) if key.name == id_type => {
-                        Some(value.next_id)
-                    }
-                    _ => None,
-                })
-                .next()
-                .expect("must exist"))
-        })
-        .await
+        // Read directly from the cached snapshot rather than walking
+        // the (possibly unconsolidated) trace. The cache is the live
+        // state and is always up-to-date after `sync_to_current_upper`.
+        self.sync_to_current_upper().await?;
+        Ok(self
+            .cached_snapshot
+            .id_allocator
+            .iter()
+            .find(|(k, _)| k.name == id_type)
+            .map(|(_, v)| v.next_id)
+            .expect("must exist"))
     }
 
     #[mz_ore::instrument(level = "debug")]

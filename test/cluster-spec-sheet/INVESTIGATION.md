@@ -345,3 +345,70 @@ remaining super-linear slope at N≥30k. Mvs scenario at extended
 sizes was not run — 100k MVs would create 100k cluster-resident
 dataflows, which is infrastructure stress, not a catalog signal.
 
+### Iteration 6 — amortize the trailing `consolidate()`
+
+A flame graph captured at N=30k against the iter-5 binary (304 raw
+samples on the coordinator thread out of 60 s of DDL loop, 234 cycles
+completed) attributed 12 % of `catalog_transact_inner` to the
+`differential_dataflow::consolidation::consolidate_updates_slice_slow`
+quicksort. That's the unconditional `consolidate()` at the end of
+`sync_inner`: every CREATE TABLE / DROP TABLE pair triggers a full
+sort of the ~30k-entry trace.
+
+The iter-4 fix only avoided this when *no* changes had landed since
+the last consolidate, but in a hot DDL loop new entries land every
+transaction, so the skip never fires.
+
+The fix replaces the unconditional trailing `consolidate()` with
+`maybe_consolidate()` (the doubling-rule variant) and stops resetting
+`size_at_last_consolidation` per `sync_inner`. With the persistent
+tracker, the doubling rule applies cumulatively across many small
+syncs: under churn (the existing
+`test_persist_sync_snapshot_stays_bounded_under_churn` test, 200
+renames of one database) the trace stays within ~3× the live size,
+exactly as before. Under bulk DDL the trace doesn't churn so
+consolidation only fires when the catalog itself doubles — i.e.
+amortized away from the per-transaction hot path.
+
+`get_next_id` was the only `with_trace` consumer that needed a
+consolidated view; it now reads from the cached `Snapshot` instead.
+That lets `with_trace` go away entirely.
+
+Microbench at N=30k (60 s DDL loop, soft asserts off):
+
+| binary  | CREATE+DROP cycles in 60 s |
+|---------|---------------------------:|
+| iter-5  |                        234 |
+| iter-6  |                        305 |
+
+A 30 % throughput bump; the flame at N=30k confirms the
+quicksort/consolidate path is gone from the top hot paths and
+`Transaction::commit` drops from 24 % to 11 %.
+
+The `runner.measure()` numbers in the full bench are tighter — the
+measurement also pays for setup/after queries that don't change
+between iterations:
+
+| N      | iter-5 | iter-6 | Δ        |
+|--------|-------:|-------:|---------:|
+| 1      |     88 |     91 |   +3 ms  |
+| 10000  |     70 |     74 |   +4 ms  |
+| 30000  |    122 |    115 |   −7 ms  |
+
+The win shows up where consolidate cost actually mattered (N=30k);
+small N is unchanged.
+
+Tests: all 9 `read-write` tests still pass, including
+`test_persist_sync_snapshot_stays_bounded_under_churn`. A flame
+sample (`results-archive/iter6_flame_N30k.mzfg`) is archived alongside
+the iter-5 one for comparison.
+
+The remaining biggest costs at N=30k (from the iter-6 flame) are
+~22 % `Catalog::transact_inner` (in-memory state apply), 16 %
+`TableTransaction<ItemKey, ItemValue>::*` (proto→rust conversion
+inside `Transaction::new`), and 11 % `Transaction::commit`. Closing
+those needs a deeper architectural change (cache rust-typed maps so
+`Transaction::new` is no longer O(N), or reshape the in-memory
+catalog so each transaction's diff doesn't fan out over the full
+state); not in scope for this round.
+
