@@ -322,6 +322,17 @@ pub(crate) trait ApplyUpdate<T: IntoStateUpdateKindJson> {
         current_fence_token: &mut FenceableToken,
         metrics: &Arc<Metrics>,
     ) -> Result<Option<StateUpdate<T>>, FenceError>;
+
+    /// Incrementally apply a `(kind, diff)` pair to the cached
+    /// [`Snapshot`]. Used by [`PersistHandle::with_snapshot`] to avoid
+    /// walking the entire trace and rebuilding the snapshot on every
+    /// `transaction()` call.
+    ///
+    /// The default implementation is a no-op. Implementations whose `T`
+    /// is meaningful for the snapshot (currently only [`StateUpdateKind`])
+    /// should override this and dispatch on `kind` the same way
+    /// [`PersistHandle::with_snapshot`] used to.
+    fn apply_to_snapshot_cache(_snapshot: &mut Snapshot, _kind: &T, _diff: Diff) {}
 }
 
 /// A handle for interacting with the persist catalog shard.
@@ -379,6 +390,16 @@ pub(crate) struct PersistHandle<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> {
     /// one — the dominant residual cost of `transaction()` once the catalog
     /// reaches a few thousand entries.
     is_consolidated: bool,
+    /// Live, fully consolidated [`Snapshot`] of the catalog, maintained
+    /// incrementally by [`Self::apply_updates`] via
+    /// [`ApplyUpdate::apply_to_snapshot_cache`]. Cloning this on
+    /// `transaction()` is O(N) but a single tree clone — much cheaper
+    /// than walking the entire trace and rebuilding a fresh
+    /// [`BTreeMap`] for every collection on every transaction.
+    ///
+    /// Only meaningful for `T = StateUpdateKind`; for the JSON variant
+    /// the trait method is a no-op and this stays empty.
+    cached_snapshot: Snapshot,
 }
 
 impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
@@ -673,6 +694,7 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
                 &self.metrics,
             ) {
                 Ok(Some(StateUpdate { kind, ts, diff })) => {
+                    U::apply_to_snapshot_cache(&mut self.cached_snapshot, &kind, diff);
                     self.snapshot.push((kind, ts, diff));
                     self.is_consolidated = false;
                 }
@@ -782,117 +804,18 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
 impl<U: ApplyUpdate<StateUpdateKind>> PersistHandle<StateUpdateKind, U> {
     /// Execute and return the results of `f` on the current catalog snapshot.
     ///
+    /// The snapshot is maintained incrementally by [`Self::apply_updates`]
+    /// via [`ApplyUpdate::apply_to_snapshot_cache`], so this just clones
+    /// the cached state instead of walking the entire trace and
+    /// rebuilding it.
+    ///
     /// Will return an error if the catalog has been fenced out.
     async fn with_snapshot<T>(
         &mut self,
         f: impl FnOnce(Snapshot) -> Result<T, CatalogError>,
     ) -> Result<T, CatalogError> {
-        fn apply<K, V>(map: &mut BTreeMap<K, V>, key: &K, value: &V, diff: Diff)
-        where
-            K: Ord + Clone,
-            V: Ord + Clone + Debug,
-        {
-            let key = key.clone();
-            let value = value.clone();
-            if diff == Diff::ONE {
-                let prev = map.insert(key, value);
-                assert_eq!(
-                    prev, None,
-                    "values must be explicitly retracted before inserting a new value"
-                );
-            } else if diff == Diff::MINUS_ONE {
-                let prev = map.remove(&key);
-                assert_eq!(
-                    prev,
-                    Some(value),
-                    "retraction does not match existing value"
-                );
-            }
-        }
-
-        self.with_trace(|trace| {
-            let mut snapshot = Snapshot::empty();
-            for (kind, ts, diff) in trace {
-                let diff = *diff;
-                if diff != Diff::ONE && diff != Diff::MINUS_ONE {
-                    panic!("invalid update in consolidated trace: ({kind:?}, {ts:?}, {diff:?})");
-                }
-
-                match kind {
-                    StateUpdateKind::AuditLog(_key, ()) => {
-                        // Ignore for snapshots.
-                    }
-                    StateUpdateKind::Cluster(key, value) => {
-                        apply(&mut snapshot.clusters, key, value, diff);
-                    }
-                    StateUpdateKind::ClusterReplica(key, value) => {
-                        apply(&mut snapshot.cluster_replicas, key, value, diff);
-                    }
-                    StateUpdateKind::Comment(key, value) => {
-                        apply(&mut snapshot.comments, key, value, diff);
-                    }
-                    StateUpdateKind::Config(key, value) => {
-                        apply(&mut snapshot.configs, key, value, diff);
-                    }
-                    StateUpdateKind::Database(key, value) => {
-                        apply(&mut snapshot.databases, key, value, diff);
-                    }
-                    StateUpdateKind::DefaultPrivilege(key, value) => {
-                        apply(&mut snapshot.default_privileges, key, value, diff);
-                    }
-                    StateUpdateKind::FenceToken(_token) => {
-                        // Ignore for snapshots.
-                    }
-                    StateUpdateKind::IdAllocator(key, value) => {
-                        apply(&mut snapshot.id_allocator, key, value, diff);
-                    }
-                    StateUpdateKind::IntrospectionSourceIndex(key, value) => {
-                        apply(&mut snapshot.introspection_sources, key, value, diff);
-                    }
-                    StateUpdateKind::Item(key, value) => {
-                        apply(&mut snapshot.items, key, value, diff);
-                    }
-                    StateUpdateKind::NetworkPolicy(key, value) => {
-                        apply(&mut snapshot.network_policies, key, value, diff);
-                    }
-                    StateUpdateKind::Role(key, value) => {
-                        apply(&mut snapshot.roles, key, value, diff);
-                    }
-                    StateUpdateKind::Schema(key, value) => {
-                        apply(&mut snapshot.schemas, key, value, diff);
-                    }
-                    StateUpdateKind::Setting(key, value) => {
-                        apply(&mut snapshot.settings, key, value, diff);
-                    }
-                    StateUpdateKind::SourceReferences(key, value) => {
-                        apply(&mut snapshot.source_references, key, value, diff);
-                    }
-                    StateUpdateKind::SystemConfiguration(key, value) => {
-                        apply(&mut snapshot.system_configurations, key, value, diff);
-                    }
-                    StateUpdateKind::SystemObjectMapping(key, value) => {
-                        apply(&mut snapshot.system_object_mappings, key, value, diff);
-                    }
-                    StateUpdateKind::SystemPrivilege(key, value) => {
-                        apply(&mut snapshot.system_privileges, key, value, diff);
-                    }
-                    StateUpdateKind::StorageCollectionMetadata(key, value) => {
-                        apply(&mut snapshot.storage_collection_metadata, key, value, diff);
-                    }
-                    StateUpdateKind::UnfinalizedShard(key, ()) => {
-                        apply(&mut snapshot.unfinalized_shards, key, &(), diff);
-                    }
-                    StateUpdateKind::TxnWalShard((), value) => {
-                        apply(&mut snapshot.txn_wal_shard, &(), value, diff);
-                    }
-                    StateUpdateKind::RoleAuth(key, value) => {
-                        apply(&mut snapshot.role_auth, key, value, diff);
-                    }
-                }
-            }
-            f(snapshot)
-        })
-        .await
+        self.sync_to_current_upper().await?;
+        f(self.cached_snapshot.clone())
     }
 
     /// Generates an iterator of [`StateUpdate`] that contain all updates to the catalog
@@ -1105,6 +1028,9 @@ impl UnopenedPersistCatalogState {
             metrics,
             size_at_last_consolidation: None,
             is_consolidated: true,
+            // Unopened catalogs never call `with_snapshot`, so the
+            // cache stays empty here.
+            cached_snapshot: Snapshot::empty(),
         };
         // If the snapshot is not consolidated, and we see multiple epoch values while applying the
         // updates, then we might accidentally fence ourselves out.
@@ -1303,6 +1229,9 @@ impl UnopenedPersistCatalogState {
             metrics: self.metrics,
             size_at_last_consolidation: None,
             is_consolidated: true,
+            // Populated incrementally by `apply_updates` below as the
+            // initial trace is replayed.
+            cached_snapshot: Snapshot::empty(),
         };
         catalog.metrics.collection_entries.reset();
         // Normally, `collection_entries` is updated in `apply_updates`. The audit log updates skip
@@ -1647,6 +1576,101 @@ impl ApplyUpdate<StateUpdateKind> for CatalogStateInner {
                 ts: update.ts,
                 diff,
             })),
+        }
+    }
+
+    fn apply_to_snapshot_cache(snapshot: &mut Snapshot, kind: &StateUpdateKind, diff: Diff) {
+        fn apply<K, V>(map: &mut BTreeMap<K, V>, key: &K, value: &V, diff: Diff)
+        where
+            K: Ord + Clone,
+            V: Ord + Clone + Debug,
+        {
+            if diff == Diff::ONE {
+                let prev = map.insert(key.clone(), value.clone());
+                assert_eq!(
+                    prev, None,
+                    "values must be explicitly retracted before inserting a new value"
+                );
+            } else if diff == Diff::MINUS_ONE {
+                let prev = map.remove(key);
+                assert_eq!(
+                    prev.as_ref(),
+                    Some(value),
+                    "retraction does not match existing value"
+                );
+            }
+        }
+
+        match kind {
+            StateUpdateKind::AuditLog(_key, ()) => {
+                // Filtered out before reaching the cache; ignore.
+            }
+            StateUpdateKind::Cluster(key, value) => {
+                apply(&mut snapshot.clusters, key, value, diff);
+            }
+            StateUpdateKind::ClusterReplica(key, value) => {
+                apply(&mut snapshot.cluster_replicas, key, value, diff);
+            }
+            StateUpdateKind::Comment(key, value) => {
+                apply(&mut snapshot.comments, key, value, diff);
+            }
+            StateUpdateKind::Config(key, value) => {
+                apply(&mut snapshot.configs, key, value, diff);
+            }
+            StateUpdateKind::Database(key, value) => {
+                apply(&mut snapshot.databases, key, value, diff);
+            }
+            StateUpdateKind::DefaultPrivilege(key, value) => {
+                apply(&mut snapshot.default_privileges, key, value, diff);
+            }
+            StateUpdateKind::FenceToken(_token) => {
+                // Filtered out before reaching the cache; ignore.
+            }
+            StateUpdateKind::IdAllocator(key, value) => {
+                apply(&mut snapshot.id_allocator, key, value, diff);
+            }
+            StateUpdateKind::IntrospectionSourceIndex(key, value) => {
+                apply(&mut snapshot.introspection_sources, key, value, diff);
+            }
+            StateUpdateKind::Item(key, value) => {
+                apply(&mut snapshot.items, key, value, diff);
+            }
+            StateUpdateKind::NetworkPolicy(key, value) => {
+                apply(&mut snapshot.network_policies, key, value, diff);
+            }
+            StateUpdateKind::Role(key, value) => {
+                apply(&mut snapshot.roles, key, value, diff);
+            }
+            StateUpdateKind::Schema(key, value) => {
+                apply(&mut snapshot.schemas, key, value, diff);
+            }
+            StateUpdateKind::Setting(key, value) => {
+                apply(&mut snapshot.settings, key, value, diff);
+            }
+            StateUpdateKind::SourceReferences(key, value) => {
+                apply(&mut snapshot.source_references, key, value, diff);
+            }
+            StateUpdateKind::SystemConfiguration(key, value) => {
+                apply(&mut snapshot.system_configurations, key, value, diff);
+            }
+            StateUpdateKind::SystemObjectMapping(key, value) => {
+                apply(&mut snapshot.system_object_mappings, key, value, diff);
+            }
+            StateUpdateKind::SystemPrivilege(key, value) => {
+                apply(&mut snapshot.system_privileges, key, value, diff);
+            }
+            StateUpdateKind::StorageCollectionMetadata(key, value) => {
+                apply(&mut snapshot.storage_collection_metadata, key, value, diff);
+            }
+            StateUpdateKind::UnfinalizedShard(key, ()) => {
+                apply(&mut snapshot.unfinalized_shards, key, &(), diff);
+            }
+            StateUpdateKind::TxnWalShard((), value) => {
+                apply(&mut snapshot.txn_wal_shard, &(), value, diff);
+            }
+            StateUpdateKind::RoleAuth(key, value) => {
+                apply(&mut snapshot.role_auth, key, value, diff);
+            }
         }
     }
 }
