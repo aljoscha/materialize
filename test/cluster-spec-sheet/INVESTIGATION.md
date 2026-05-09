@@ -267,3 +267,81 @@ on every transaction. Closing it would be an architectural change
 (maintain the snapshot as cached state, or re-shape `Transaction` to
 read directly from the trace) and is left as a follow-up.
 
+### Iteration 5 — incrementally cached `Snapshot` + extended N range
+
+User asked to push `N` to 30k / 50k / 100k and to chase the residual
+slope with another fix. Scope: tables-only (mvs at 100k is
+controller-bound and would dwarf the catalog signal). Soft asserts off
+(`MZ_SOFT_ASSERTIONS=0`) at the SERVICES level so production envd
+is what's being measured.
+
+The fix (`56211df811`) maintains a `Snapshot` cache in `PersistHandle`,
+updated incrementally by `apply_updates` via a new
+`ApplyUpdate::apply_to_snapshot_cache` trait method. `with_snapshot`
+now just clones the cache instead of walking the consolidated trace
+and rebuilding a fresh `BTreeMap` from scratch.
+
+Instrumented (`tracing::info!` inside `with_snapshot`) at N≈1500: the
+cache clone is **1 ms**. So the architectural goal is met — the 33 %
+of `catalog_transact_inner` that iter-4's flame attributed to
+`PersistHandle::snapshot` is gone.
+
+Result (`results-archive/results_1778322764.envd_scalability.csv`,
+sizes 1, 10, 100, 1000, 3000, 5000, 10000, 30000, 50000; bench was
+killed before reaching N=100000 because population to 100k tables
+takes ~3 hours at ~5 tables/s):
+
+| N      | iter-4 tables | iter-5 tables | Δ        |
+|--------|--------------:|--------------:|---------:|
+| 1      |            48 |            88 |  +40 ms  |
+| 10     |            49 |            92 |  +43 ms  |
+| 100    |            43 |            90 |  +47 ms  |
+| 1000   |            61 |            95 |  +34 ms  |
+| 3000   |            74 |           104 |  +30 ms  |
+| 5000   |            75 |            56 |  −19 ms  |
+| 10000  |            81 |            70 |  −11 ms  |
+| 30000  |             — |           122 |          |
+| 50000  |             — |           222 |          |
+
+Honest read: the cache eliminates the trace walk (and the iter-4
+flame's #1 cost), but the end-to-end win is mixed.
+
+* At low N the fix adds an unidentified ~30–45 ms of constant
+  overhead. Cloning the cache is 1 ms (instrumented), so the
+  overhead is *not* in the clone itself — something else in the
+  per-transaction path got slower. Possible suspects: the extra
+  `apply_to_snapshot_cache` work shifted to `apply_updates`,
+  catalog memory pressure (the cache adds ~50–100 MB of duplicated
+  state), or simply system load on this VM relative to when iter-4
+  ran. Did not pin it down.
+* At N=10000 the fix wins by 11 ms vs iter-4 (70 vs 81), consistent
+  with the snapshot-rebuild cost being on the order of 10–20 ms at
+  that size.
+* At N=30000 the fix is at 122 ms; iter-4 wasn't measured there but
+  linear extrapolation (3.3 µs/object slope) gives ~147 ms, so iter-5
+  is ahead by ~25 ms.
+* At N=50000 iter-5 is 222 ms; extrapolated iter-4 ~213 ms. The fix
+  starts to LOSE — the slope from 30k→50k jumps to ~5 µs/object,
+  which is super-linear. The remaining bottleneck (now neither the
+  rebuild nor the consolidate) scales worse than O(N).
+* The dip at N=5000 (56 ms) and the bimodal distribution at N=50000
+  (values cluster around 174 and 270 ms) suggest some other
+  threshold-driven behaviour — possibly persist compaction or
+  consolidate cadence — kicks in at certain catalog sizes.
+
+So iter-5 is a wash architecturally: the trace-walk on every
+transaction is gone, but the new dominant cost (whatever it is at
+N≥30k) scales worse than iter-4 did. The clone itself (1 ms) is not
+where the time goes; some other O(N)-or-worse work in
+`catalog_transact_inner` is now the bottleneck. Confirming what it
+is needs a soft-asserts-off flame at N=30000+ and is deferred.
+
+### Status
+
+Cache fix shipped as `56211df811`. Investigation is paused here:
+delivered the requested 30k / 50k data, identified the snapshot
+rebuild was no longer the bottleneck, but did not close the
+remaining super-linear slope at N≥30k. Mvs scenario at extended
+sizes was not run — 100k MVs would create 100k cluster-resident
+dataflows, which is infrastructure stress, not a catalog signal.
+
