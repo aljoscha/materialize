@@ -371,6 +371,14 @@ pub(crate) struct PersistHandle<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> {
     /// [`Self::maybe_consolidate`] to decide when to consolidate. Initialized
     /// lazily on the first call.
     size_at_last_consolidation: Option<usize>,
+    /// Tracks whether the in-memory snapshot is currently in a consolidated
+    /// state (each `(kind, ts, diff)` tuple unique with `diff == 1`). Cleared
+    /// by [`Self::apply_updates`] when it appends to the snapshot, and set by
+    /// [`Self::consolidate`]. Used by [`Self::sync_inner`] to skip the trailing
+    /// O(N log N) `consolidate()` call when nothing has changed since the last
+    /// one — the dominant residual cost of `transaction()` once the catalog
+    /// reaches a few thousand entries.
+    is_consolidated: bool,
 }
 
 impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
@@ -664,7 +672,10 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
                 &mut self.fenceable_token,
                 &self.metrics,
             ) {
-                Ok(Some(StateUpdate { kind, ts, diff })) => self.snapshot.push((kind, ts, diff)),
+                Ok(Some(StateUpdate { kind, ts, diff })) => {
+                    self.snapshot.push((kind, ts, diff));
+                    self.is_consolidated = false;
+                }
                 Ok(None) => {}
                 // Instead of returning immediately, we accumulate all the errors and return the one
                 // with the most information.
@@ -704,6 +715,14 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
 
     #[mz_ore::instrument]
     pub(crate) fn consolidate(&mut self) {
+        // If we already consolidated and nothing has been appended since,
+        // there's nothing to do. This is the common case for `sync_inner`
+        // returning a no-op when no new updates have arrived since the last
+        // sync, e.g. when opening a fresh transaction immediately after the
+        // previous one committed.
+        if self.is_consolidated {
+            return;
+        }
         self.metrics.snapshot_consolidations.inc();
         soft_assert_no_log!(
             self.snapshot
@@ -722,6 +741,7 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
             *ts = new_ts;
         }
         differential_dataflow::consolidation::consolidate_updates(&mut self.snapshot);
+        self.is_consolidated = true;
     }
 
     /// Execute and return the results of `f` on the current catalog trace.
@@ -1084,6 +1104,7 @@ impl UnopenedPersistCatalogState {
             bootstrap_complete: false,
             metrics,
             size_at_last_consolidation: None,
+            is_consolidated: true,
         };
         // If the snapshot is not consolidated, and we see multiple epoch values while applying the
         // updates, then we might accidentally fence ourselves out.
@@ -1281,6 +1302,7 @@ impl UnopenedPersistCatalogState {
             bootstrap_complete: false,
             metrics: self.metrics,
             size_at_last_consolidation: None,
+            is_consolidated: true,
         };
         catalog.metrics.collection_entries.reset();
         // Normally, `collection_entries` is updated in `apply_updates`. The audit log updates skip
