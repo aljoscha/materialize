@@ -188,3 +188,82 @@ Skipped for this round (lower-priority follow-ups):
   Would need a separate flamegraph from a soft-asserts-off run to
   pin down — out of scope for this investigation.
 
+### Iteration 4 — chasing the soft-asserts-off residual
+
+A soft-asserts-off CPU flamegraph (`baseline_flame_softoff_N5000.mzfg`,
+30 s sample at N=5000 tables) attributed the production-path residual
+mostly to `mz_catalog::durable::persist`:
+
+| % of `catalog_transact_inner` | function                                                        |
+|------------------------------:|------------------------------------------------------------------|
+|                         33.24 | `PersistHandle::snapshot` (build BTreeMap from trace, clone all entries) |
+|                         25.95 | quicksort under `consolidate_updates_slice_slow` (the trailing `consolidate()` in `sync_inner`) |
+|                         21.14 | `Transaction::new` (proto→rust conversion of the snapshot) |
+|                         18.95 | `String::clone` (inside the snapshot apply loop) |
+|                         18.22 | `transact_inner`, the in-memory state apply step |
+|                         15.74 | `Transaction::commit` |
+|                         12.39 | `commit_transaction` (persist write) |
+
+The cheapest of these to fix is the trailing `consolidate()` —
+`sync_inner` calls it unconditionally at the end of every sync, even
+when no new updates have arrived since the last call. With ~5000
+catalog entries, that's a redundant O(N log N) sort on every
+`transaction()`. Adding an `is_consolidated` flag and short-circuiting
+when it's already true avoids the work in the common case.
+
+Result (`results-archive/results_1778303419.envd_scalability.csv`,
+soft asserts off, with the new consolidate fix):
+
+| N      | iter3 mvs DDL | iter4 mvs DDL | iter3 tables DDL | iter4 tables DDL |
+|--------|--------------:|--------------:|-----------------:|-----------------:|
+| 1      |            94 |            92 |               58 |               49 |
+| 10     |            99 |            94 |               61 |               50 |
+| 100    |           111 |           108 |               58 |               44 |
+| 1000   |            55 |            56 |               60 |               61 |
+| 3000   |            63 |            63 |               65 |               74 |
+| 5000   |            69 |            66 |               71 |               75 |
+| 10000  |            81 |            80 |               88 |               81 |
+
+* Tables p50 at N=10000 drops from 88 → 81 ms (~8 %).
+* The bigger relative improvement is at small N (tables N=100 from
+  58 → 44 ms, ~24 %), where the redundant consolidate is a larger
+  share of total cost.
+* Mid-range tables (N=3000, N=5000) show modest regressions of a
+  few ms — within the run-to-run noise we've seen elsewhere.
+* Peeks unchanged.
+
+So my second commit removes a real waste — every `sync_inner` was
+re-sorting the entire trace even when nothing had changed — but the
+end-to-end win in production-like mode is small. The dominant
+residual cost in soft-asserts-off DDL is now `snapshot()` itself
+(33 % of `catalog_transact_inner`): every transaction rebuilds an
+owned `BTreeMap` of every catalog entry by walking the consolidated
+trace and cloning each `(key, value)`. That's a structural O(N) cost
+that needs a more invasive change to address — caching the snapshot
+across transactions and applying incremental deltas when new updates
+arrive, or re-shaping `Transaction` to borrow the trace rather than
+own a fresh `BTreeMap`.
+
+## Final summary
+
+* Iteration-1 fix (`bb9c84a64c`): `check_object_dependencies` is now
+  O(N) instead of O(N²). Big win when soft asserts are enabled (anyone
+  running mzcompose, CI, local development): tables N=10000 DDL
+  267 → 149 ms (-44 %), mvs 236 → 186 ms (-21 %). Doesn't affect
+  cloud production envd.
+* Iteration-4 fix (`d6a4276a78`): `PersistHandle::sync_inner` no
+  longer re-sorts the trace on every transaction when nothing has
+  changed. Modest production win on top of iteration-3: tables
+  N=10000 88 → 81 ms (-8 %), most useful at small/mid N where the
+  redundant work was a larger share of total cost.
+
+Both fixes are logically independent (one is debug-only, one is
+production) and both are pure correctness wins (less wasted work, no
+behavioural change). Pushed to `aljoscha/envd-specsheet`.
+
+The remaining production-path slope (~30 ms going 1→10000) is dominated
+by `snapshot()` rebuilding the `BTreeMap` from the consolidated trace
+on every transaction. Closing it would be an architectural change
+(maintain the snapshot as cached state, or re-shape `Transaction` to
+read directly from the trace) and is left as a follow-up.
+
