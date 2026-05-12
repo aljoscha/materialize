@@ -1185,6 +1185,64 @@ impl Catalog {
             .map(|(_, policy)| policy)
     }
 
+    /// Returns the cached count of user tables, maintained incrementally in
+    /// `CatalogState::resource_counts`.
+    pub fn user_tables_count(&self) -> usize {
+        self.state.resource_counts.user_tables
+    }
+
+    /// Returns the cached sum of `user_controllable_persist_shard_count()`
+    /// across all user sources, maintained incrementally in
+    /// `CatalogState::resource_counts`.
+    pub fn user_sources_shards_count(&self) -> i64 {
+        self.state.resource_counts.user_sources_shards
+    }
+
+    /// Returns the cached count of user sinks.
+    pub fn user_sinks_count(&self) -> usize {
+        self.state.resource_counts.user_sinks
+    }
+
+    /// Returns the cached count of user materialized views.
+    pub fn user_materialized_views_count(&self) -> usize {
+        self.state.resource_counts.user_materialized_views
+    }
+
+    /// Returns the cached count of user clusters.
+    pub fn user_clusters_count(&self) -> usize {
+        self.state.resource_counts.user_clusters
+    }
+
+    /// Returns the cached count of databases (system + user).
+    pub fn databases_count(&self) -> usize {
+        self.state.resource_counts.databases
+    }
+
+    /// Returns the cached count of user Kafka connections.
+    pub fn user_kafka_connections_count(&self) -> usize {
+        self.state.resource_counts.user_kafka_connections
+    }
+
+    /// Returns the cached count of user Postgres connections.
+    pub fn user_postgres_connections_count(&self) -> usize {
+        self.state.resource_counts.user_postgres_connections
+    }
+
+    /// Returns the cached count of user MySQL connections.
+    pub fn user_mysql_connections_count(&self) -> usize {
+        self.state.resource_counts.user_mysql_connections
+    }
+
+    /// Returns the cached count of user SQL Server connections.
+    pub fn user_sql_server_connections_count(&self) -> usize {
+        self.state.resource_counts.user_sql_server_connections
+    }
+
+    /// Returns the cached count of user AWS PrivateLink connections.
+    pub fn user_aws_privatelink_connections_count(&self) -> usize {
+        self.state.resource_counts.user_aws_privatelink_connections
+    }
+
     pub fn system_privileges(&self) -> &PrivilegeMap {
         &self.state.system_privileges
     }

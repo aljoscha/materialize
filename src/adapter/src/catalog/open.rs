@@ -142,6 +142,7 @@ impl Catalog {
             roles_by_name: imbl::OrdMap::new(),
             roles_by_id: imbl::OrdMap::new(),
             network_policies_by_id: imbl::OrdMap::new(),
+            resource_counts: Default::default(),
             role_auth_by_id: imbl::OrdMap::new(),
             network_policies_by_name: imbl::OrdMap::new(),
             system_configuration: Arc::new(system_configuration),

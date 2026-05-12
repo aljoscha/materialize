@@ -12,10 +12,11 @@
 //! Note: the implementation of consistency checks should favor simplicity over performance, to
 //! make it as easy as possible to understand what a given check is doing.
 
+use mz_catalog::memory::objects::CatalogItem;
 use mz_controller_types::{ClusterId, ReplicaId};
 use mz_repr::role_id::RoleId;
 use mz_repr::{CatalogItemId, GlobalId};
-use mz_sql::catalog::{CatalogItem, DefaultPrivilegeObject};
+use mz_sql::catalog::{CatalogItem as SqlCatalogItem, DefaultPrivilegeObject};
 use mz_sql::names::{
     CommentObjectId, DatabaseId, QualifiedItemName, ResolvedDatabaseSpecifier, SchemaId,
     SchemaSpecifier,
@@ -26,6 +27,7 @@ use serde::Serialize;
 
 // DO NOT add any more imports from `crate` outside of `crate::catalog`.
 use super::CatalogState;
+use super::state::ResourceLimitCounts;
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq)]
 pub struct CatalogInconsistencies {
@@ -39,6 +41,9 @@ pub struct CatalogInconsistencies {
     object_dependencies: Vec<ObjectDependencyInconsistency>,
     /// Inconsistencies found with items in the catalog, if any.
     items: Vec<ItemInconsistency>,
+    /// Inconsistencies between the cached resource-limit counts and a fresh
+    /// O(N) recomputation.
+    resource_counts: Option<ResourceCountsInconsistency>,
 }
 
 impl CatalogInconsistencies {
@@ -49,12 +54,14 @@ impl CatalogInconsistencies {
             comments,
             object_dependencies,
             items,
+            resource_counts,
         } = self;
         internal_fields.is_empty()
             && roles.is_empty()
             && comments.is_empty()
             && object_dependencies.is_empty()
             && items.is_empty()
+            && resource_counts.is_none()
     }
 }
 
@@ -78,11 +85,80 @@ impl CatalogState {
         if let Err(items) = self.check_items() {
             inconsistencies.items = items;
         }
+        if let Err(resource_counts) = self.check_resource_counts() {
+            inconsistencies.resource_counts = Some(resource_counts);
+        }
 
         if inconsistencies.is_empty() {
             Ok(())
         } else {
             Err(Box::new(inconsistencies))
+        }
+    }
+
+    /// # Invariants:
+    ///
+    /// * The cached counts in [`CatalogState::resource_counts`] must match a
+    ///   fresh O(N) recomputation from `entry_by_id`, `clusters_by_id`, and
+    ///   `database_by_id`.
+    ///
+    /// This protects against a missing maintenance point in
+    /// `insert_entry` / `drop_item` / `apply_cluster_update` /
+    /// `apply_database_update` silently desynchronizing the cache.
+    fn check_resource_counts(&self) -> Result<(), ResourceCountsInconsistency> {
+        let mut expected = ResourceLimitCounts::default();
+        for (id, entry) in &self.entry_by_id {
+            if !id.is_user() {
+                continue;
+            }
+            match entry.item() {
+                CatalogItem::Table(_) => expected.user_tables += 1,
+                CatalogItem::Source(source) => {
+                    expected.user_sources_shards += source.user_controllable_persist_shard_count();
+                }
+                CatalogItem::Sink(_) => expected.user_sinks += 1,
+                CatalogItem::MaterializedView(_) => expected.user_materialized_views += 1,
+                CatalogItem::Connection(connection) => {
+                    use mz_sql::plan::ConnectionDetails;
+                    match connection.details {
+                        ConnectionDetails::Kafka(_) => expected.user_kafka_connections += 1,
+                        ConnectionDetails::Postgres(_) => expected.user_postgres_connections += 1,
+                        ConnectionDetails::MySql(_) => expected.user_mysql_connections += 1,
+                        ConnectionDetails::SqlServer(_) => {
+                            expected.user_sql_server_connections += 1
+                        }
+                        ConnectionDetails::AwsPrivatelink(_) => {
+                            expected.user_aws_privatelink_connections += 1
+                        }
+                        ConnectionDetails::Csr(_)
+                        | ConnectionDetails::Ssh { .. }
+                        | ConnectionDetails::Aws(_)
+                        | ConnectionDetails::IcebergCatalog(_) => {}
+                    }
+                }
+                CatalogItem::Log(_)
+                | CatalogItem::View(_)
+                | CatalogItem::Index(_)
+                | CatalogItem::Type(_)
+                | CatalogItem::Func(_)
+                | CatalogItem::Secret(_) => {}
+            }
+        }
+        for cluster_id in self.clusters_by_id.keys() {
+            if cluster_id.is_user() {
+                expected.user_clusters += 1;
+            }
+        }
+        // Databases count all (system + user) to mirror the existing call site.
+        expected.databases = self.database_by_id.len();
+
+        if expected != self.resource_counts {
+            Err(ResourceCountsInconsistency {
+                cached: self.resource_counts.clone(),
+                expected,
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -717,6 +793,15 @@ enum ObjectDependencyInconsistency {
         object_a: CatalogItemId,
         object_b: CatalogItemId,
     },
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct ResourceCountsInconsistency {
+    /// The cached counts on `CatalogState::resource_counts`.
+    cached: ResourceLimitCounts,
+    /// The fresh O(N) recomputation from `entry_by_id` /
+    /// `clusters_by_id` / `database_by_id`.
+    expected: ResourceLimitCounts,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]

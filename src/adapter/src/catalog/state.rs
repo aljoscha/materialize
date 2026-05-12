@@ -135,6 +135,10 @@ pub struct CatalogState {
     pub(super) network_policies_by_name: imbl::OrdMap<String, NetworkPolicyId>,
     #[serde(serialize_with = "mz_ore::serde::map_key_to_string")]
     pub(super) network_policies_by_id: imbl::OrdMap<NetworkPolicyId, NetworkPolicy>,
+    /// Cached counts of catalog entries by category, maintained incrementally
+    /// to avoid O(N) walks in `Coordinator::validate_resource_limits` on every
+    /// DDL transaction. See [`ResourceLimitCounts`] for the trust boundary.
+    pub(super) resource_counts: ResourceLimitCounts,
     #[serde(serialize_with = "mz_ore::serde::map_key_to_string")]
     pub(super) role_auth_by_id: imbl::OrdMap<RoleId, RoleAuth>,
 
@@ -178,6 +182,33 @@ pub struct CatalogState {
     // Read-only not derived from the durable catalog.
     #[serde(skip)]
     pub(super) license_key: ValidatedLicenseKey,
+}
+
+/// Cached counts of catalog entries by category, maintained incrementally to
+/// avoid O(N) walks in `Coordinator::validate_resource_limits` on every DDL
+/// transaction.
+///
+/// These are derived from [`CatalogState::entry_by_id`],
+/// [`CatalogState::clusters_by_id`], [`CatalogState::database_by_id`], etc.;
+/// the trust boundary is that any mutation of those maps through
+/// `insert_entry` / `drop_item` / `apply_cluster_update` /
+/// `apply_database_update` must also update the corresponding counter.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct ResourceLimitCounts {
+    pub user_tables: usize,
+    /// Sum of `user_controllable_persist_shard_count()` over user sources.
+    /// This isn't a simple count because a single source can own multiple
+    /// shards.
+    pub user_sources_shards: i64,
+    pub user_sinks: usize,
+    pub user_materialized_views: usize,
+    pub user_clusters: usize,
+    pub databases: usize,
+    pub user_kafka_connections: usize,
+    pub user_postgres_connections: usize,
+    pub user_mysql_connections: usize,
+    pub user_sql_server_connections: usize,
+    pub user_aws_privatelink_connections: usize,
 }
 
 /// Keeps track of what expressions are cached or not during startup.
@@ -303,6 +334,7 @@ impl CatalogState {
             roles_by_name: Default::default(),
             roles_by_id: Default::default(),
             network_policies_by_id: Default::default(),
+            resource_counts: Default::default(),
             role_auth_by_id: Default::default(),
             config: CatalogConfig {
                 start_time: Default::default(),

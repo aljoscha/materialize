@@ -53,6 +53,7 @@ use mz_sql::names::{
     FullItemName, ItemQualifiers, QualifiedItemName, RawDatabaseSpecifier,
     ResolvedDatabaseSpecifier, ResolvedIds, SchemaSpecifier,
 };
+use mz_sql::plan::ConnectionDetails;
 use mz_sql::session::user::MZ_SYSTEM_ROLE_ID;
 use mz_sql::session::vars::{VarError, VarInput};
 use mz_sql::{plan, rbac};
@@ -409,6 +410,13 @@ impl CatalogState {
         diff: StateDiff,
         retractions: &mut InProgressRetractions,
     ) {
+        // The `max_databases` limit counts all databases, system + user, to
+        // mirror the existing `self.catalog().databases().count()` call site
+        // in `validate_resource_limits`.
+        match diff {
+            StateDiff::Addition => self.resource_counts.databases += 1,
+            StateDiff::Retraction => self.resource_counts.databases -= 1,
+        }
         apply_inverted_lookup(
             &mut self.database_by_name,
             &database.name,
@@ -531,6 +539,12 @@ impl CatalogState {
         diff: StateDiff,
         retractions: &mut InProgressRetractions,
     ) {
+        if cluster.id.is_user() {
+            match diff {
+                StateDiff::Addition => self.resource_counts.user_clusters += 1,
+                StateDiff::Retraction => self.resource_counts.user_clusters -= 1,
+            }
+        }
         apply_inverted_lookup(&mut self.clusters_by_name, &cluster.name, cluster.id, diff);
         apply_with_update(
             &mut self.clusters_by_id,
@@ -1901,6 +1915,9 @@ impl CatalogState {
 
     /// Associates a name, `CatalogItemId`, and entry.
     fn insert_entry(&mut self, entry: CatalogEntry) {
+        if entry.id.is_user() {
+            self.adjust_resource_counts_for_item(entry.item(), /*addition*/ true);
+        }
         if !entry.id.is_system() {
             if let Some(cluster_id) = entry.item.cluster_id() {
                 self.clusters_by_id
@@ -1995,9 +2012,61 @@ impl CatalogState {
         self.insert_entry(entry);
     }
 
+    /// Bump (`addition = true`) or decrement (`addition = false`) the cached
+    /// per-category counts in [`CatalogState::resource_counts`] to reflect
+    /// the addition or removal of `item`.
+    ///
+    /// Callers must only invoke this for user entries; the resource limits
+    /// only track user-owned objects.
+    fn adjust_resource_counts_for_item(&mut self, item: &CatalogItem, addition: bool) {
+        let counts = &mut self.resource_counts;
+        let bump = |slot: &mut usize| {
+            if addition {
+                *slot += 1;
+            } else {
+                *slot -= 1;
+            }
+        };
+        match item {
+            CatalogItem::Table(_) => bump(&mut counts.user_tables),
+            CatalogItem::Source(source) => {
+                let shards = source.user_controllable_persist_shard_count();
+                if addition {
+                    counts.user_sources_shards += shards;
+                } else {
+                    counts.user_sources_shards -= shards;
+                }
+            }
+            CatalogItem::Sink(_) => bump(&mut counts.user_sinks),
+            CatalogItem::MaterializedView(_) => bump(&mut counts.user_materialized_views),
+            CatalogItem::Connection(connection) => match connection.details {
+                ConnectionDetails::Kafka(_) => bump(&mut counts.user_kafka_connections),
+                ConnectionDetails::Postgres(_) => bump(&mut counts.user_postgres_connections),
+                ConnectionDetails::MySql(_) => bump(&mut counts.user_mysql_connections),
+                ConnectionDetails::SqlServer(_) => bump(&mut counts.user_sql_server_connections),
+                ConnectionDetails::AwsPrivatelink(_) => {
+                    bump(&mut counts.user_aws_privatelink_connections)
+                }
+                ConnectionDetails::Csr(_)
+                | ConnectionDetails::Ssh { .. }
+                | ConnectionDetails::Aws(_)
+                | ConnectionDetails::IcebergCatalog(_) => {}
+            },
+            CatalogItem::Log(_)
+            | CatalogItem::View(_)
+            | CatalogItem::Index(_)
+            | CatalogItem::Type(_)
+            | CatalogItem::Func(_)
+            | CatalogItem::Secret(_) => {}
+        }
+    }
+
     #[mz_ore::instrument(level = "trace")]
     fn drop_item(&mut self, id: CatalogItemId) -> CatalogEntry {
         let metadata = self.entry_by_id.remove(&id).expect("catalog out of sync");
+        if metadata.id.is_user() {
+            self.adjust_resource_counts_for_item(metadata.item(), /*addition*/ false);
+        }
         for u in metadata.references().items() {
             if let Some(dep_metadata) = self.entry_by_id.get_mut(u) {
                 dep_metadata.referenced_by.retain(|u| *u != metadata.id())
