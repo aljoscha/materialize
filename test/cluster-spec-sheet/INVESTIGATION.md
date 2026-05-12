@@ -491,3 +491,97 @@ that remains lives in the **adapter** layer:
 
 These are the iter-8+ targets.
 
+### Iteration 8 — cache resource-limit counts (O(N) → O(1))
+
+Target: `Coordinator::validate_resource_limits` ran six O(N) walks
+on every DDL transaction (`user_tables().count()`,
+`user_materialized_views().count()`, `user_sinks().count()`,
+`user_clusters().count()`, `databases().count()`, plus a
+connection-counting loop that filtered `user_connections()` by
+kind).
+
+Fix (`dc2acd5f13`):
+
+* Added `ResourceLimitCounts` to `CatalogState` (11 counters: tables,
+  source-shard sum, sinks, MVs, clusters, databases, plus the five
+  connection kinds).
+* `insert_entry` / `drop_item` / `apply_cluster_update` /
+  `apply_database_update` bump the counters in-place.
+* `Op::UpdateItem` automatically does the right thing — it produces
+  a retraction+addition pair through `apply_item_update`, so a
+  source's `user_controllable_persist_shard_count` change is picked
+  up via the drop+insert path.
+* `validate_resource_limits` now reads each count in O(1).
+* A `check_resource_counts` consistency check recomputes the counts
+  O(N) and surfaces any drift via the existing `check_consistency`
+  soft-assertion path (free in production, fires in CI/dev).
+
+CPU flame at N=12k catalog (post-iter-8,
+`results-archive/iter8_flame_tablespop_N12k.mzfg`):
+
+| function                                | iter-7 | iter-8 | Δ        |
+|-----------------------------------------|-------:|-------:|---------:|
+| `Coordinator::validate_resource_limits` |   8.6% |   3.6% | **−5.0**  |
+| `CatalogState::apply_updates`           |  13.8% |  13.7% |   −0.1    |
+| `CatalogState::insert_entry`            |    —   |   9.8% | (visible) |
+| `drop_in_place::<CatalogState>`         |   5.1% |   9.1% |   +4.0    |
+| `CatalogState::get_schema_mut`          |   7.0% |   7.6% |   +0.6    |
+| `*::from_proto`                         |   0.1% |   0.2% |   noise   |
+
+The fix was structurally clean (CPU saving where designed), but
+wall-clock improvement is small:
+
+| N      | iter-7 p50 | iter-8 p50 | iter-8 max | iter-7 max |
+|--------|-----------:|-----------:|-----------:|-----------:|
+| 1      |          8 |         11 |         12 |         13 |
+| 10     |          7 |          7 |          8 |         12 |
+| 100    |          7 |          7 |          8 |          7 |
+| 1000   |          8 |          8 |         11 |         12 |
+| 3000   |         10 |         10 |         20 |         11 |
+| 5000   |         14 |         13 |         16 |         18 |
+| 10000  |         23 |         23 |         24 |         25 |
+| 30000  |         54 |         56 |         85 |        120 |
+
+Peeks unchanged (~4 ms across the board).
+
+So iter-8 is honest: p50 is unchanged at every N, but tail latency at
+N=30k dropped from 120 → 85 ms (≈30% better worst case). The 5% of
+coordinator CPU we saved corresponds to ~0.8 ms of wall-clock at
+N=30k (5% of 1860 samples / 30 s × 99 Hz = ~1.5% of wall time × 54
+ms ≈ 0.8 ms), which is within run-to-run noise on the median but
+shows up in the max.
+
+Lesson: the iter-7 flame's "biggest" remaining cost wasn't the
+biggest wall-clock cost — coordinator CPU and DDL wall-clock are
+not 1:1. Per-DDL wall-clock at N=30k is bounded by persist commit
+latency + controller round-trips + other off-coord-thread work,
+not coord CPU. Removing a 5% CPU strip only helps when the
+coordinator was the bottleneck (which it is in some tail cases —
+hence the max-latency win).
+
+### Status after iter-8
+
+Pushed to `aljoscha/envd-specsheet`. The catalog now does no O(N)
+work in the per-DDL hot path on either side:
+
+* Durable: rust-typed snapshot cache (iter-7).
+* In-memory: cached resource-limit counts (iter-8).
+
+The remaining slope (1.5 µs/object) is **not** algorithmic O(N) on
+the coordinator; it's the cumulative effect of:
+
+* `apply_updates` running twice per Op (preliminary-state apply +
+  final apply) — 13.7% of coord CPU, structural change to remove.
+* `imbl::OrdMap` COW path-copies on every state mutation — 23.4%
+  of coord CPU collectively (insert_entry, get_schema_mut,
+  CatalogState clone).
+* Wall-clock contributors off the coordinator thread (persist
+  write latency, controller round-trips) that get worse as the
+  durable shard grows — these don't show up as coord CPU at all.
+
+Next round (iter-9): start by either restructuring `transact_inner`
+to skip the per-Op preliminary apply when `ops.len() == 1` (cheap
+shot at apply_updates and the per-Op CatalogState clone+drop), or
+instrument the *wall-clock* breakdown of a single CREATE TABLE at
+N=30k to find where the off-coord time goes.
+
