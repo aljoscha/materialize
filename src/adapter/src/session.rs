@@ -63,7 +63,7 @@ use crate::error::AdapterError;
 use crate::metrics::{Metrics, SessionMetrics};
 use crate::statement_logging::PreparedStatementLoggingInfo;
 use crate::{AdapterNotice, ExecuteContext};
-use mz_catalog::durable::Snapshot;
+use mz_catalog::durable::MemorySnapshot;
 
 const DUMMY_CONNECTION_ID: ConnectionId = ConnectionId::Static(0);
 
@@ -1607,7 +1607,7 @@ pub enum TransactionOps {
         /// Used to initialize the next dry run's transaction so it starts
         /// in sync with the accumulated `state`. `None` for the first
         /// statement in the transaction (before any dry run).
-        snapshot: Option<Snapshot>,
+        snapshot: Option<MemorySnapshot>,
     },
 }
 

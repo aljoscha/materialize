@@ -25,7 +25,7 @@ use mz_ore::vec::VecExt;
 use mz_ore::{soft_assert_no_log, soft_assert_or_log, soft_panic_or_log};
 use mz_persist_types::ShardId;
 use mz_pgrepr::oid::FIRST_USER_OID;
-use mz_proto::{RustType, TryFromProtoError};
+use mz_proto::RustType;
 use mz_repr::adt::mz_acl_item::{AclMode, MzAclItem};
 use mz_repr::network_policy_id::NetworkPolicyId;
 use mz_repr::role_id::RoleId;
@@ -63,9 +63,9 @@ use crate::durable::objects::{
 use crate::durable::{
     AUDIT_LOG_ID_ALLOC_KEY, BUILTIN_MIGRATION_SHARD_KEY, CATALOG_CONTENT_VERSION_KEY, CatalogError,
     DATABASE_ID_ALLOC_KEY, DefaultPrivilege, DurableCatalogError, DurableCatalogState,
-    EXPRESSION_CACHE_SHARD_KEY, MOCK_AUTHENTICATION_NONCE_KEY, NetworkPolicy, OID_ALLOC_KEY,
-    SCHEMA_ID_ALLOC_KEY, SYSTEM_CLUSTER_ID_ALLOC_KEY, SYSTEM_ITEM_ALLOC_KEY,
-    SYSTEM_REPLICA_ID_ALLOC_KEY, Snapshot, SystemConfiguration, USER_ITEM_ALLOC_KEY,
+    EXPRESSION_CACHE_SHARD_KEY, MOCK_AUTHENTICATION_NONCE_KEY, MemorySnapshot, NetworkPolicy,
+    OID_ALLOC_KEY, SCHEMA_ID_ALLOC_KEY, SYSTEM_CLUSTER_ID_ALLOC_KEY, SYSTEM_ITEM_ALLOC_KEY,
+    SYSTEM_REPLICA_ID_ALLOC_KEY, SystemConfiguration, USER_ITEM_ALLOC_KEY,
     USER_NETWORK_POLICY_ID_ALLOC_KEY, USER_REPLICA_ID_ALLOC_KEY, USER_ROLE_ID_ALLOC_KEY,
 };
 use crate::memory::objects::{StateDiff, StateUpdate, StateUpdateKind};
@@ -115,7 +115,7 @@ pub struct Transaction<'a> {
 impl<'a> Transaction<'a> {
     pub fn new(
         durable_catalog: &'a mut dyn DurableCatalogState,
-        Snapshot {
+        MemorySnapshot {
             databases,
             schemas,
             roles,
@@ -137,7 +137,7 @@ impl<'a> Transaction<'a> {
             storage_collection_metadata,
             unfinalized_shards,
             txn_wal_shard,
-        }: Snapshot,
+        }: MemorySnapshot,
         upper: mz_repr::Timestamp,
     ) -> Result<Transaction<'a>, CatalogError> {
         Ok(Transaction {
@@ -145,10 +145,10 @@ impl<'a> Transaction<'a> {
             databases: TableTransaction::new_with_uniqueness_fn(
                 databases,
                 |a: &DatabaseValue, b| a.name == b.name,
-            )?,
+            ),
             schemas: TableTransaction::new_with_uniqueness_fn(schemas, |a: &SchemaValue, b| {
                 a.database_id == b.database_id && a.name == b.name
-            })?,
+            }),
             items: TableTransaction::new_with_uniqueness_fn(items, |a: &ItemValue, b| {
                 a.schema_id == b.schema_id && a.name == b.name && {
                     // `item_type` is slow, only compute if needed.
@@ -158,38 +158,38 @@ impl<'a> Transaction<'a> {
                         || (a_type == CatalogItemType::Type && b_type.conflicts_with_type())
                         || (b_type == CatalogItemType::Type && a_type.conflicts_with_type())
                 }
-            })?,
-            comments: TableTransaction::new(comments)?,
+            }),
+            comments: TableTransaction::new(comments),
             roles: TableTransaction::new_with_uniqueness_fn(roles, |a: &RoleValue, b| {
                 a.name == b.name
-            })?,
-            role_auth: TableTransaction::new(role_auth)?,
+            }),
+            role_auth: TableTransaction::new(role_auth),
             clusters: TableTransaction::new_with_uniqueness_fn(clusters, |a: &ClusterValue, b| {
                 a.name == b.name
-            })?,
+            }),
             network_policies: TableTransaction::new_with_uniqueness_fn(
                 network_policies,
                 |a: &NetworkPolicyValue, b| a.name == b.name,
-            )?,
+            ),
             cluster_replicas: TableTransaction::new_with_uniqueness_fn(
                 cluster_replicas,
                 |a: &ClusterReplicaValue, b| a.cluster_id == b.cluster_id && a.name == b.name,
-            )?,
-            introspection_sources: TableTransaction::new(introspection_sources)?,
-            id_allocator: TableTransaction::new(id_allocator)?,
-            configs: TableTransaction::new(configs)?,
-            settings: TableTransaction::new(settings)?,
-            source_references: TableTransaction::new(source_references)?,
-            system_gid_mapping: TableTransaction::new(system_object_mappings)?,
-            system_configurations: TableTransaction::new(system_configurations)?,
-            default_privileges: TableTransaction::new(default_privileges)?,
-            system_privileges: TableTransaction::new(system_privileges)?,
-            storage_collection_metadata: TableTransaction::new(storage_collection_metadata)?,
-            unfinalized_shards: TableTransaction::new(unfinalized_shards)?,
+            ),
+            introspection_sources: TableTransaction::new(introspection_sources),
+            id_allocator: TableTransaction::new(id_allocator),
+            configs: TableTransaction::new(configs),
+            settings: TableTransaction::new(settings),
+            source_references: TableTransaction::new(source_references),
+            system_gid_mapping: TableTransaction::new(system_object_mappings),
+            system_configurations: TableTransaction::new(system_configurations),
+            default_privileges: TableTransaction::new(default_privileges),
+            system_privileges: TableTransaction::new(system_privileges),
+            storage_collection_metadata: TableTransaction::new(storage_collection_metadata),
+            unfinalized_shards: TableTransaction::new(unfinalized_shards),
             // Uniqueness violations for this value occur at the key rather than
             // the value (the key is the unit struct `()` so this is a singleton
             // value).
-            txn_wal_shard: TableTransaction::new(txn_wal_shard)?,
+            txn_wal_shard: TableTransaction::new(txn_wal_shard),
             audit_log_updates: Vec::new(),
             upper,
             op_id: 0,
@@ -1019,36 +1019,36 @@ impl<'a> Transaction<'a> {
             .map(|oids| oids.into_element())
     }
 
-    /// Exports the current state of this transaction as a [`Snapshot`].
+    /// Exports the current state of this transaction as a [`MemorySnapshot`].
     ///
     /// This merges each `TableTransaction`'s initial data with its pending
-    /// changes to produce the current view, then converts back to proto types.
+    /// changes to produce the current view as rust-typed key-value pairs.
     /// Used to persist transaction state between incremental DDL dry runs so
     /// the next dry run's fresh `Transaction` starts in sync with the
     /// accumulated `CatalogState`.
-    pub fn current_snapshot(&self) -> Snapshot {
-        Snapshot {
-            databases: self.databases.current_items_proto(),
-            schemas: self.schemas.current_items_proto(),
-            roles: self.roles.current_items_proto(),
-            role_auth: self.role_auth.current_items_proto(),
-            items: self.items.current_items_proto(),
-            comments: self.comments.current_items_proto(),
-            clusters: self.clusters.current_items_proto(),
-            network_policies: self.network_policies.current_items_proto(),
-            cluster_replicas: self.cluster_replicas.current_items_proto(),
-            introspection_sources: self.introspection_sources.current_items_proto(),
-            id_allocator: self.id_allocator.current_items_proto(),
-            configs: self.configs.current_items_proto(),
-            settings: self.settings.current_items_proto(),
-            system_object_mappings: self.system_gid_mapping.current_items_proto(),
-            system_configurations: self.system_configurations.current_items_proto(),
-            default_privileges: self.default_privileges.current_items_proto(),
-            source_references: self.source_references.current_items_proto(),
-            system_privileges: self.system_privileges.current_items_proto(),
-            storage_collection_metadata: self.storage_collection_metadata.current_items_proto(),
-            unfinalized_shards: self.unfinalized_shards.current_items_proto(),
-            txn_wal_shard: self.txn_wal_shard.current_items_proto(),
+    pub fn current_snapshot(&self) -> MemorySnapshot {
+        MemorySnapshot {
+            databases: self.databases.current_items_memory(),
+            schemas: self.schemas.current_items_memory(),
+            roles: self.roles.current_items_memory(),
+            role_auth: self.role_auth.current_items_memory(),
+            items: self.items.current_items_memory(),
+            comments: self.comments.current_items_memory(),
+            clusters: self.clusters.current_items_memory(),
+            network_policies: self.network_policies.current_items_memory(),
+            cluster_replicas: self.cluster_replicas.current_items_memory(),
+            introspection_sources: self.introspection_sources.current_items_memory(),
+            id_allocator: self.id_allocator.current_items_memory(),
+            configs: self.configs.current_items_memory(),
+            settings: self.settings.current_items_memory(),
+            system_object_mappings: self.system_gid_mapping.current_items_memory(),
+            system_configurations: self.system_configurations.current_items_memory(),
+            default_privileges: self.default_privileges.current_items_memory(),
+            source_references: self.source_references.current_items_memory(),
+            system_privileges: self.system_privileges.current_items_memory(),
+            storage_collection_metadata: self.storage_collection_metadata.current_items_memory(),
+            unfinalized_shards: self.unfinalized_shards.current_items_memory(),
+            txn_wal_shard: self.txn_wal_shard.current_items_memory(),
         }
     }
 
@@ -2916,9 +2916,14 @@ mod unique_name {
 ///
 /// `K` is the primary key type. Multiple entries with the same key are disallowed.
 /// `V` is the an arbitrary value type.
+///
+/// The `initial` map uses [`imbl::OrdMap`] so that `Transaction::new` can take
+/// the in-memory snapshot cache from [`crate::durable::persist::PersistHandle`]
+/// without doing an O(N) clone or an O(N) proto→rust conversion: the snapshot
+/// is already rust-typed and structurally shared.
 #[derive(Debug)]
-struct TableTransaction<K, V> {
-    initial: BTreeMap<K, V>,
+struct TableTransaction<K: Ord, V> {
+    initial: imbl::OrdMap<K, V>,
     // The desired updates to keys after commit.
     // Invariant: Value is sorted by `ts`.
     pending: BTreeMap<K, Vec<TransactionUpdate<V>>>,
@@ -2932,47 +2937,30 @@ where
 {
     /// Create a new TableTransaction with initial data.
     ///
-    /// Internally the catalog serializes data as protobuf. All fields in a proto message are
-    /// optional, which makes using them in Rust cumbersome. Generic parameters `KP` and `VP` are
-    /// protobuf types which deserialize to `K` and `V` that a [`TableTransaction`] is generic
-    /// over.
-    fn new<KP, VP>(initial: BTreeMap<KP, VP>) -> Result<Self, TryFromProtoError>
-    where
-        K: RustType<KP>,
-        V: RustType<VP>,
-    {
-        let initial = initial
-            .into_iter()
-            .map(RustType::from_proto)
-            .collect::<Result<_, _>>()?;
-
-        Ok(Self {
+    /// The caller is responsible for providing the data already in rust-typed
+    /// form — historically this constructor took proto-typed data and did the
+    /// conversion here, but that meant paying O(N) `RustType::from_proto`
+    /// calls on every `Transaction::new`. Conversion is now done once in
+    /// [`crate::durable::persist::PersistHandle::apply_updates`].
+    fn new(initial: imbl::OrdMap<K, V>) -> Self {
+        Self {
             initial,
             pending: BTreeMap::new(),
             uniqueness_violation: None,
-        })
+        }
     }
 
     /// Like [`Self::new`], but you can also provide `uniqueness_violation`, which is a function
     /// that determines whether there is a uniqueness violation among two values.
-    fn new_with_uniqueness_fn<KP, VP>(
-        initial: BTreeMap<KP, VP>,
+    fn new_with_uniqueness_fn(
+        initial: imbl::OrdMap<K, V>,
         uniqueness_violation: fn(a: &V, b: &V) -> bool,
-    ) -> Result<Self, TryFromProtoError>
-    where
-        K: RustType<KP>,
-        V: RustType<VP>,
-    {
-        let initial = initial
-            .into_iter()
-            .map(RustType::from_proto)
-            .collect::<Result<_, _>>()?;
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             initial,
             pending: BTreeMap::new(),
             uniqueness_violation: Some(uniqueness_violation),
-        })
+        }
     }
 
     /// Consumes and returns the pending changes and their diffs. `Diff` is
@@ -3121,18 +3109,14 @@ where
         items
     }
 
-    /// Returns the current items as proto-typed key-value pairs, suitable for
-    /// constructing a [`Snapshot`]. This merges `initial` and `pending` to
-    /// produce the current view and converts back to proto types.
-    fn current_items_proto<KP, VP>(&self) -> BTreeMap<KP, VP>
-    where
-        K: RustType<KP>,
-        V: RustType<VP>,
-        KP: Ord,
-    {
-        let mut items = BTreeMap::new();
+    /// Returns the current items as rust-typed key-value pairs in an
+    /// [`imbl::OrdMap`], suitable for constructing a
+    /// [`crate::durable::objects::MemorySnapshot`]. This merges `initial` and
+    /// `pending` to produce the current view.
+    fn current_items_memory(&self) -> imbl::OrdMap<K, V> {
+        let mut items = imbl::OrdMap::new();
         self.for_values(|k, v| {
-            items.insert(k.into_proto(), v.into_proto());
+            items.insert(k.clone(), v.clone());
         });
         items
     }
@@ -3478,11 +3462,9 @@ mod tests {
         fn uniqueness_violation(a: &String, b: &String) -> bool {
             a == b
         }
-        let mut table = TableTransaction::new_with_uniqueness_fn(
-            BTreeMap::from([(1i64.to_le_bytes().to_vec(), "a".to_string())]),
-            uniqueness_violation,
-        )
-        .unwrap();
+        let initial: imbl::OrdMap<Vec<u8>, String> =
+            imbl::OrdMap::from_iter([(1i64.to_le_bytes().to_vec(), "a".to_string())]);
+        let mut table = TableTransaction::new_with_uniqueness_fn(initial, uniqueness_violation);
 
         // Ideally, we compare for errors here, but it's hard/impossible to implement PartialEq
         // for DurableCatalogError.
@@ -3526,10 +3508,16 @@ mod tests {
             }
         }
 
+        // Helper to convert the test's `BTreeMap` view of the table into the
+        // `imbl::OrdMap` that `TableTransaction` now consumes.
+        fn as_ord(table: &BTreeMap<Vec<u8>, String>) -> imbl::OrdMap<Vec<u8>, String> {
+            table.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        }
+
         table.insert(1i64.to_le_bytes().to_vec(), "v1".to_string());
         table.insert(2i64.to_le_bytes().to_vec(), "v2".to_string());
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         assert_eq!(table_txn.items_cloned(), table);
         assert_eq!(table_txn.delete(|_k, _v| false, 0).len(), 0);
         assert_eq!(table_txn.delete(|_k, v| v == "v2", 1).len(), 1);
@@ -3594,7 +3582,7 @@ mod tests {
         );
 
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         // Deleting then creating an item that has a uniqueness violation should work.
         assert_eq!(
             table_txn.delete(|k, _v| k == &1i64.to_le_bytes(), 0).len(),
@@ -3646,7 +3634,7 @@ mod tests {
         );
 
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         assert_eq!(table_txn.delete(|_k, _v| true, 0).len(), 3);
         table_txn
             .insert(1i64.to_le_bytes().to_vec(), "v1".to_string(), 0)
@@ -3659,7 +3647,7 @@ mod tests {
         );
 
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         assert_eq!(table_txn.delete(|_k, _v| true, 0).len(), 1);
         table_txn
             .insert(1i64.to_le_bytes().to_vec(), "v2".to_string(), 0)
@@ -3672,7 +3660,7 @@ mod tests {
 
         // Verify we don't try to delete v3 or v4 during commit.
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         assert_eq!(table_txn.delete(|_k, _v| true, 0).len(), 1);
         table_txn
             .insert(1i64.to_le_bytes().to_vec(), "v3".to_string(), 0)
@@ -3692,7 +3680,7 @@ mod tests {
 
         // Test `set`.
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         // Uniqueness violation.
         table_txn
             .set(2i64.to_le_bytes().to_vec(), Some("v5".to_string()), 0)
@@ -3722,7 +3710,7 @@ mod tests {
 
         // Duplicate `set`.
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         table_txn
             .set(3i64.to_le_bytes().to_vec(), Some("v6".to_string()), 0)
             .unwrap();
@@ -3731,7 +3719,7 @@ mod tests {
 
         // Test `set_many`.
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         // Uniqueness violation.
         table_txn
             .set_many(
@@ -3784,7 +3772,7 @@ mod tests {
 
         // Duplicate `set_many`.
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         table_txn
             .set_many(
                 BTreeMap::from([
@@ -3807,7 +3795,7 @@ mod tests {
 
         // Test `update_by_key`
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         // Uniqueness violation.
         table_txn
             .update_by_key(1i64.to_le_bytes().to_vec(), "v7".to_string(), 0)
@@ -3845,7 +3833,7 @@ mod tests {
 
         // Duplicate `update_by_key`.
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         assert!(
             table_txn
                 .update_by_key(1i64.to_le_bytes().to_vec(), "v8".to_string(), 0)
@@ -3864,7 +3852,7 @@ mod tests {
 
         // Test `update_by_keys`
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         // Uniqueness violation.
         table_txn
             .update_by_keys(
@@ -3918,7 +3906,7 @@ mod tests {
 
         // Duplicate `update_by_keys`.
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         let n = table_txn
             .update_by_keys(
                 [
@@ -3942,7 +3930,7 @@ mod tests {
 
         // Test `delete_by_key`
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         let prev = table_txn.delete_by_key(1i64.to_le_bytes().to_vec(), 0);
         assert_eq!(prev, Some("v9".to_string()));
         let prev = table_txn.delete_by_key(5i64.to_le_bytes().to_vec(), 1);
@@ -3966,7 +3954,7 @@ mod tests {
 
         // Test `delete_by_keys`
         let mut table_txn =
-            TableTransaction::new_with_uniqueness_fn(table.clone(), uniqueness_violation).unwrap();
+            TableTransaction::new_with_uniqueness_fn(as_ord(&table), uniqueness_violation);
         let prevs = table_txn.delete_by_keys(
             [42i64.to_le_bytes().to_vec(), 55i64.to_le_bytes().to_vec()],
             0,

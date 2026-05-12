@@ -1168,6 +1168,94 @@ impl Snapshot {
     }
 }
 
+/// An in-memory snapshot of the catalog's durable state, using rust-typed
+/// keys and values backed by [`imbl::OrdMap`].
+///
+/// [`MemorySnapshot`] is the type cached inside [`crate::durable::persist::PersistHandle`] and
+/// handed off to [`crate::durable::Transaction::new`]. Compared to [`Snapshot`]
+/// (which stores proto-typed keys/values), this type has two important properties:
+///
+/// 1. Proto → rust conversion is paid once per update inside
+///    `apply_to_snapshot_cache`, not once per entry per transaction. This drops
+///    the per-DDL `RustType::from_proto` cost from O(N) to O(1).
+/// 2. [`imbl::OrdMap`] clones are O(log N) and structurally shared, so the
+///    `Transaction::new` clone of the cache is cheap.
+#[derive(Debug, Clone, Default)]
+pub struct MemorySnapshot {
+    pub databases: imbl::OrdMap<DatabaseKey, DatabaseValue>,
+    pub schemas: imbl::OrdMap<SchemaKey, SchemaValue>,
+    pub roles: imbl::OrdMap<RoleKey, RoleValue>,
+    pub role_auth: imbl::OrdMap<RoleAuthKey, RoleAuthValue>,
+    pub items: imbl::OrdMap<ItemKey, ItemValue>,
+    pub comments: imbl::OrdMap<CommentKey, CommentValue>,
+    pub clusters: imbl::OrdMap<ClusterKey, ClusterValue>,
+    pub network_policies: imbl::OrdMap<NetworkPolicyKey, NetworkPolicyValue>,
+    pub cluster_replicas: imbl::OrdMap<ClusterReplicaKey, ClusterReplicaValue>,
+    pub introspection_sources:
+        imbl::OrdMap<ClusterIntrospectionSourceIndexKey, ClusterIntrospectionSourceIndexValue>,
+    pub id_allocator: imbl::OrdMap<IdAllocKey, IdAllocValue>,
+    pub configs: imbl::OrdMap<ConfigKey, ConfigValue>,
+    pub settings: imbl::OrdMap<SettingKey, SettingValue>,
+    pub system_object_mappings: imbl::OrdMap<GidMappingKey, GidMappingValue>,
+    pub system_configurations: imbl::OrdMap<ServerConfigurationKey, ServerConfigurationValue>,
+    pub default_privileges: imbl::OrdMap<DefaultPrivilegesKey, DefaultPrivilegesValue>,
+    pub source_references: imbl::OrdMap<SourceReferencesKey, SourceReferencesValue>,
+    pub system_privileges: imbl::OrdMap<SystemPrivilegesKey, SystemPrivilegesValue>,
+    pub storage_collection_metadata:
+        imbl::OrdMap<StorageCollectionMetadataKey, StorageCollectionMetadataValue>,
+    pub unfinalized_shards: imbl::OrdMap<UnfinalizedShardKey, ()>,
+    pub txn_wal_shard: imbl::OrdMap<(), TxnWalShardValue>,
+}
+
+impl MemorySnapshot {
+    pub fn empty() -> MemorySnapshot {
+        MemorySnapshot::default()
+    }
+
+    /// Returns the proto-typed equivalent of this snapshot. Intended for
+    /// tests and debug output: the conversion clones every entry and runs
+    /// `RustType::into_proto` per entry, so this is O(N) and not suitable
+    /// for hot paths. The production path stays rust-typed end to end.
+    pub fn to_proto_snapshot(&self) -> Snapshot {
+        use mz_proto::RustType;
+
+        fn map<K, V, KP, VP>(m: &imbl::OrdMap<K, V>) -> BTreeMap<KP, VP>
+        where
+            K: RustType<KP> + Ord + Clone,
+            V: RustType<VP> + Clone,
+            KP: Ord,
+        {
+            m.iter()
+                .map(|(k, v)| (k.into_proto(), v.into_proto()))
+                .collect()
+        }
+
+        Snapshot {
+            databases: map(&self.databases),
+            schemas: map(&self.schemas),
+            roles: map(&self.roles),
+            role_auth: map(&self.role_auth),
+            items: map(&self.items),
+            comments: map(&self.comments),
+            clusters: map(&self.clusters),
+            network_policies: map(&self.network_policies),
+            cluster_replicas: map(&self.cluster_replicas),
+            introspection_sources: map(&self.introspection_sources),
+            id_allocator: map(&self.id_allocator),
+            configs: map(&self.configs),
+            settings: map(&self.settings),
+            system_object_mappings: map(&self.system_object_mappings),
+            system_configurations: map(&self.system_configurations),
+            default_privileges: map(&self.default_privileges),
+            source_references: map(&self.source_references),
+            system_privileges: map(&self.system_privileges),
+            storage_collection_metadata: map(&self.storage_collection_metadata),
+            unfinalized_shards: map(&self.unfinalized_shards),
+            txn_wal_shard: map(&self.txn_wal_shard),
+        }
+    }
+}
+
 /// Token used to fence out other processes.
 ///
 /// Every time a new process takes over, the `epoch` should be incremented.

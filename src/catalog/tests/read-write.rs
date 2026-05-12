@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use insta::assert_debug_snapshot;
-use itertools::Itertools;
 use mz_audit_log::{EventDetails, EventType, EventV1, IdNameV1, VersionedEvent};
 use mz_catalog::durable::objects::serialization::proto;
 use mz_catalog::durable::objects::{DurableType, IdAlloc};
@@ -114,10 +113,8 @@ async fn test_allocate_id(state_builder: TestCatalogStateBuilder) {
         .unwrap()
         .id_allocator
         .into_iter()
-        .map(RustType::from_proto)
-        .map_ok(|(k, v)| IdAlloc::from_key_value(k, v))
-        .collect::<Result<_, _>>()
-        .unwrap();
+        .map(|(k, v)| IdAlloc::from_key_value(k, v))
+        .collect();
     assert!(snapshot_id_allocs.contains(&IdAlloc {
         name: id_type.to_string(),
         next_id: start_id + 3,
@@ -275,10 +272,8 @@ async fn test_items(state_builder: TestCatalogStateBuilder) {
         .unwrap()
         .items
         .into_iter()
-        .map(RustType::from_proto)
-        .map_ok(|(k, v)| Item::from_key_value(k, v))
-        .collect::<Result<_, _>>()
-        .unwrap();
+        .map(|(k, v)| Item::from_key_value(k, v))
+        .collect();
     for item in &items {
         assert!(snapshot_items.contains(item));
     }
@@ -407,7 +402,12 @@ async fn test_non_writer_commits(state_builder: TestCatalogStateBuilder) {
         let commit_ts = txn.upper();
         txn.commit(commit_ts).await.unwrap();
 
-        let roles = writer_state.snapshot().await.unwrap().roles;
+        let roles = writer_state
+            .snapshot()
+            .await
+            .unwrap()
+            .to_proto_snapshot()
+            .roles;
         let role = roles
             .get(&proto::RoleKey {
                 id: role_id.into_proto(),
@@ -433,7 +433,11 @@ async fn test_non_writer_commits(state_builder: TestCatalogStateBuilder) {
         let commit_ts = txn.upper();
         txn.commit(commit_ts).await.unwrap();
 
-        let snapshot = savepoint_state.snapshot().await.unwrap();
+        let snapshot = savepoint_state
+            .snapshot()
+            .await
+            .unwrap()
+            .to_proto_snapshot();
 
         // Savepoint catalogs do not yet know how to update themselves in response to concurrent
         // writes from writer catalogs, so it should not see the new role.
@@ -627,7 +631,7 @@ async fn test_persist_sync_consolidation_not_quadratic() {
         !updates.is_empty(),
         "reader should have received updates from writer"
     );
-    let snapshot = reader.snapshot().await.unwrap();
+    let snapshot = reader.snapshot().await.unwrap().to_proto_snapshot();
     for i in 0..num_timestamps {
         let db_name = format!("db_{i}");
         let found = snapshot.databases.values().any(|db| db.name == db_name);
@@ -712,7 +716,7 @@ async fn test_persist_sync_snapshot_stays_bounded_under_churn() {
     let _ = reader.sync_to_current_updates().await.unwrap();
 
     // Verify correctness: only one database, with the final name.
-    let snapshot = reader.snapshot().await.unwrap();
+    let snapshot = reader.snapshot().await.unwrap().to_proto_snapshot();
     let churn_dbs: Vec<_> = snapshot
         .databases
         .values()

@@ -27,7 +27,7 @@ use mz_audit_log::{
 };
 use mz_catalog::SYSTEM_CONN_ID;
 use mz_catalog::builtin::BuiltinLog;
-use mz_catalog::durable::{NetworkPolicy, Snapshot, Transaction};
+use mz_catalog::durable::{MemorySnapshot, NetworkPolicy, Transaction};
 use mz_catalog::expr_cache::LocalExpressions;
 use mz_catalog::memory::error::{AmbiguousRename, Error, ErrorKind};
 use mz_catalog::memory::objects::{
@@ -514,9 +514,9 @@ impl Catalog {
         base_state: &CatalogState,
         ops: Vec<Op>,
         session: Option<&ConnMeta>,
-        prev_snapshot: Option<Snapshot>,
+        prev_snapshot: Option<MemorySnapshot>,
         oracle_write_ts: mz_repr::Timestamp,
-    ) -> Result<(CatalogState, Snapshot), AdapterError> {
+    ) -> Result<(CatalogState, MemorySnapshot), AdapterError> {
         // For DDL transactions, items are not temporary (CREATE TABLE FROM SOURCE, etc.)
         // but we still need to check for collisions.
         let temporary_ids = self.temporary_ids(&ops, BTreeSet::new())?;

@@ -602,7 +602,7 @@ async fn test_concurrent_debugs(state_builder: TestCatalogStateBuilder) {
         .await
         .unwrap()
         .0;
-    let configs = state.snapshot().await.unwrap().configs;
+    let configs = state.snapshot().await.unwrap().to_proto_snapshot().configs;
     assert_eq!(configs.get(&key).unwrap(), &value);
 
     let state_handle = mz_ore::task::spawn(|| "state", async move {
@@ -641,6 +641,7 @@ async fn test_concurrent_debugs(state_builder: TestCatalogStateBuilder) {
         .snapshot()
         .await
         .unwrap()
+        .to_proto_snapshot()
         .configs;
     assert_none!(configs.get(&key));
 }

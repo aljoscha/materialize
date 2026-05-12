@@ -57,7 +57,7 @@ use crate::durable::objects::state_update::{
     IntoStateUpdateKindJson, StateUpdate, StateUpdateKind, StateUpdateKindJson,
     TryIntoStateUpdateKind,
 };
-use crate::durable::objects::{AuditLogKey, FenceToken, Snapshot};
+use crate::durable::objects::{AuditLogKey, FenceToken, MemorySnapshot};
 use crate::durable::transaction::TransactionBatch;
 use crate::durable::upgrade::upgrade;
 use crate::durable::{
@@ -324,7 +324,7 @@ pub(crate) trait ApplyUpdate<T: IntoStateUpdateKindJson> {
     ) -> Result<Option<StateUpdate<T>>, FenceError>;
 
     /// Incrementally apply a `(kind, diff)` pair to the cached
-    /// [`Snapshot`]. Used by [`PersistHandle::with_snapshot`] to avoid
+    /// [`MemorySnapshot`]. Used by [`PersistHandle::with_snapshot`] to avoid
     /// walking the entire trace and rebuilding the snapshot on every
     /// `transaction()` call.
     ///
@@ -332,7 +332,7 @@ pub(crate) trait ApplyUpdate<T: IntoStateUpdateKindJson> {
     /// is meaningful for the snapshot (currently only [`StateUpdateKind`])
     /// should override this and dispatch on `kind` the same way
     /// [`PersistHandle::with_snapshot`] used to.
-    fn apply_to_snapshot_cache(_snapshot: &mut Snapshot, _kind: &T, _diff: Diff) {}
+    fn apply_to_snapshot_cache(_snapshot: &mut MemorySnapshot, _kind: &T, _diff: Diff) {}
 }
 
 /// A handle for interacting with the persist catalog shard.
@@ -390,16 +390,18 @@ pub(crate) struct PersistHandle<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> {
     /// one — the dominant residual cost of `transaction()` once the catalog
     /// reaches a few thousand entries.
     is_consolidated: bool,
-    /// Live, fully consolidated [`Snapshot`] of the catalog, maintained
-    /// incrementally by [`Self::apply_updates`] via
+    /// Live, fully consolidated rust-typed [`MemorySnapshot`] of the catalog,
+    /// maintained incrementally by [`Self::apply_updates`] via
     /// [`ApplyUpdate::apply_to_snapshot_cache`]. Cloning this on
-    /// `transaction()` is O(N) but a single tree clone — much cheaper
-    /// than walking the entire trace and rebuilding a fresh
-    /// [`BTreeMap`] for every collection on every transaction.
+    /// `transaction()` is O(log N) per collection (structural sharing via
+    /// [`imbl::OrdMap`]) — much cheaper than walking the entire trace and
+    /// rebuilding a fresh map per collection on every transaction. Storing
+    /// rust-typed values also avoids re-running `RustType::from_proto`
+    /// over every entry on every `Transaction::new`.
     ///
     /// Only meaningful for `T = StateUpdateKind`; for the JSON variant
     /// the trait method is a no-op and this stays empty.
-    cached_snapshot: Snapshot,
+    cached_snapshot: MemorySnapshot,
 }
 
 impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
@@ -817,7 +819,7 @@ impl<U: ApplyUpdate<StateUpdateKind>> PersistHandle<StateUpdateKind, U> {
     /// Will return an error if the catalog has been fenced out.
     async fn with_snapshot<T>(
         &mut self,
-        f: impl FnOnce(Snapshot) -> Result<T, CatalogError>,
+        f: impl FnOnce(MemorySnapshot) -> Result<T, CatalogError>,
     ) -> Result<T, CatalogError> {
         self.sync_to_current_upper().await?;
         f(self.cached_snapshot.clone())
@@ -1035,7 +1037,7 @@ impl UnopenedPersistCatalogState {
             is_consolidated: true,
             // Unopened catalogs never call `with_snapshot`, so the
             // cache stays empty here.
-            cached_snapshot: Snapshot::empty(),
+            cached_snapshot: MemorySnapshot::empty(),
         };
         // If the snapshot is not consolidated, and we see multiple epoch values while applying the
         // updates, then we might accidentally fence ourselves out.
@@ -1236,7 +1238,7 @@ impl UnopenedPersistCatalogState {
             is_consolidated: true,
             // Populated incrementally by `apply_updates` below as the
             // initial trace is replayed.
-            cached_snapshot: Snapshot::empty(),
+            cached_snapshot: MemorySnapshot::empty(),
         };
         catalog.metrics.collection_entries.reset();
         // Normally, `collection_entries` is updated in `apply_updates`. The audit log updates skip
@@ -1584,23 +1586,34 @@ impl ApplyUpdate<StateUpdateKind> for CatalogStateInner {
         }
     }
 
-    fn apply_to_snapshot_cache(snapshot: &mut Snapshot, kind: &StateUpdateKind, diff: Diff) {
-        fn apply<K, V>(map: &mut BTreeMap<K, V>, key: &K, value: &V, diff: Diff)
+    fn apply_to_snapshot_cache(snapshot: &mut MemorySnapshot, kind: &StateUpdateKind, diff: Diff) {
+        // Converts the proto-typed `(key, value)` pair to rust-typed and
+        // applies `diff` to `map`. The conversion runs once per update here
+        // instead of once per entry per `Transaction::new`, which is what
+        // makes the per-DDL hot path O(1) instead of O(N) for proto→rust
+        // conversion.
+        fn apply<KP, VP, K, V>(map: &mut imbl::OrdMap<K, V>, key: &KP, value: &VP, diff: Diff)
         where
-            K: Ord + Clone,
-            V: Ord + Clone + Debug,
+            K: RustType<KP> + Ord + Clone + Debug,
+            V: RustType<VP> + Clone + PartialEq + Debug,
+            KP: Clone,
+            VP: Clone,
         {
+            let key = K::from_proto(key.clone())
+                .expect("invariant violated: cached snapshot key must be convertible from proto");
+            let value = V::from_proto(value.clone())
+                .expect("invariant violated: cached snapshot value must be convertible from proto");
             if diff == Diff::ONE {
-                let prev = map.insert(key.clone(), value.clone());
+                let prev = map.insert(key, value);
                 assert_eq!(
                     prev, None,
                     "values must be explicitly retracted before inserting a new value"
                 );
             } else if diff == Diff::MINUS_ONE {
-                let prev = map.remove(key);
+                let prev = map.remove(&key);
                 assert_eq!(
                     prev.as_ref(),
-                    Some(value),
+                    Some(&value),
                     "retraction does not match existing value"
                 );
             }
@@ -1760,7 +1773,7 @@ impl ReadOnlyDurableCatalogState for PersistCatalogState {
     }
 
     #[mz_ore::instrument(level = "debug")]
-    async fn snapshot(&mut self) -> Result<Snapshot, CatalogError> {
+    async fn snapshot(&mut self) -> Result<MemorySnapshot, CatalogError> {
         self.with_snapshot(Ok).await
     }
 
@@ -1830,7 +1843,7 @@ impl DurableCatalogState for PersistCatalogState {
 
     fn transaction_from_snapshot(
         &mut self,
-        snapshot: Snapshot,
+        snapshot: MemorySnapshot,
     ) -> Result<Transaction, CatalogError> {
         let commit_ts = self.upper.clone();
         Transaction::new(self, snapshot, commit_ts)

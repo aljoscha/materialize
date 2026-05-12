@@ -31,7 +31,6 @@ use crate::durable::debug::{DebugCatalogState, Trace};
 pub use crate::durable::error::{CatalogError, DurableCatalogError, FenceError};
 pub use crate::durable::metrics::Metrics;
 use crate::durable::objects::AuditLog;
-pub use crate::durable::objects::Snapshot;
 pub use crate::durable::objects::state_update::StateUpdate;
 use crate::durable::objects::state_update::{StateUpdateKindJson, TryIntoStateUpdateKind};
 pub use crate::durable::objects::{
@@ -41,6 +40,7 @@ pub use crate::durable::objects::{
     StorageCollectionMetadata, SystemConfiguration, SystemObjectDescription, SystemObjectMapping,
     UnfinalizedShard,
 };
+pub use crate::durable::objects::{MemorySnapshot, Snapshot};
 pub use crate::durable::persist::shard_id;
 use crate::durable::persist::{Timestamp, UnopenedPersistCatalogState};
 pub use crate::durable::transaction::Transaction;
@@ -255,7 +255,7 @@ pub trait ReadOnlyDurableCatalogState: Debug + Send + Sync {
     async fn get_deployment_generation(&mut self) -> Result<u64, CatalogError>;
 
     /// Get a snapshot of the catalog.
-    async fn snapshot(&mut self) -> Result<Snapshot, CatalogError>;
+    async fn snapshot(&mut self) -> Result<MemorySnapshot, CatalogError>;
 
     /// Listen and return all updates that are currently in the catalog.
     ///
@@ -299,14 +299,14 @@ pub trait DurableCatalogState: ReadOnlyDurableCatalogState {
     /// Creates a new durable catalog state transaction.
     async fn transaction(&mut self) -> Result<Transaction, CatalogError>;
 
-    /// Creates a new transaction initialized from the given [`Snapshot`]
+    /// Creates a new transaction initialized from the given [`MemorySnapshot`]
     /// instead of reading from durable storage. Used for incremental DDL
     /// dry runs where the transaction state from a previous dry run has been
     /// saved and needs to be restored so it stays in sync with the accumulated
     /// `CatalogState`.
     fn transaction_from_snapshot(
         &mut self,
-        snapshot: Snapshot,
+        snapshot: MemorySnapshot,
     ) -> Result<Transaction, CatalogError>;
 
     /// Commits a durable catalog state transaction. The transaction will be committed at

@@ -326,7 +326,7 @@ async fn test_open_savepoint(state_builder: TestCatalogStateBuilder) {
         txn.commit(commit_ts).await.unwrap();
 
         // Read back writes.
-        let snapshot = state.snapshot().await.unwrap();
+        let snapshot = state.snapshot().await.unwrap().to_proto_snapshot();
         for (db, schema) in &db_schemas {
             let (db_key, db_value) = db.clone().into_key_value();
             let db_found = snapshot.databases.get(&db_key.into_proto()).unwrap();
@@ -354,7 +354,7 @@ async fn test_open_savepoint(state_builder: TestCatalogStateBuilder) {
         txn.commit(commit_ts).await.unwrap();
 
         // Read back updates.
-        let snapshot = state.snapshot().await.unwrap();
+        let snapshot = state.snapshot().await.unwrap().to_proto_snapshot();
         for (db, schema) in &db_schemas {
             let (db_key, db_value) = db.clone().into_key_value();
             let db_found = snapshot.databases.get(&db_key.into_proto()).unwrap();
@@ -382,6 +382,7 @@ async fn test_open_savepoint(state_builder: TestCatalogStateBuilder) {
             .snapshot()
             .await
             .unwrap()
+            .to_proto_snapshot()
             .databases
             .into_iter()
             .find(|(_k, v)| v.name == "db");
@@ -468,7 +469,11 @@ async fn test_open_read_only(state_builder: TestCatalogStateBuilder) {
     let commit_ts = txn.upper();
     txn.commit(commit_ts).await.unwrap();
 
-    let snapshot = read_only_state.snapshot().await.unwrap();
+    let snapshot = read_only_state
+        .snapshot()
+        .await
+        .unwrap()
+        .to_proto_snapshot();
     let role = snapshot.roles.get(&proto::RoleKey {
         id: role_id.into_proto(),
     });
@@ -502,7 +507,7 @@ async fn test_open(state_builder: TestCatalogStateBuilder) {
 
         assert_eq!(state.epoch(), Epoch::new(2).expect("known to be non-zero"));
         // Check initial snapshot.
-        let snapshot = state.snapshot().await.unwrap();
+        let snapshot = state.snapshot().await.unwrap().to_proto_snapshot();
         {
             let test_snapshot = StableSnapshot(&snapshot);
 
@@ -546,7 +551,10 @@ async fn test_open(state_builder: TestCatalogStateBuilder) {
         );
 
         assert_eq!(state.epoch(), Epoch::new(3).expect("known to be non-zero"));
-        assert_eq!(state.snapshot().await.unwrap(), snapshot);
+        assert_eq!(
+            state.snapshot().await.unwrap().to_proto_snapshot(),
+            snapshot
+        );
         assert_eq!(state.get_audit_logs().await.unwrap(), audit_log);
         Box::new(state).expire().await;
     }
@@ -562,7 +570,10 @@ async fn test_open(state_builder: TestCatalogStateBuilder) {
             .0;
 
         assert_eq!(state.epoch(), Epoch::new(4).expect("known to be non-zero"));
-        assert_eq!(state.snapshot().await.unwrap(), snapshot);
+        assert_eq!(
+            state.snapshot().await.unwrap().to_proto_snapshot(),
+            snapshot
+        );
         assert_eq!(state.get_audit_logs().await.unwrap(), audit_log);
         Box::new(state).expire().await;
     }
