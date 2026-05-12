@@ -1436,21 +1436,21 @@ impl Coordinator {
             )?;
         }
         self.validate_resource_limit(
-            self.catalog().user_secrets().count(),
+            self.catalog().user_secrets_count(),
             new_secrets,
             SystemVars::max_secrets,
             "secret",
             MAX_SECRETS.name(),
         )?;
         self.validate_resource_limit(
-            self.catalog().user_roles().count(),
+            self.catalog().user_roles_count(),
             new_roles,
             SystemVars::max_roles,
             "role",
             MAX_ROLES.name(),
         )?;
         self.validate_resource_limit(
-            self.catalog().user_network_policies().count(),
+            self.catalog().user_network_policies_count(),
             new_network_policies,
             SystemVars::max_network_policies,
             "network_policy",

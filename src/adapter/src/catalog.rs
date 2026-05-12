@@ -1243,6 +1243,21 @@ impl Catalog {
         self.state.resource_counts.user_aws_privatelink_connections
     }
 
+    /// Returns the cached count of user secrets.
+    pub fn user_secrets_count(&self) -> usize {
+        self.state.resource_counts.user_secrets
+    }
+
+    /// Returns the cached count of user roles.
+    pub fn user_roles_count(&self) -> usize {
+        self.state.resource_counts.user_roles
+    }
+
+    /// Returns the cached count of user network policies.
+    pub fn user_network_policies_count(&self) -> usize {
+        self.state.resource_counts.user_network_policies
+    }
+
     pub fn system_privileges(&self) -> &PrivilegeMap {
         &self.state.system_privileges
     }

@@ -99,11 +99,12 @@ impl CatalogState {
     /// # Invariants:
     ///
     /// * The cached counts in [`CatalogState::resource_counts`] must match a
-    ///   fresh O(N) recomputation from `entry_by_id`, `clusters_by_id`, and
-    ///   `database_by_id`.
+    ///   fresh O(N) recomputation from `entry_by_id`, `clusters_by_id`,
+    ///   `roles_by_id`, `network_policies_by_id`, and `database_by_id`.
     ///
     /// This protects against a missing maintenance point in
     /// `insert_entry` / `drop_item` / `apply_cluster_update` /
+    /// `apply_role_update` / `apply_network_policy_update` /
     /// `apply_database_update` silently desynchronizing the cache.
     fn check_resource_counts(&self) -> Result<(), ResourceCountsInconsistency> {
         let mut expected = ResourceLimitCounts::default();
@@ -136,17 +137,27 @@ impl CatalogState {
                         | ConnectionDetails::IcebergCatalog(_) => {}
                     }
                 }
+                CatalogItem::Secret(_) => expected.user_secrets += 1,
                 CatalogItem::Log(_)
                 | CatalogItem::View(_)
                 | CatalogItem::Index(_)
                 | CatalogItem::Type(_)
-                | CatalogItem::Func(_)
-                | CatalogItem::Secret(_) => {}
+                | CatalogItem::Func(_) => {}
             }
         }
         for cluster_id in self.clusters_by_id.keys() {
             if cluster_id.is_user() {
                 expected.user_clusters += 1;
+            }
+        }
+        for role_id in self.roles_by_id.keys() {
+            if role_id.is_user() {
+                expected.user_roles += 1;
+            }
+        }
+        for network_policy_id in self.network_policies_by_id.keys() {
+            if network_policy_id.is_user() {
+                expected.user_network_policies += 1;
             }
         }
         // Databases count all (system + user) to mirror the existing call site.

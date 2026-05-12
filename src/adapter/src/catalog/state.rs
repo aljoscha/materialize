@@ -209,6 +209,9 @@ pub(crate) struct ResourceLimitCounts {
     pub user_mysql_connections: usize,
     pub user_sql_server_connections: usize,
     pub user_aws_privatelink_connections: usize,
+    pub user_secrets: usize,
+    pub user_roles: usize,
+    pub user_network_policies: usize,
 }
 
 /// Keeps track of what expressions are cached or not during startup.

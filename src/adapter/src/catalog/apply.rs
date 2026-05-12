@@ -393,6 +393,12 @@ impl CatalogState {
         diff: StateDiff,
         retractions: &mut InProgressRetractions,
     ) {
+        if role.id.is_user() {
+            match diff {
+                StateDiff::Addition => self.resource_counts.user_roles += 1,
+                StateDiff::Retraction => self.resource_counts.user_roles -= 1,
+            }
+        }
         apply_inverted_lookup(&mut self.roles_by_name, &role.name, role.id, diff);
         apply_with_update(
             &mut self.roles_by_id,
@@ -562,6 +568,12 @@ impl CatalogState {
         diff: StateDiff,
         retractions: &mut InProgressRetractions,
     ) {
+        if policy.id.is_user() {
+            match diff {
+                StateDiff::Addition => self.resource_counts.user_network_policies += 1,
+                StateDiff::Retraction => self.resource_counts.user_network_policies -= 1,
+            }
+        }
         apply_inverted_lookup(
             &mut self.network_policies_by_name,
             &policy.name,
@@ -2052,12 +2064,12 @@ impl CatalogState {
                 | ConnectionDetails::Aws(_)
                 | ConnectionDetails::IcebergCatalog(_) => {}
             },
+            CatalogItem::Secret(_) => bump(&mut counts.user_secrets),
             CatalogItem::Log(_)
             | CatalogItem::View(_)
             | CatalogItem::Index(_)
             | CatalogItem::Type(_)
-            | CatalogItem::Func(_)
-            | CatalogItem::Secret(_) => {}
+            | CatalogItem::Func(_) => {}
         }
     }
 
