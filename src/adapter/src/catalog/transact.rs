@@ -681,7 +681,14 @@ impl Catalog {
 
         let mut updates = Vec::new();
 
-        for op in ops {
+        // The per-Op apply on `preliminary_state` exists so that the next
+        // iteration of this loop sees the modified state from prior Ops.
+        // For the LAST Op there is no next iteration, so we skip it — the
+        // final apply on `state` below covers it. For single-Op transactions
+        // (the common case in DDL benchmarks) this halves the apply_updates
+        // cost on the per-DDL hot path.
+        let num_ops = ops.len();
+        for (op_index, op) in ops.into_iter().enumerate() {
             let temporary_item_updates = Self::transact_op(
                 oracle_write_ts,
                 session,
@@ -712,7 +719,8 @@ impl Catalog {
 
             let mut op_updates: Vec<_> = tx.get_and_commit_op_updates();
             op_updates.extend(temporary_item_updates);
-            if !op_updates.is_empty() {
+            let is_last_op = op_index + 1 == num_ops;
+            if !op_updates.is_empty() && !is_last_op {
                 // Clone the cache so each apply_updates call has access to cached expressions.
                 // The cache uses `remove` semantics, so we need a fresh clone for each call.
                 let mut local_expr_cache = LocalExpressionCache::new(cached_exprs.clone());
