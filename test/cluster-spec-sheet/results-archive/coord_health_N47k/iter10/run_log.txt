@@ -1,0 +1,11 @@
+50/500 created  rate=9.91/s
+100/500 created  rate=9.63/s
+150/500 created  rate=9.52/s
+200/500 created  rate=9.51/s
+250/500 created  rate=9.52/s
+300/500 created  rate=9.52/s
+350/500 created  rate=9.49/s
+400/500 created  rate=9.46/s
+450/500 created  rate=9.45/s
+500/500 created  rate=9.44/s
+DONE: 500 CMVs in 53.0s  rate=9.44/s

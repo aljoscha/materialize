@@ -420,6 +420,86 @@ post-fix CMV time and is the natural follow-up.
 The fix and methodology are committed; the after-fix flame is at
 `results-archive/coord_health_N47k/cmv_flame_after_fix.html`.
 
+### After the iter-10 fix (closing the iter-8 gap)
+
+Extended `ResourceLimitCounts` to also cache `user_secrets`,
+`user_roles`, and `user_network_policies`, maintained incrementally
+in `apply_role_update`, `apply_network_policy_update`, and
+`adjust_resource_counts_for_item` (which now bumps `user_secrets`
+when a `CatalogItem::Secret` is inserted/dropped). The consistency
+check (`check_resource_counts`) was extended to recompute and
+compare all three. The three call sites in `validate_resource_limits`
+that still did `.count()` on filter-iterators now read the cached
+counts as O(1).
+
+Re-tested against the same 47k-MV catalog, same `quickstart`
+(scale=1,workers=1) target, same 30s flame at 99 Hz with a
+sustained CREATE MV load.
+
+| measurement                                 | mean per call | window |
+|---------------------------------------------|--------------:|--------|
+| iter-9 post-fix (ReadHolds only)            | 70.3 ms       | 500 calls / 45s on quickstart |
+| **iter-10 post-fix** (+ resource-counts)    | **59.0 ms**   | 500 calls / 53s on quickstart |
+| **delta vs iter-9 post-fix**                | **-11.3 ms (-16.1%)** | |
+| delta vs the original (84.3 ms)             | -25.3 ms (-30.0%) | cumulative iter-9 + iter-10 |
+
+The recovery (16.1%) matches the inclusive 12.6% the flame predicted
+for `validate_resource_limits`, plus a small additional gain from
+the eliminated `is_secret` / `is_network_policy` leaf-predicate cost
+that was no longer attributable to anything else.
+
+**Targeted symbol presence (substring match against resolved
+addresses, iter-10 flame, 1492 CMV samples):**
+
+| symbol                            | iter-9 post-fix %CMV | iter-10 post-fix %CMV |
+|-----------------------------------|---------------------:|----------------------:|
+| `validate_resource_limits` (incl.) | 12.6%                | **0.13%**             |
+| `is_secret`                       | 5.4%                 | 0.00%                 |
+| `is_network_policy`               | (subsumed above)     | 0.00%                 |
+| `user_secrets` / `user_roles` / `user_network_policies` | various | 0.00% |
+| `ReadHolds::id_bundle`            | 0.00% (iter-9 fix)   | 0.00% (still gone)    |
+
+The iter-10 flame's "Grouped inclusive breakdown" of the remaining
+1492 CMV samples (out of 5775 total samples; 25.8% of the merged
+profile is CMV):
+
+| group                                       | %CMV  |
+|---------------------------------------------|------:|
+| plan / optimize / lower                     | 64.0% |
+| rust-typed snapshot cache write             | 10.7% |
+| builtin_table_updates emission              |  8.1% |
+| CatalogState apply / mutate                 |  6.0% |
+| validate_resource_limits                    |  0.1% |
+| compute controller round-trip               |  0.1% |
+| ingress (sql parse / purify)                |  0.1% |
+
+Two things stand out for follow-up:
+
+1. **The optimizer is now the dominant cost (64% of CMV).** This is
+   a clean shape — coord-side bookkeeping is no longer hiding the
+   optimizer behind it. Further coord-thread wins from here are
+   sub-percent unless the optimizer itself gets faster (which is a
+   different project).
+2. **`rust-typed snapshot cache write` (11%) and `CatalogState
+   apply / mutate` (6%)** — the per-Op preliminary catalog apply
+   step from iter-9's analysis is still there. The architectural
+   rework noted in INVESTIGATION.md (passing `&mut state` to
+   `apply_updates` instead of cloning) would chip away at both
+   groups, but the win is now bounded around 15-17% of post-iter-10
+   CMV — smaller than the changes we already landed.
+
+Artifacts at `results-archive/coord_health_N47k/iter10/`:
+* `cmv_drilldown_after_iter10.txt` — substring breakdown
+* `cmv_drilldown_v2.py` — patched parser (the in-build mzfg now
+  appends a thread-tag after each stack's count)
+* `run_500_cmvs.py` — the load driver
+* `diff_cmv_mean.py` — sum/count diff over the metric snapshots
+* `snap_pre.slim.prom` / `snap_post.slim.prom` — slim metrics
+* `run_log.txt` — driver wall-clock output
+
+The 4 MB flame HTML itself is not committed (binary, same shape as
+the iter-9 follow-up).
+
 ### What's NOT the bottleneck (yet)
 
 * `RustType::from_proto` — gone (iter-7), 0.0% in this flame.

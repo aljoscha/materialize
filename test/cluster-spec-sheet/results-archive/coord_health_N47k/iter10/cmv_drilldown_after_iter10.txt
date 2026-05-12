@@ -1,0 +1,18 @@
+# stacks: 3575, total samples: 5775, symbols: 5723
+# 557 stacks containing `create_materialized_view`, total 1492 samples
+# 5775 total samples in profile  (25.8%)
+
+Deepest meaningful frame (closest to leaf) per CMV stack:
+symbol                                                                                                                                         samples    %cmv
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+__pow_finite                                                                                                                                      1492 100.00%
+
+Grouped inclusive breakdown (a stack is counted at most once per group):
+group                                                     samples    %cmv
+rust-typed snapshot cache (write)                             160  10.72%
+CatalogState apply / mutate                                    89   5.97%
+validate_resource_limits (target of iter-10 fix)                2   0.13%
+builtin_table_updates emission                                121   8.11%
+plan / optimize / lower                                       955  64.01%
+compute controller round-trip                                   1   0.07%
+ingress (sql parse/purify)                                      2   0.13%
