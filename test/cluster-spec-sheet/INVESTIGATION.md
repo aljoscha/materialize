@@ -682,3 +682,57 @@ Closing the remaining slope would require either:
 All are larger architectural changes outside the scope of this
 investigation pass.
 
+### Iteration 10 — apples-to-apples head-to-head iter-6 vs iter-9
+
+The iter-7 results table compared to iter-6, but the two ran on
+different VMs, leaving the headline numbers suspect. We re-ran iter-6
+(`a5caa58be9`, pre iter-7/8/9 — trailing-consolidate fix already
+applied) and iter-9 (HEAD) on the **same** VM with sizes
+1, 10, 100, 1000, 3000, 5000, 10000, 30000, 50000. Soft asserts off
+on both.
+
+Results (`results-archive/iter6_validate_1778582346.envd_scalability.csv`
+and `iter9_validate_1778579392.envd_scalability.csv`):
+
+| N      | iter-6 p50 | iter-6 max | iter-9 p50 | iter-9 max | p50 Δ    | p50 Δ %  |
+|--------|-----------:|-----------:|-----------:|-----------:|---------:|---------:|
+|      1 |          8 |          8 |          6 |          7 |   −2 ms  | −25 %    |
+|     10 |          8 |          8 |          6 |          7 |   −2 ms  | −25 %    |
+|    100 |          8 |          8 |          6 |          8 |   −2 ms  | −25 %    |
+|   1000 |         10 |         11 |          7 |          8 |   −3 ms  | −30 %    |
+|   3000 |         15 |         24 |          9 |         13 |   −6 ms  | −40 %    |
+|   5000 |         20 |         21 |         13 |         13 |   −7 ms  | −35 %    |
+|  10000 |         36 |         38 |         23 |         43 |  −13 ms  | −36 %    |
+|  30000 |         88 |        146 |         55 |        103 |  −33 ms  | −38 %    |
+|  50000 |        138 |        247 |         57 |        178 |  −81 ms  | **−59 %** |
+
+Slope (per-existing-object):
+* iter-6: 8 → 138 ms going 1 → 50k = **2.6 µs/object**.
+* iter-9: 6 → 57 ms going 1 → 50k = **1.0 µs/object**.
+
+iter-7+8+9 cumulatively reduce per-DDL p50 wall-clock by **25–59 %**
+and the slope by **~2.5×**. The gain grows with N. Distributions are
+clean across all 10 reps per size — not noise.
+
+Bulk-DDL throughput at the high end (population rate during the
+benchmark):
+
+| phase                | iter-6 rate | iter-9 rate |
+|----------------------|------------:|------------:|
+| building 10k → 30k   |   24.7 → 16.1 tables/s |  41.2 → 16.4 tables/s |
+| building 30k → 50k   |   10.3 →  8.3 tables/s |  19.9 → 16.4 tables/s |
+
+iter-9 sustains roughly 2× the bulk-DDL rate of iter-6 at N=30k+.
+
+So the earlier observation in iter-8/iter-9 sections that "p50
+didn't move" was a comparison between iter-7, iter-8, iter-9
+(adjacent iterations, all already cleared the durable-catalog O(N)
+work) — but the **cumulative iter-6 → iter-9 win is large and real**.
+The complexity of iter-7 (rust-typed `MemorySnapshot` via
+`imbl::OrdMap`, +272/−165 in catalog durable) and iter-8 (cached
+resource counts, +261/−37 in adapter) is justified by the
+end-to-end wall-clock gain. iter-9 (+10/−2) is trivially worth
+keeping.
+
+**Decision: keep iter-7, iter-8, iter-9.** None get backed out.
+
