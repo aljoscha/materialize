@@ -412,3 +412,82 @@ those needs a deeper architectural change (cache rust-typed maps so
 catalog so each transaction's diff doesn't fan out over the full
 state); not in scope for this round.
 
+### Iteration 7 — rust-typed snapshot cache via `imbl::OrdMap`
+
+The user's standing direction: replace the O(N) snapshot-on-every-DDL
+with something O(1). A re-parse of the iter-6 flamegraph at N=30k
+(coordinator thread only) confirmed `RustType::from_proto` (called
+per entry inside `TableTransaction::new` for every transaction) was
+22.1 % of coordinator CPU — the dominant remaining O(N) cost.
+
+Fix (`c10cb56e24`):
+
+* `PersistHandle::cached_snapshot` is now a rust-typed `MemorySnapshot`
+  whose 21 fields are `imbl::OrdMap<K, V>`.
+* `apply_to_snapshot_cache` runs `RustType::from_proto` per durable
+  update before inserting into the OrdMap — O(1) per update, paid
+  once per write instead of N times per read.
+* `Transaction::new` destructures `MemorySnapshot` and hands each
+  `imbl::OrdMap` straight into the corresponding `TableTransaction`
+  without conversion. Cloning the cache is structurally shared
+  (O(log N) per field).
+* `TableTransaction::initial` is now `imbl::OrdMap<K, V>`; the
+  proto-taking constructors are gone (infallible now).
+* `Transaction::current_snapshot()` / `transaction_from_snapshot`
+  (the DDL dry-run path) flow rust types end to end; the proto
+  `Snapshot` type stays for tests via a `to_proto_snapshot()` shim.
+
+Bench (`results-archive/results_1778570752.envd_scalability.csv`,
+tables-only, soft asserts off):
+
+| N      | iter-6 tables | iter-7 tables | Δ          |
+|--------|--------------:|--------------:|-----------:|
+| 1      |            92 |             8 |  −84 ms    |
+| 10     |            90 |             7 |  −83 ms    |
+| 100    |            91 |             7 |  −84 ms    |
+| 1000   |            96 |             8 |  −88 ms    |
+| 3000   |           102 |            10 |  −92 ms    |
+| 5000   |            57 |            14 |  −43 ms    |
+| 10000  |            74 |            23 |  −51 ms    |
+| 30000  |           115 |            54 |  −61 ms    |
+
+> **Caveat:** this VM is meaningfully faster than whatever ran iter-6.
+> The small-N absolute drop from 92→8 ms can't be attributed to iter-7
+> alone — our change wouldn't help at N=1 since there's nothing to
+> convert. The relative-slope improvement is the load-bearing
+> comparison: iter-7 scales ~1.5 µs/object (8 ms at N=1 → 54 ms at
+> N=30k) vs iter-6's ~3 µs/object (at N=10000→30000). Still not flat,
+> but cut roughly in half. An apples-to-apples iter-6 re-baseline on
+> this VM is deferred.
+
+Peeks unchanged at ~4 ms across the board.
+
+Flame at N=12k catalog (captured during bulk-DDL population, soft
+asserts off, archived as `iter7_flame_tablespop_N12k.mzfg`):
+
+| % of coord CPU | function                                  | note                                       |
+|---------------:|-------------------------------------------|--------------------------------------------|
+|            0.1 | `RustType::from_proto`                    | **was 22.1 % in iter-6** — fix works       |
+|            8.6 | `Coordinator::validate_resource_limits`   | calls `user_tables().count()` etc.         |
+|            7.0 | `CatalogState::get_schema_mut`            | COW `imbl::OrdMap` path-copy on every Op   |
+|            5.1 | `drop_in_place::<CatalogState>`           | per-Op preliminary-state clone+drop        |
+|           13.8 | `CatalogState::apply_updates`             | runs twice per Op (preliminary+final)      |
+|           10.5 | `*::builtin_table_updates`                | builtin table emission                     |
+
+So iter-7 closed the durable-catalog O(N) entirely (from_proto gone,
+snapshot clone now O(log N) via structural sharing), but the slope
+that remains lives in the **adapter** layer:
+
+* `validate_resource_limits` iterates `user_tables()` /
+  `user_materialized_views()` / `user_sinks()` / `user_clusters()` /
+  `databases()` on every DDL to count them. Each is an O(N) walk
+  over the catalog.
+* `apply_updates` runs twice per Op (preliminary-state clone + final
+  apply on `state`) per the explicit comment at
+  `src/adapter/src/catalog/transact.rs:658` ("we won't win any DDL
+  throughput benchmarks") — that's now where the bottleneck moved.
+* `get_schema_mut` does an `imbl::OrdMap::get_mut` COW path-copy on
+  every Op.
+
+These are the iter-8+ targets.
+
