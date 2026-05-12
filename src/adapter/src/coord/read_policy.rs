@@ -71,6 +71,11 @@ impl ReadHolds {
 
     /// Return a `CollectionIdBundle` containing all the IDs in the
     /// [ReadHolds].
+    ///
+    /// **O(N) in the number of held collections.** Avoid building this just
+    /// to do a subset check — use [`Self::contains_bundle`] or
+    /// [`Self::is_subset_of_bundle`] instead, which avoid materializing the
+    /// full id-bundle.
     pub fn id_bundle(&self) -> CollectionIdBundle {
         let mut res = CollectionIdBundle::default();
         for id in self.storage_ids() {
@@ -81,6 +86,43 @@ impl ReadHolds {
         }
 
         res
+    }
+
+    /// Returns `true` iff every collection in `other` has a corresponding
+    /// read hold here. O(|other| · log N) instead of the O(N) cost of
+    /// `other.difference(&self.id_bundle()).is_empty()`.
+    pub fn contains_bundle(&self, other: &CollectionIdBundle) -> bool {
+        for id in &other.storage_ids {
+            if !self.storage_holds.contains_key(id) {
+                return false;
+            }
+        }
+        for (instance_id, ids) in &other.compute_ids {
+            for id in ids {
+                if !self.compute_holds.contains_key(&(*instance_id, *id)) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Returns `true` iff every read hold here is also present in `other`.
+    /// O(N · log |other|) — same iteration cost as building the id-bundle,
+    /// but skips the intermediate allocation.
+    pub fn is_subset_of_bundle(&self, other: &CollectionIdBundle) -> bool {
+        for id in self.storage_holds.keys() {
+            if !other.storage_ids.contains(id) {
+                return false;
+            }
+        }
+        for (instance_id, id) in self.compute_holds.keys() {
+            match other.compute_ids.get(instance_id) {
+                Some(ids) if ids.contains(id) => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Downgrade the contained [`ReadHold`]s to the given time.

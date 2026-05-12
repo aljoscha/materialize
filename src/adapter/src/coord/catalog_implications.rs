@@ -869,7 +869,7 @@ impl Coordinator {
                 .get(&timeline)
                 .expect("all timelines have a timestamp oracle");
 
-            let empty = read_holds.id_bundle().difference(&id_bundle).is_empty();
+            let empty = read_holds.is_subset_of_bundle(&id_bundle);
             timeline_associations.insert(timeline, (empty, id_bundle));
         }
 

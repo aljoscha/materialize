@@ -385,7 +385,7 @@ impl Coordinator {
                 let ids = self
                     .index_oracle(*cluster_id)
                     .sufficient_collections(resolved_ids.collections().copied());
-                if !ids.difference(&read_holds.id_bundle()).is_empty() {
+                if !read_holds.contains_bundle(&ids) {
                     return Err(AdapterError::ChangedPlan(
                         "the set of possible inputs changed during the creation of the \
                          materialized view"
@@ -851,7 +851,7 @@ impl Coordinator {
         AdapterError,
     > {
         assert!(
-            id_bundle.difference(&read_holds.id_bundle()).is_empty(),
+            read_holds.contains_bundle(&id_bundle),
             "we must have read holds for all involved collections"
         );
 
