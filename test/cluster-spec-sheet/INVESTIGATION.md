@@ -585,3 +585,100 @@ shot at apply_updates and the per-Op CatalogState clone+drop), or
 instrument the *wall-clock* breakdown of a single CREATE TABLE at
 N=30k to find where the off-coord time goes.
 
+### Iteration 9 — skip the redundant last-Op preliminary apply
+
+`Catalog::transact_inner` apply-loops over `ops` and calls
+`apply_updates` on `preliminary_state` after each Op so the *next*
+iteration sees the modified state. After the loop a final
+`apply_updates` runs on `state` with all accumulated updates. The
+per-Op apply on the LAST Op has no next iteration to feed and is
+fully redundant with the final apply.
+
+Fix (`3900de3bd2`): track `op_index + 1 == num_ops` and skip the
+per-Op apply on the last Op. For single-Op DDL (the common case in
+this benchmark — CREATE TABLE / DROP TABLE / CREATE INDEX) this
+halves the `apply_updates` work on the hot path. Multi-Op
+transactions are unchanged for ops[0..n-1].
+
+Flame at N=12k catalog (post-iter-9,
+`results-archive/iter9_flame_tablespop_N12k.mzfg`):
+
+| function                                | iter-7 | iter-8 | iter-9 |
+|-----------------------------------------|-------:|-------:|-------:|
+| `CatalogState::apply_updates`           |  13.8% |  13.7% |  10.4% |
+| `drop_in_place::<CatalogState>`         |   5.1% |   9.1% |   7.2% |
+| `CatalogState::insert_entry`            |    —   |   9.8% |   8.3% |
+| `CatalogState::get_schema_mut`          |   7.0% |   7.6% |   5.8% |
+| `Coordinator::validate_resource_limits` |   8.6% |   3.6% |   4.2% |
+| `imbl` (collective)                     |  26.0% |  23.4% |  22.5% |
+| `memory::objects` (collective)          |  25.3% |  20.7% |  18.6% |
+| `transact_inner` (catalog)              |  43.4% |  41.7% |  38.8% |
+
+`apply_updates` dropped 3.3 percentage points, and the drop in
+`drop_in_place::<CatalogState>` (1.9 pp) confirms one fewer per-Op
+preliminary clone gets created and dropped. The other
+adapter-state functions (`get_schema_mut`, `insert_entry`,
+`memory::objects`, `imbl`) all dropped a smaller amount because
+each Op now goes through one less round of state mutation.
+
+Wall-clock (tables, soft asserts off,
+`results-archive/results_1778575530.envd_scalability.csv`):
+
+| N      | iter-7 p50 | iter-8 p50 | iter-9 p50 | iter-9 max |
+|--------|-----------:|-----------:|-----------:|-----------:|
+|      1 |          8 |         11 |          7 |          9 |
+|     10 |          7 |          7 |          7 |         11 |
+|    100 |          7 |          7 |          7 |          7 |
+|   1000 |          8 |          8 |          8 |          8 |
+|   3000 |         10 |         10 |         10 |         10 |
+|   5000 |         14 |         13 |         13 |         16 |
+|  10000 |         23 |         23 |         24 |         31 |
+|  30000 |         54 |         56 |         54 |        103 |
+
+Median essentially unchanged. The 5+ percentage points of
+coordinator CPU we saved (apply_updates + drop) don't show up in
+p50 wall-clock, same lesson as iter-8: at N=30k, per-DDL
+wall-clock is bounded by off-coord-thread work (persist commit
+latency, controller round-trips, `imbl::OrdMap` COW copies which
+allocate and free even though they're "structurally shared").
+
+### Status after iter-9
+
+Pushed to `aljoscha/envd-specsheet`. The coordinator thread is now
+largely "as flat as we can make it" without changing the data
+structures it operates over:
+
+* `Transaction::new` is structurally O(log N) (iter-7).
+* `validate_resource_limits` is O(1) (iter-8).
+* `apply_updates` runs exactly once per Op in the steady-state
+  single-Op DDL case (iter-9).
+
+What's left in coord CPU at N=12k (per iter-9 flame, summed):
+~22% `imbl::OrdMap` operations (insert/get_mut/path-copy on each
+state mutation), ~10% `apply_updates`, ~7% builtin-table-updates,
+~7% `drop_in_place::<CatalogState>` (the `state.to_mut()` final
+clone for the durable apply). Most of this is the
+**`imbl::OrdMap` COW machinery** — every mutation of `entry_by_id`,
+`database_by_id`, `clusters_by_id`, etc. does a logN path-clone
+that allocates fresh nodes.
+
+The remaining wall-clock slope (~1.5 µs per existing catalog
+object) lives in:
+* Off-coord-thread work — persist write commit latency in
+  particular grows with the durable shard size,
+* `imbl::OrdMap` allocation cost on each state mutation,
+* `Catalog::transact_inner`'s second-phase final apply still
+  cloning `state` to mutate it.
+
+Closing the remaining slope would require either:
+1. Switching the hot `CatalogState` collections from `imbl::OrdMap`
+   to a different data structure (e.g. `Arc<HashMap<K, Arc<V>>>`
+   with copy-on-mutate-the-Arcs), or
+2. Removing the `Cow<CatalogState>::to_mut()` final clone by
+   making `apply_updates` take `&mut state` directly, or
+3. Reducing how often a CREATE TABLE has to touch the durable
+   shard (e.g. batching catalog writes).
+
+All are larger architectural changes outside the scope of this
+investigation pass.
+
