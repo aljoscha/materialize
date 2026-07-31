@@ -546,6 +546,35 @@ Final state: design doc (374 lines) + four specs (1131 lines), style-clean
 (no em-dashes, no semicolons, no code), passed adversarial review with all
 findings closed or explicitly rejected with reasons.
 
+## Round-6: user review of the change summary (decisions)
+
+- **AS OF goes opportunistic (user directive), auxiliary holds removed.**
+  Historical reads below the standing hold acquire no holds: direct
+  attempt, execution-time validation (persist since check, replica
+  admission), clean history-compacted error. Slow-path pinned AS OF is
+  validated at controllerd admission against actual sinces (it manages the
+  dataflow's input holds anyway). Specs 2, 3 and the design doc edited,
+  invariant 1 reworded (adapter-CHOSEN timestamps acquire-then-choose,
+  user-pinned AS OF validated at execution).
+- **As-of recovery poison surface named in spec 4**: error + reason in
+  controller-owned status collections, no progress in mirror/metrics, like
+  a wedged source. History stays readable, resolution is operator-level.
+- Clarified for the user (no spec change): zero-session freeze resumes
+  automatically when any adapter registers, operator action only for
+  permanently-departed adapters. Boot-ordering rationale for early
+  lease/mirror serving. Fast-path gating cluster rationale.
+- **SUBSCRIBE/COPY FROM bypass declined** (controllerd stays authoritative
+  for what runs on clusters, adapter must not grow a mini controller,
+  COPY FROM hop is negligible). Instead, user approved **transient
+  dataflow adoption** (added to specs 1, 2, 3 and design doc): on session
+  re-establishment after a controllerd restart the adapter re-declares
+  its running subscribes/COPY TOs, the new controllerd adopts them into
+  state and command history (input holds re-acquired under freeze +
+  durable handle positions), replicas retain unrecognized transient
+  dataflows across reconciliation for the drain grace. Running subscribes
+  survive controllerd restarts from 2b on, the SUBSCRIBE regression
+  narrows to installation availability plus the 2a delivery window.
+
 ## Status / handoff
 
 All open design questions are resolved through four rounds (exploration,

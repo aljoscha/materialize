@@ -98,6 +98,14 @@ receives an error on its data-plane connection rather than silence.
 Teardown of data-plane state happens on data-plane connection loss or
 target removal, always with an error response for anything in flight.
 
+Running transient dataflows get a related grace: reconciliation retains a
+running transient dataflow that is absent from the incoming command
+history for the drain grace (spec 2) instead of removing it immediately,
+so its owner's session can re-declare it and the controller can adopt it
+by adding it to the history, where the ordinary compatible-dataflow
+matching keeps it. After the grace it is removed with the usual
+termination reporting on the control stream.
+
 **Cancellation.** Peek cancellation is issued on the data-plane connection
 by peek id. Completion or cancellation is acknowledged on the data plane,
 and the adapter releases the local hold token backing the peek only after
@@ -162,8 +170,9 @@ plan shapes.
    unknown targets resolve to wait-or-error, never to undefined behavior.
 2. Compaction of a peek target past an in-flight peek's timestamp is
    prevented by lease holds before admission and by dataflow-state pinning
-   after admission. The unprotected window is exactly the lease-expiry
-   window, and it resolves to errors by rule 1.
+   after admission. The unprotected windows are the lease-expiry window
+   and user-pinned `AS OF` timestamps below the held frontier (spec 2's
+   historical reads), both resolve to errors by rule 1.
 3. Data-plane state is owned by (client name, incarnation, connection),
    survives control-plane reconciliation, and is torn down on connection
    loss or target removal, always with an error response rather than

@@ -161,7 +161,13 @@ process. Consequences:
   acquire-before-retire exist to prevent), the dataflow is refused and
   surfaced as an error condition, because installing it with a forced
   later as-of would silently serve stale contents in the gap. This
-  replaces the current best-effort fallback for this case.
+  replaces the current best-effort fallback for this case. The condition
+  surfaces through the channels that exist (spec 2 invariant 8): the
+  object's error and reason in the controller-owned status collections
+  (rendered by introspection relations), and the absence of progress in
+  the mirror and frontier-lag metrics, like a wedged source today.
+  Already-written history stays readable, the output's since and upper
+  are untouched, only progress stops. Resolution is an operator decision.
 
 ## Handle identity and retirement (phase 3)
 

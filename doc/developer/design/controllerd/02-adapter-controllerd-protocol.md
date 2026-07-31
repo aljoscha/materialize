@@ -91,15 +91,20 @@ another instance's capability.
   collection it can query, installing holds as the mirror reports new
   collections. Hold installation is off the query path: per collection per
   adapter incarnation, not per query.
-- **Auxiliary holds for historical reads.** `AS OF` reads (and any read
-  below the standing hold) acquire an additional hold via the same install
-  verb, which grants at the collection's current since, below the standing
-  hold. The query then validates its requested timestamp against the
-  granted frontier and fails cleanly if history has already been compacted.
-  This is a synchronous round trip on the historical-read path only.
+- **Historical reads (`AS OF`) acquire no extra holds.** A user-pinned
+  timestamp below the standing hold is attempted directly and gated by
+  execution-time validation alone: persist rejects reads below the since,
+  replica admission rejects peeks below the compaction frontier (spec 3),
+  and the rejection surfaces as a clean history-compacted error. This is
+  the one read path where rejection is an acceptable answer (the user
+  named a time that may legitimately be gone), so no lease machinery
+  exists to make it rare. For transient dataflows with a pinned `AS OF`,
+  admission at controllerd is the validation point (see ephemeral
+  commands).
 - **Acquire-then-choose.** The adapter never selects a query timestamp
-  except at or above the granted frontier of a hold it owns (standing or
-  auxiliary). The adapter-internal bookkeeping that ties local query and
+  except at or above the granted frontier of a hold it owns. User-pinned
+  `AS OF` timestamps are not selected, they are validated at execution
+  (historical reads above). The adapter-internal bookkeeping that ties local query and
   transaction tokens to granted holds must make token registration atomic
   with respect to its downgrade computation, concurrent session threads
   must not observe a hold as downgradable while registering a token under
@@ -216,10 +221,13 @@ Rejects are explicit, reason-carrying, retryable errors.
 - **Create transient dataflow** (slow-path peek dataflows, SUBSCRIBE,
   COPY TO). The request carries the adapter-optimized plan and the
   adapter-chosen as-of (for `AS OF` queries, the user-pinned timestamp).
-  Admission requires that the session holds every imported collection at or
-  below the as-of, otherwise the command is rejected and the adapter
-  retries with a fresh timestamp where the semantics permit (never for
-  user-pinned `AS OF`, which surfaces the error). The slow-path peek flow
+  Admission requires capability at the as-of: controllerd acquires the
+  dataflow's input holds at the as-of, which it manages for the dataflow's
+  lifetime anyway. For adapter-chosen as-ofs this is covered by the
+  session's holds (acquire-then-choose). For a user-pinned `AS OF` below
+  the session's holds, controllerd validates against the actual sinces and
+  rejects if history is compacted. Rejected commands surface the error for
+  user-pinned `AS OF` and are retried with a fresh timestamp otherwise. The slow-path peek flow
   end to end: the adapter installs the transient dataflow via this command,
   and on acceptance issues a data-plane peek (spec 3) against the transient
   output at the same timestamp, rows return on the data plane. The
@@ -259,14 +267,29 @@ canceled before capability is released.
   displaces the old one (ordered, immediate). It installs standing holds
   afresh in one batch and chooses timestamps only from the new grants. It
   does not recover the previous incarnation's transient dataflows.
-- **controllerd restart.** Sessions and transient dataflows are ephemeral
-  in controllerd and lost. Adapters detect the break, keep serving from
+- **controllerd restart.** Sessions and transient-dataflow bookkeeping
+  are ephemeral in controllerd and lost, the dataflows themselves keep
+  running on the replicas. Adapters detect the break, keep serving from
   retained mirror state and unexpired holds, and re-establish when
-  controllerd serves sessions again (early in its boot, spec 1). In-flight
-  slow-path queries, subscribes, and COPY TO operations fail with
-  retryable errors. Pending data-plane peeks are unaffected (spec 3), and
-  the restarted controllerd enacts no downgrades until sessions
-  re-register (freeze rule).
+  controllerd serves sessions again (early in its boot, spec 1). Pending
+  data-plane peeks are unaffected (spec 3), and the restarted controllerd
+  enacts no downgrades until sessions re-register (freeze rule).
+- **Transient dataflow adoption.** On re-establishing its session with a
+  restarted controllerd, the adapter re-declares the transient dataflows
+  it still owns (its running subscribes and COPY TOs, in-flight slow-path
+  peeks are simply retried). Controllerd adopts a re-declared dataflow
+  that is still running: it enters it into its state and command history,
+  so replica reconciliation matches and keeps it, and acquires its input
+  holds, which are still available because the freeze rule and the
+  durable handle positions kept sinces where the predecessor left them.
+  Data-plane delivery of an adopted dataflow is untouched throughout, the
+  data-plane connection is independent of the control plane (spec 3). If
+  adoption cannot re-acquire capability, or nobody re-declares a dataflow
+  within the drain grace, it is torn down with the usual drop event and
+  error. Replicas retain unrecognized running transient dataflows across
+  reconciliation for the drain grace to give adoption time (spec 3), so
+  the drain grace must also cover controllerd
+  restart-to-session-re-establishment.
 - **Both restart.** Equivalent to controllerd restart followed by adapter
   session establishment. No ordering requirement between the two: a
   controllerd instance acquires its critical handles and serves sessions
@@ -297,9 +320,9 @@ canceled before capability is released.
 
 ## Invariants
 
-1. Query timestamps are only chosen at or above granted frontiers of holds
-   owned by the choosing adapter (standing or auxiliary,
-   acquire-then-choose).
+1. Adapter-chosen query timestamps are only chosen at or above granted
+   frontiers of holds owned by the choosing adapter (acquire-then-choose).
+   User-pinned `AS OF` timestamps are validated at execution instead.
 2. A granting instance never advances a collection's since past a hold of
    a live, unexpired session it granted, except when the collection is
    dropped, and it never grants frontiers below its own durable capability.

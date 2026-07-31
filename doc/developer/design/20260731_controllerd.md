@@ -103,8 +103,8 @@ re-optimizes) and re-optimizes on miss.
 
 **Capability and observation travel on one thin protocol.** The adapter
 holds per-collection read capability as leases at controllerd
-(grant-at-current-since, standing holds on all collections, auxiliary holds
-for historical reads) and observes enactment and frontiers through a
+(grant-at-current-since, standing holds on all collections, execution-time
+validation for historical reads) and observes enactment and frontiers through a
 streamed, coalescing mirror that doubles as the "controllerd has applied
 the catalog up to here" signal. Ephemeral, query-shaped work (transient
 dataflows for slow-path peeks, subscribes, COPY TO, and oneshot ingestions
@@ -167,7 +167,8 @@ mechanisms), and per-cluster controllerd gives a query one lease
 counterparty. The hot path stays cheap because holds are standing
 (installed per collection per adapter incarnation, off the query path) and
 timestamps are chosen only above already-granted holds. Historical reads
-(`AS OF`) pay one auxiliary-hold round trip. The adapter's short-lived
+(`AS OF`) acquire no holds at all: they are attempted directly and rely on
+execution-time validation, erroring cleanly if history is compacted. The adapter's short-lived
 leased persist handles for persist fast-path reads are the one additional
 capability form, bounded by persist's own lease timeout (spec 1).
 
@@ -225,16 +226,18 @@ These need explicit scrutiny in review:
    where DDL acks and nothing materializes until controllerd returns. The
    required observability (enactment lag as a first-class, alertable
    signal) is normative in spec 1.
-4. **Controllerd restarts fail in-flight slow-path queries, subscribes,
-   and COPY operations** with retryable errors. Today these survive
-   controller hiccups because the controllers share the adapter's process,
-   and die only with it. SUBSCRIBE in particular becomes less available:
-   it now depends on the minimum of two process lifetimes plus the
-   data-plane connection. This is a real regression for
-   restart-sensitivity of long-running operations, accepted in v1, with
-   client-transparent resumption as the identified future mitigation. In
-   exchange, fast-path reads, table reads and writes, and DDL survive
-   controller restarts, which today they do not.
+4. **Controllerd restarts fail in-flight slow-path queries and
+   not-yet-accepted commands** with retryable errors, and installing new
+   subscribes or COPY operations waits until controllerd returns. Running
+   SUBSCRIBEs and COPY TOs survive controllerd restarts once delivery is
+   on the data plane (milestone 2b): the adapter re-declares them on
+   session re-establishment and the restarted controllerd adopts them
+   (spec 2), delivery never stops because the data-plane connection is
+   independent of the control plane. In the 2a window, where their
+   delivery still routes through controllerd, they die with it, a real
+   but temporary regression. In exchange, fast-path reads, table reads
+   and writes, and DDL survive controller restarts, which today they do
+   not.
 5. **Persist fast-path peeks succeed without replicas and run on the
    adapter.** Queries served by the persist fast path today execute on a
    replica, post-split they execute in the adapter against persist
@@ -270,7 +273,7 @@ Blast radius by failing component:
 
 | Component down | Keeps working | Degrades or fails |
 | --- | --- | --- |
-| controllerd | fast-path reads (running adapter), table reads/writes, DDL commits, running dataflows | slow path, SUBSCRIBE, COPY, new-object readability, enactment, since downgrades (frozen) |
+| controllerd | fast-path reads (running adapter), table reads/writes, DDL commits, running dataflows incl. adopted subscribes and COPY TOs (from 2b) | slow path, new SUBSCRIBE/COPY installations, new-object readability, enactment, since downgrades (frozen) |
 | adapter | running dataflows, sources, sinks, controllerd enactment | all client traffic (as today), table upper advancement, since downgrades (frozen once the session expires, until an adapter returns or an operator intervenes) |
 | one replica | untargeted peeks (broadcast, first response wins), other replicas | targeted peeks to it, its subscribes (buffer then terminate) |
 | oracle | running dataflows, enactment | all timestamp selection, so reads and writes (as today) |
@@ -318,7 +321,8 @@ behind the topology configuration:
   enacted, promotion stuck per stage, stale capability pinning compaction,
   and split-rollout rollback.
 - 2b: subscribe and COPY TO delivery on the data plane (requires the
-  phase 0 frontier-reporting work), introspection subscribes move to
+  phase 0 frontier-reporting work) with adoption across controllerd
+  restarts (spec 2), introspection subscribes move to
   controllerd.
 - 2c: persist fast-path in the adapter, MV as-of ownership flip
   (constraint honored, write retained), 0dt flow validation for split

@@ -217,7 +217,7 @@ subscription and never allocates shards.
 | Lease sessions | controllerd | Adapters re-register. Freeze rule protects sinces meanwhile (spec 2). |
 | Frontier mirror (consumer copy) | adapter | Retained and served from across controllerd restarts, re-synced when the new stream catches up (spec 2). |
 | Controller command histories, instance state | controllerd | Re-derived from catalog plus persist frontiers, replica-side reconciliation preserves compatible dataflows. |
-| Transient dataflows (slow-path peeks, subscribes, COPY TO) | the issuing lease session (controllerd-side bookkeeping) | Lost on controllerd restart, affected operations fail with retryable errors. |
+| Transient dataflows (slow-path peeks, subscribes, COPY TO) | the issuing lease session (controllerd-side bookkeeping) | Bookkeeping lost on controllerd restart, rebuilt by adoption: the owning session re-declares its dataflows on re-establishment and running ones carry on (spec 2). Dataflows nobody re-declares within the drain grace are torn down with errors. |
 | Pending data-plane peeks and delivery buffers | (client name, incarnation, data-plane connection) on the replica | Survive controllerd restarts and control-plane reconciliation (spec 3). Torn down by data-plane connection loss or target removal, always with an error response. |
 | Watch-set equivalents, DDL waits | adapter | Local waits against the mirror, rebuilt from catalog plus mirror. |
 
