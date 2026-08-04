@@ -147,7 +147,7 @@ impl PeekScan {
             .row_iteration_seconds
             .observe(self.row_iteration_time.as_secs_f64());
         metrics
-            .result_sort_seconds
+            .result_thinning_seconds
             .observe(self.thinning_time.as_secs_f64());
 
         match stop {
@@ -234,17 +234,28 @@ impl PeekScan {
             return Some(Stop::Complete);
         }
 
-        // Sorting and truncating has an effect similar to a priority queue,
-        // without its interactive dequeueing properties.
+        // Partition rather than sort: we only need to know which rows fall
+        // outside the first `max_results`, not the order among those that stay.
+        // The final ordering is established once, when the results are
+        // collected. Sorting here would cost a log factor per row for an order
+        // we then throw away.
+        //
+        // Partitioning is not stable, so when rows tie across the cut it is
+        // unspecified which of them survives. That is unobservable here: a tie
+        // under this comparator means the rows are byte-identical, so however
+        // the cut lands, the retained run agrees with any other choice on its
+        // first `max_results` rows, and that prefix is all the finishing reads.
+        //
         // TODO: Had we left these as `Vec<Datum>` we would avoid the unpacking.
         // We should consider doing that, although it will require a re-pivot of
         // the code to branch on this inner test (as we prefer not to maintain
         // `Vec<Datum>` in the other case).
         let sort_start = Instant::now();
         let comparator = &self.comparator;
-        self.results.sort_by(|left, right| {
-            comparator.compare_rows(&left.0, &right.0, || left.0.cmp(&right.0))
-        });
+        self.results
+            .select_nth_unstable_by(max_results, |left, right| {
+                comparator.compare_rows(&left.0, &right.0, || left.0.cmp(&right.0))
+            });
         self.thinning_time += sort_start.elapsed();
 
         let dropped_size = self

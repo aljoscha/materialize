@@ -1086,7 +1086,10 @@ impl<'a> ActiveComputeState<'a> {
                         .compute_state
                         .metrics
                         .index_peek_row_iteration_seconds,
-                    result_sort_seconds: &self.compute_state.metrics.index_peek_result_sort_seconds,
+                    result_thinning_seconds: &self
+                        .compute_state
+                        .metrics
+                        .index_peek_result_thinning_seconds,
                     row_collection_seconds: &self
                         .compute_state
                         .metrics
@@ -1662,7 +1665,7 @@ pub(crate) struct IndexPeekMetrics<'a> {
     pub error_scan_seconds: &'a prometheus::Histogram,
     pub cursor_setup_seconds: &'a prometheus::Histogram,
     pub row_iteration_seconds: &'a prometheus::Histogram,
-    pub result_sort_seconds: &'a prometheus::Histogram,
+    pub result_thinning_seconds: &'a prometheus::Histogram,
     pub row_collection_seconds: &'a prometheus::Histogram,
 }
 
