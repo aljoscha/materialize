@@ -1,61 +1,48 @@
 # Materialize
 
-## Skills
+## Engineering quality
 
-Canonical agent skills in `.agents/skills/`. `.claude/skills` is compat symlink
-for Claude Code. Check `mz-*` skill before tasks — encodes project conventions,
-saves time.
+Build the smallest coherent solution that fully solves the problem. Preserve
+the requested capability and derive data from authoritative sources rather than
+shipping snapshots or inert surfaces. Put responsibility in the subsystem that
+already owns the behavior, with explicit contracts at storage, compute,
+adapter, SQL, persist, catalog, and controller boundaries.
 
-Use the `mz-test` skill before running ANY tests, even mid-task — the canonical
-commands aren't the obvious ones (e.g. `bin/sqllogictest --optimized`, not
-`cargo build --bin sqllogictest`).
+A change can be correct and still be wrong for the architecture. Review the
+whole design for ownership, boundary clarity, duplicated concepts, failure and
+recovery behavior, and whether a smaller complete shape fits the surrounding
+system better. Findings name concrete code, contracts, or failure scenarios.
 
-## Code navigation
+## Project knowledge and skills
 
-For operation flow tracing, read first:
+Canonical agent skills live in `.agents/skills/`. `.claude/skills` is a
+compatibility symlink. Check the applicable `mz-*` skill before work in that
+area. The `mz-test` skill is authoritative for selecting and running tests,
+including targeted checks during implementation.
 
-* `doc/developer/generated/flows.md` — maps operations (query lifecycle, source ingestion, MV creation, sink lifecycle, catalog DDL, timestamp selection, persist read/write, controller architecture) to `crate::module` paths in execution order.
-* `doc/developer/generated/<crate>/_crate.md` — per-crate overview: modules, key types, dependencies.
-* `doc/developer/generated/<crate>/<module>.md` — per-file docs.
+For operation flow and crate ownership, consult:
 
-> **READ-ONLY: `doc/developer/generated/` is generated, not authored.**
-> The entire `doc/developer/generated/` tree is maintained exclusively by the
-> recurring documentation agent, which runs the `update-docs` skill/command.
-> That agent is the *only* session permitted to create, edit, or delete files
-> under this directory.
->
-> In any other session: **treat `doc/developer/generated/` as read-only.** Use
-> it for navigation and context, but never edit, create, delete, or regenerate
-> files there — not even to "fix" something you noticed, and not as part of an
-> unrelated change. These files carry `source`/`revision` front-matter that the
-> recurring agent manages; hand edits desync that bookkeeping. If a generated
-> doc is wrong or stale, report it in your response rather than editing it, and
-> leave the correction to the `update-docs` agent. Do not stage or commit any
-> path under `doc/developer/generated/` unless you are explicitly running the
-> `update-docs` workflow.
+- `doc/developer/generated/flows.md` for execution paths across the system.
+- `doc/developer/generated/<crate>/_crate.md` for crate responsibilities.
+- `doc/developer/generated/<crate>/<module>.md` for file-level structure.
 
-## Dependency management
+`doc/developer/generated/` is owned exclusively by the recurring documentation
+agent and its `update-docs` workflow. Other sessions treat the tree as
+read-only, including when its contents are stale. Report problems rather than
+editing, regenerating, staging, or committing generated documentation.
 
-### Workspace dependencies
+## Dependency contracts
 
-All third-party versions declared in `[workspace.dependencies]` in root
-`Cargo.toml`. Members use `dep.workspace = true` or
-`dep = { workspace = true, optional = true }`.
+Third-party versions belong in root `[workspace.dependencies]`. Member crates
+use `dep.workspace = true`, with `optional = true` when needed. Do not inline a
+version in a member manifest. Workspace features are the union needed by all
+members.
 
-* **Add new dep**: add to `[workspace.dependencies]` in root `Cargo.toml` first, then `dep.workspace = true` in member crate.
-* **Never inline version** in member `Cargo.toml` — `bin/lint-cargo` enforces.
-* **Update version**: change once in root `Cargo.toml`.
-* Cargo unifies features workspace-wide, so workspace declaration is union of all features across crates. Members just use `dep.workspace = true`.
+Dependency changes preserve a focused `Cargo.lock` diff. Adding a dependency or
+changing features may update the lock through `cargo check`. Update one package
+with `cargo update -p <crate>` and `--precise` when needed. Never use bare
+`cargo update`, and inspect any regenerated lockfile for unrelated version
+changes.
 
-### Cargo.lock
-
-Never regenerate full Cargo.lock. When changing deps:
-
-* **Add dep or change features**: run `cargo check` — updates only what changed.
-* **Update specific crate**: `cargo update -p <crate>` (optional `--precise <version>`).
-* **Never bare `cargo update`** — bumps every semver-compatible dep, causes unrelated breakage from transitive changes.
-* **If lock regenerated**, diff before commit (`git diff Cargo.lock | grep '^[+-]version'`) and pin back unintended bumps with `cargo update -p <crate> --precise <old-version>`.
-
-### Licensing
-
-Two files control license policy, **keep in sync**: `deny.toml` (`[licenses].allow`) and `about.toml` (`accepted`). New dep with new license not already allowed: add SPDX identifier to both.
+License policy is defined jointly by `deny.toml` and `about.toml`. A newly
+accepted SPDX license is added to both.
