@@ -287,6 +287,7 @@ where
         // If Some, an override for the default listen sleep retry parameters.
         retry: Option<RetryParameters>,
     ) -> (Vec<LeasedBatchPart<T>>, Antichain<T>) {
+        let started = Instant::now();
         // Wait until the upper is past our frontier - ie. there is another batch for us to process.
         let retry = retry
             .unwrap_or_else(|| next_listen_batch_retry_params(&self.handle.machine.applier.cfg));
@@ -300,9 +301,13 @@ where
                 retry,
             )
             .await;
+        let progress_elapsed = started.elapsed();
 
         // Obtain a lease before grabbing the upcoming batch from state.
+        let lease_started = Instant::now();
         let lease = self.handle.lease_seqno().await;
+        let lease_elapsed = lease_started.elapsed();
+        let selection_started = Instant::now();
         let batch = match self
             .handle
             .machine
@@ -400,18 +405,39 @@ where
             as_of: self.as_of.clone(),
             lower: self.frontier.clone(),
         };
-        let parts = self
+        let selection_elapsed = selection_started.elapsed();
+        let parts_started = Instant::now();
+        let parts: Vec<_> = self
             .handle
             .lease_batch_parts(lease, batch, filter)
             .collect()
             .await;
+        let parts_elapsed = parts_started.elapsed();
 
+        let downgrade_started = Instant::now();
         self.handle.maybe_downgrade_since(&self.since).await;
+        let downgrade_elapsed = downgrade_started.elapsed();
 
         // NB: Keep this after we use self.frontier to join_assign self.since
         // and also after we construct metadata.
         self.frontier = new_frontier;
 
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            tracing::debug!(
+                target: "mz_persist_client::listen_diagnostics",
+                shard = %self.handle.machine.shard_id(),
+                reader = ?self.handle.reader_id,
+                ?elapsed,
+                ?progress_elapsed,
+                ?lease_elapsed,
+                ?selection_elapsed,
+                ?parts_elapsed,
+                ?downgrade_elapsed,
+                part_count = parts.len(),
+                "slow listen batch preparation returned"
+            );
+        }
         (parts, self.frontier.clone())
     }
 }
@@ -435,16 +461,42 @@ where
     /// consolidated, come talk to us!
     #[instrument(level = "debug", name = "listen::next", fields(shard = %self.handle.machine.shard_id()))]
     pub async fn fetch_next(&mut self) -> Vec<ListenEvent<T, ((K, V), T, D)>> {
+        let started = Instant::now();
         let (parts, progress) = self.next(None).await;
+        let next_elapsed = started.elapsed();
+        let part_count = parts.len();
+        let mut fetch_elapsed = Duration::ZERO;
+        let mut collect_elapsed = Duration::ZERO;
+        let mut update_count = 0;
         let mut ret = Vec::with_capacity(parts.len() + 1);
         for part in parts {
+            let fetch_started = Instant::now();
             let fetched_part = self.fetch_batch_part(part).await;
+            fetch_elapsed += fetch_started.elapsed();
+            let collect_started = Instant::now();
             let updates = fetched_part.collect::<Vec<_>>();
+            collect_elapsed += collect_started.elapsed();
+            update_count += updates.len();
             if !updates.is_empty() {
                 ret.push(ListenEvent::Updates(updates));
             }
         }
         ret.push(ListenEvent::Progress(progress));
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            tracing::debug!(
+                target: "mz_persist_client::listen_diagnostics",
+                shard = %self.handle.machine.shard_id(),
+                reader = ?self.handle.reader_id,
+                ?elapsed,
+                ?next_elapsed,
+                ?fetch_elapsed,
+                ?collect_elapsed,
+                part_count,
+                update_count,
+                "slow listen fetch returned"
+            );
+        }
         ret
     }
 
