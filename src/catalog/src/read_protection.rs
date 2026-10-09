@@ -341,6 +341,23 @@ impl ClientReadProtection {
         state.prune_dependencies();
     }
 
+    /// Acknowledge a definitive successful catalog-derived grant publication.
+    /// The supplied map must cover every pending requirement without advancement
+    /// or release. Failed publications use `finish_publication(false)` instead.
+    /// Panics if no publication is pending or a pending requirement is not covered.
+    pub fn finish_grant_publication(&self, requirements: BTreeMap<GlobalId, Timestamp>) {
+        let mut state = self.state.lock().expect("read protection mutex poisoned");
+        let pending = state.pending.take().expect("publication must be pending");
+        assert!(
+            pending
+                .iter()
+                .all(|(id, frontier)| requirements.get(id).is_some_and(|held| held <= frontier)),
+            "catalog grant must cover every pending requirement"
+        );
+        state.committed = requirements;
+        state.prune_dependencies();
+    }
+
     /// Stop new acquisitions without invalidating token bookkeeping. Existing
     /// tokens are not proof of liveness. Closure is enforced at the read boundary.
     pub fn mark_closed(&self) {

@@ -114,10 +114,14 @@ Creator dry-run admission and catalog catch-up are the measured expensive waits.
 The largest cumulative dry-run component in selected holders is Persist listen
 fetching, not update application. Some individual waits instead spend most time
 acquiring storage. Neither establishes pure I/O or CPU cost.
-Creator admission catches up after allocation and revalidates retained work before
-dry-run open. CI138442 confirms this catch-up, but later transaction opens and CAS
-checks still lose. Other DDL holders occupy 271s of the timed-out MV's queue windows.
-Review whether creation can use one real candidate without weakening admission.
+Creator admission catches up after allocation and revalidates retained work.
+CI138442 confirms this catch-up, but later transaction opens and CAS checks still
+lose. Other DDL holders occupy 271s of the timed-out MV's queue windows.
+Ordinary DDL now derives its creator grant in the real admission candidate,
+without a separate preview/open. It retains the oracle minimum, committed grants,
+freshness checks and definitive publication barrier. Bootstrap's explicit preview
+and reconstruction windows remain unchanged. Verify the combined path in CI,
+including successful commit counts, SQL completion and renewal separately.
 Renewal separately loses 19 attempts after its last successful CAS, with closure
 observed 381s later. The largest measured sync spends 32s in five listen fetches.
 Slow-call diagnostics separate progress, lease, batch preparation, fetching and

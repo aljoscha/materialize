@@ -364,6 +364,14 @@ pub enum Op {
         incarnation: u64,
         requirements: BTreeMap<GlobalId, mz_repr::Timestamp>,
     },
+    /// Extends committed grants with newly admitted targets in this transaction.
+    /// Oracle minima constrain client grants, not birth or reconstruction history.
+    /// Publication runs after index and materialized-view birth admission.
+    PublishCreatorReadRequirements {
+        incarnation: u64,
+        requirements: BTreeMap<GlobalId, mz_repr::Timestamp>,
+        minimums: BTreeMap<GlobalId, mz_repr::Timestamp>,
+    },
     /// Closes an unchanged incarnation after the caller's observation window.
     ReclaimClientIncarnation {
         incarnation: u64,
@@ -433,6 +441,7 @@ impl Op {
             | Self::CreateClientIncarnation { .. }
             | Self::RenewClientIncarnation { .. }
             | Self::PublishClientReadRequirements { .. }
+            | Self::PublishCreatorReadRequirements { .. }
             | Self::ReclaimClientIncarnation { .. }
             | Self::SetReadProtection { .. }
             | Self::SetWrittenPlan { .. } => true,
@@ -586,12 +595,15 @@ pub struct TransactionResult {
     pub catalog_updates: Vec<ParsedStateUpdate>,
     pub audit_events: Vec<VersionedEvent>,
     pub created_client_incarnations: Vec<u64>,
+    /// Exact creator grants published by this commit, grouped by incarnation.
+    pub creator_read_requirements: BTreeMap<u64, BTreeMap<GlobalId, mz_repr::Timestamp>>,
 }
 
 struct TransactInnerResult {
     state: CatalogState,
     planning_changed: bool,
     created_client_incarnations: Vec<u64>,
+    creator_read_requirements: BTreeMap<u64, BTreeMap<GlobalId, mz_repr::Timestamp>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -989,11 +1001,13 @@ impl Catalog {
         // mutating anything until after f is executed.
         drop(storage);
         let mut created_clients = Vec::new();
+        let mut creator_grants = BTreeMap::new();
         let mut position_planning_changed = false;
         if let Some(TransactInnerResult {
             state,
             planning_changed,
             created_client_incarnations,
+            creator_read_requirements,
         }) = new_state
         {
             if planning_changed {
@@ -1006,6 +1020,7 @@ impl Catalog {
             }
             self.state = state;
             created_clients = created_client_incarnations;
+            creator_grants = creator_read_requirements;
             position_planning_changed = planning_changed;
         }
         self.advance_positions(upper, position_planning_changed.then_some(upper));
@@ -1015,6 +1030,7 @@ impl Catalog {
             catalog_updates,
             audit_events,
             created_client_incarnations: created_clients,
+            creator_read_requirements: creator_grants,
         })
     }
 
@@ -1207,8 +1223,20 @@ impl Catalog {
         let mut updated_requirements = BTreeSet::new();
         let mut created_client_incarnations = Vec::new();
         let mut selected_plans = BTreeMap::new();
+        let mut creator_publications = Vec::new();
+        let mut creator_read_requirements =
+            BTreeMap::<u64, BTreeMap<GlobalId, mz_repr::Timestamp>>::new();
 
         for op in ops {
+            if let Op::PublishCreatorReadRequirements {
+                incarnation,
+                requirements,
+                minimums,
+            } = op
+            {
+                creator_publications.push((incarnation, requirements, minimums));
+                continue;
+            }
             if let Op::SetWrittenPlan {
                 id,
                 build_version,
@@ -1419,15 +1447,66 @@ impl Catalog {
         // Batch extraction repeats this check for other durable callers.
         let validation_started = Instant::now();
         super::retention::admit_index_bounds(tx, &preliminary_state, &admitted_plans)?;
-        if admit_automatic_materialized_views(
+        let admitted_mvs = admit_automatic_materialized_views(
             tx,
             &preliminary_state,
             &born_mvs,
             &admitted_plans,
             mode,
-        )? {
-            // Admission stamps the definition and its requirements together. Make
-            // them visible to the same validators as explicitly selected births.
+        )?;
+        for (incarnation, mut requirements, minimums) in creator_publications {
+            let mut grants = BTreeMap::new();
+            for (id, minimum) in minimums {
+                // A peer may have admitted this target already. Its reconstruction
+                // window is not a new birth, even if this transaction selects a plan.
+                if state.collection_compaction_bounds().contains_key(&id) {
+                    continue;
+                }
+                if let Some(bound) = tx.proposed_compaction_bound(id)
+                    && let Some(bound) = bound.as_option()
+                {
+                    grants.insert(id, (*bound).max(minimum));
+                }
+            }
+            // Creator publication cannot flush unrelated advancement or release.
+            // System(0) is the minimum GlobalId, so this visits only this client.
+            let committed = state
+                .client_read_requirements()
+                .range((incarnation, GlobalId::System(0))..)
+                .take_while(|((client, _), _)| *client == incarnation)
+                .map(|((_, id), frontier)| (*id, *frontier));
+            let staged = preliminary_state
+                .client_read_requirements()
+                .range((incarnation, GlobalId::System(0))..)
+                .take_while(|((client, _), _)| *client == incarnation)
+                .map(|((_, id), frontier)| (*id, *frontier));
+            let earlier_creators = creator_read_requirements
+                .get(&incarnation)
+                .into_iter()
+                .flat_map(|requirements| requirements.iter())
+                .map(|(id, frontier)| (*id, *frontier));
+            for (id, frontier) in committed
+                .chain(staged)
+                .chain(earlier_creators)
+                .chain(grants)
+            {
+                requirements
+                    .entry(id)
+                    .and_modify(|held| *held = (*held).min(frontier))
+                    .or_insert(frontier);
+            }
+            let requested_count = requirements.len();
+            let requirements =
+                preliminary_state.expand_client_read_requirements(incarnation, requirements)?;
+            tx.publish_client_read_requirements(incarnation, requirements.clone())?;
+            debug!(target: "mz_adapter::frontend_read_then_write",
+                incarnation, requested_count, expanded_count = requirements.len(), creator = true,
+                "catalog client protection staged");
+            creator_read_requirements.insert(incarnation, requirements);
+        }
+        if admitted_mvs || !creator_read_requirements.is_empty() {
+            // Apply derived grants with birth definitions and requirements so
+            // final validation sees one projection of the admission updates.
             let mut admission_updates = tx.get_and_commit_op_updates();
             let mut local_expr_cache = LocalExpressionCache::new(cached_exprs.clone());
             let outputs = preliminary_state
@@ -1534,6 +1613,7 @@ impl Catalog {
                 state,
                 planning_changed,
                 created_client_incarnations,
+                creator_read_requirements,
             })),
             Cow::Borrowed(_) => Ok(None),
         }
@@ -1561,6 +1641,9 @@ impl Catalog {
         created_client_incarnations: &mut Vec<u64>,
     ) -> Result<(), CatalogError> {
         match op {
+            Op::PublishCreatorReadRequirements { .. } => {
+                unreachable!("creator publication must follow birth admission")
+            }
             Op::SetWrittenPlan {
                 id,
                 build_version,
@@ -5440,6 +5523,358 @@ mod tests {
             }
             catalog.expire().await;
         }).await;
+    }
+
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)]
+    async fn test_creator_read_requirements_at_admission() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use mz_persist_client::PersistClient;
+        use mz_repr::Timestamp;
+        use timely::progress::Antichain;
+        use uuid::Uuid;
+
+        use crate::catalog::state::LocalExpressionCache;
+
+        let persist = PersistClient::new_for_tests().await;
+        let organization = Uuid::new_v4();
+        let bootstrap = crate::catalog::test_bootstrap_args();
+        let storage = crate::durable::TestCatalogStateBuilder::new(persist.clone())
+            .with_organization_id(organization)
+            .with_default_deploy_generation()
+            .unwrap_build()
+            .await
+            .open(mz_ore::now::SYSTEM_TIME().into(), &bootstrap)
+            .await
+            .expect("open durable catalog");
+        let mut catalog = Catalog::open_debug_catalog_inner(
+            persist,
+            storage,
+            mz_ore::now::SYSTEM_TIME.clone(),
+            Some(format!("local-az1-{organization}-0").parse().unwrap()),
+            &mz_build_info::DUMMY_BUILD_INFO,
+            BTreeMap::from([("enable_catalog_read_protection".into(), "true".into())]),
+            &bootstrap,
+            None,
+            None,
+        )
+        .await
+        .expect("open protected catalog");
+        let database = catalog.resolve_database(DEFAULT_DATABASE_NAME).unwrap();
+        let database_spec = ResolvedDatabaseSpecifier::Id(database.id());
+        let schema = catalog
+            .resolve_schema_in_database(&database_spec, DEFAULT_SCHEMA, &SYSTEM_CONN_ID)
+            .unwrap();
+        let qualifiers = ItemQualifiers {
+            database_spec,
+            schema_spec: schema.id.clone(),
+        };
+        let prefix = format!("{}.{}", database.name, schema.name.schema);
+        let ts = catalog.current_upper().await;
+        let clients = catalog
+            .transact(
+                None,
+                ts,
+                None,
+                vec![
+                    Op::CreateClientIncarnation { replica_id: None },
+                    Op::CreateClientIncarnation { replica_id: None },
+                ],
+            )
+            .await
+            .unwrap()
+            .created_client_incarnations;
+        let incarnation = clients[0];
+        let leaf_client = clients[1];
+        let mut ids = BTreeMap::new();
+        let mut input_birth = Timestamp::MIN;
+        for (name, sql) in [
+            (
+                "creator_input",
+                format!("CREATE TABLE {prefix}.creator_input (a int)"),
+            ),
+            (
+                "creator_view",
+                format!(
+                    "CREATE VIEW {prefix}.creator_view AS SELECT * FROM {prefix}.creator_input"
+                ),
+            ),
+        ] {
+            let (id, gid) = catalog.allocate_user_id_for_test().await.unwrap();
+            let item = catalog
+                .state
+                .with_enable_for_item_parsing(|state| {
+                    state.parse_item(
+                        gid,
+                        &sql,
+                        &BTreeMap::new(),
+                        None,
+                        false,
+                        None,
+                        &mut LocalExpressionCache::Closed,
+                        None,
+                    )
+                })
+                .unwrap();
+            let ts = catalog.current_upper().await;
+            catalog
+                .transact(
+                    None,
+                    ts,
+                    None,
+                    vec![Op::CreateItem {
+                        id,
+                        name: QualifiedItemName {
+                            qualifiers: qualifiers.clone(),
+                            item: name.into(),
+                        },
+                        item,
+                        owner_id: MZ_SYSTEM_ROLE_ID,
+                    }],
+                )
+                .await
+                .unwrap();
+            if name == "creator_input" {
+                input_birth = ts;
+            }
+            ids.insert(name, (id, gid));
+        }
+        let input = ids["creator_input"].1;
+        let old = BTreeMap::from([(input, input_birth)]);
+        let ts = catalog.current_upper().await;
+        catalog
+            .transact(
+                None,
+                ts,
+                None,
+                vec![Op::PublishClientReadRequirements {
+                    incarnation,
+                    requirements: old.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let mut ops = Vec::new();
+        for (name, sql) in [
+            (
+                "creator_index",
+                format!(
+                    "CREATE INDEX creator_index IN CLUSTER quickstart ON {prefix}.creator_view (a)"
+                ),
+            ),
+            (
+                "creator_mv",
+                format!(
+                    "CREATE MATERIALIZED VIEW {prefix}.creator_mv IN CLUSTER quickstart AS SELECT * FROM {prefix}.creator_view"
+                ),
+            ),
+            (
+                "creator_closed",
+                format!("CREATE TABLE {prefix}.creator_closed (a int)"),
+            ),
+        ] {
+            let (id, gid) = catalog.allocate_user_id_for_test().await.unwrap();
+            let item = catalog
+                .state
+                .with_enable_for_item_parsing(|state| {
+                    state.parse_item(
+                        gid,
+                        &sql,
+                        &BTreeMap::new(),
+                        None,
+                        false,
+                        None,
+                        &mut LocalExpressionCache::Closed,
+                        None,
+                    )
+                })
+                .unwrap();
+            ops.push(Op::CreateItem {
+                id,
+                name: QualifiedItemName {
+                    qualifiers: qualifiers.clone(),
+                    item: name.into(),
+                },
+                item,
+                owner_id: MZ_SYSTEM_ROLE_ID,
+            });
+            if name != "creator_closed" {
+                ops.push(Op::SetWrittenPlan {
+                    id: gid,
+                    build_version: "test-build".into(),
+                    expected_revision: None,
+                    revision: Some(Uuid::new_v4()),
+                    imports: BTreeSet::from([input]),
+                    replica_owner: None,
+                });
+            } else {
+                ops.push(Op::SetReadProtection {
+                    requirements: vec![],
+                    bounds: vec![CollectionCompactionBound {
+                        id: gid,
+                        frontier: None,
+                    }],
+                });
+            }
+            ids.insert(name, (id, gid));
+        }
+        let index = ids["creator_index"].1;
+        let mv = ids["creator_mv"].1;
+        let closed = ids["creator_closed"].1;
+        let minimum = input_birth.step_forward();
+        // Position in the op list must not make publication precede admission.
+        ops.insert(
+            0,
+            Op::PublishCreatorReadRequirements {
+                incarnation,
+                requirements: old.clone(),
+                minimums: BTreeMap::from([(mv, Timestamp::MIN)]),
+            },
+        );
+        ops.push(Op::PublishCreatorReadRequirements {
+            incarnation,
+            requirements: old.clone(),
+            minimums: BTreeMap::from([(index, minimum), (closed, minimum)]),
+        });
+        ops.push(Op::PublishCreatorReadRequirements {
+            incarnation: leaf_client,
+            requirements: BTreeMap::new(),
+            minimums: BTreeMap::from([(index, minimum)]),
+        });
+        let ts = catalog.current_upper().await;
+        let result = catalog.transact(None, ts, None, ops).await.unwrap();
+        let expected = BTreeMap::from([(input, input_birth), (index, minimum), (mv, input_birth)]);
+        // The fresh client's index grant expands through the view to its leaf.
+        assert_eq!(
+            result.creator_read_requirements,
+            BTreeMap::from([
+                (incarnation, expected.clone()),
+                (
+                    leaf_client,
+                    BTreeMap::from([(input, minimum), (index, minimum)])
+                ),
+            ])
+        );
+        for (id, frontier) in &expected {
+            assert_eq!(
+                catalog.state().client_read_requirements()[&(incarnation, *id)],
+                *frontier
+            );
+        }
+        assert!(
+            !catalog
+                .state()
+                .client_read_requirements()
+                .contains_key(&(incarnation, closed))
+        );
+        assert_eq!(
+            catalog.state().collection_compaction_bounds()[&index],
+            Antichain::from_elem(input_birth)
+        );
+        assert_eq!(
+            catalog.state().collection_compaction_bounds()[&mv],
+            Antichain::from_elem(input_birth)
+        );
+        assert_eq!(
+            catalog.state().maintained_read_requirements()[&mv].frontier,
+            Some(input_birth)
+        );
+        assert_eq!(
+            catalog
+                .state()
+                .get_entry(&ids["creator_mv"].0)
+                .materialized_view()
+                .unwrap()
+                .initial_as_of,
+            Some(Antichain::from_elem(input_birth))
+        );
+
+        // Ordinary publication can release the MV grant and advance the input.
+        let ts = catalog.current_upper().await;
+        catalog
+            .transact(
+                None,
+                ts,
+                None,
+                vec![Op::PublishClientReadRequirements {
+                    incarnation,
+                    requirements: BTreeMap::from([(index, minimum)]),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // Existing permission is not rebased to an oracle minimum, and an
+        // omitted committed requirement cannot be advanced or released.
+        let ts = catalog.current_upper().await;
+        let skipped = catalog
+            .transact(
+                None,
+                ts,
+                None,
+                vec![Op::PublishCreatorReadRequirements {
+                    incarnation,
+                    requirements: BTreeMap::from([(input, minimum.step_forward())]),
+                    minimums: BTreeMap::from([
+                        (index, minimum.step_forward()),
+                        (mv, minimum.step_forward()),
+                    ]),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            skipped.creator_read_requirements[&incarnation],
+            BTreeMap::from([(input, minimum), (index, minimum)])
+        );
+        assert_eq!(
+            catalog.state().collection_compaction_bounds()[&index],
+            Antichain::from_elem(input_birth)
+        );
+        assert_eq!(
+            catalog.state().maintained_read_requirements()[&mv].frontier,
+            Some(input_birth)
+        );
+
+        let heartbeat = catalog.state().client_incarnations()[&incarnation].heartbeat;
+        let ts = catalog.current_upper().await;
+        catalog
+            .transact(
+                None,
+                ts,
+                None,
+                vec![Op::ReclaimClientIncarnation {
+                    incarnation,
+                    expected_heartbeat: heartbeat,
+                }],
+            )
+            .await
+            .unwrap();
+        let ts = catalog.current_upper().await;
+        assert!(
+            catalog
+                .transact(
+                    None,
+                    ts,
+                    None,
+                    vec![Op::PublishCreatorReadRequirements {
+                        incarnation,
+                        requirements: BTreeMap::new(),
+                        minimums: BTreeMap::new(),
+                    }]
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            !catalog
+                .state()
+                .client_incarnations()
+                .contains_key(&incarnation)
+        );
+        catalog.expire().await;
     }
 
     #[mz_ore::test(tokio::test)]

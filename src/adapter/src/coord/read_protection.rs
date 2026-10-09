@@ -25,7 +25,7 @@ use mz_repr::{GlobalId, Timestamp};
 use mz_storage_client::storage_collections::CollectionFrontiers;
 use timely::progress::Antichain;
 
-use crate::catalog::{BuiltinTableUpdate, Catalog, CatalogState, Op};
+use crate::catalog::{BuiltinTableUpdate, Catalog, CatalogState, Op, TransactionResult};
 use crate::coord::{Coordinator, Message};
 use crate::query_client::{PreparedRead, QueryClient};
 use crate::{AdapterError, CollectionIdBundle, ReadHolds, TimelineContext};
@@ -126,6 +126,14 @@ fn limit_conflict_delay(delay: Duration, age: Duration) -> Duration {
     delay.min(remaining)
 }
 
+pub(super) enum AdmissionTimelineSource<'a> {
+    /// An explicitly selected window, including reconstruction of existing indexes.
+    Catalog(&'a CatalogState),
+    /// The content transaction determines the new collection's admitted bound.
+    /// Its inputs must already be in the catalog, as required by single-statement CREATE.
+    Creation(&'a [Op]),
+}
+
 /// A pending publication that protects a serving timeline window at admission.
 /// Finish only after a definitive transaction outcome. Cancellation must leave
 /// the publication barrier in place, just like any unresolved catalog write.
@@ -135,20 +143,49 @@ pub(super) struct AdmissionTimelinePublication {
     requested: BTreeMap<GlobalId, Timestamp>,
     inputs: BTreeMap<GlobalId, BTreeSet<GlobalId>>,
     requirements: BTreeMap<GlobalId, Timestamp>,
+    resolve_birth: bool,
 }
 
 impl AdmissionTimelinePublication {
     pub(super) fn op(&self) -> Op {
+        if self.resolve_birth {
+            return Op::PublishCreatorReadRequirements {
+                incarnation: self.client.protection.incarnation(),
+                requirements: self.requirements.clone(),
+                minimums: self.requested.clone(),
+            };
+        }
         Op::PublishClientReadRequirements {
             incarnation: self.client.protection.incarnation(),
             requirements: self.requirements.clone(),
         }
     }
 
-    pub(super) fn finish(self, committed: bool) -> ReadHolds {
-        self.client.protection.finish_publication(committed);
-        if !committed {
+    pub(super) fn finish(mut self, result: Option<&TransactionResult>) -> ReadHolds {
+        let Some(result) = result else {
+            self.client.protection.finish_publication(false);
             return ReadHolds::new();
+        };
+        if self.resolve_birth {
+            self.requested = result
+                .creator_read_requirements
+                .get(&self.client.protection.incarnation())
+                .expect("creator publication resolved")
+                .clone();
+            self.client
+                .protection
+                .finish_grant_publication(self.requested.clone());
+            // Completed collections have no finite window to acquire. Entries
+            // outside the bundle are retained grants, not new local tokens.
+            self.bundle
+                .storage_ids
+                .retain(|id| self.requested.contains_key(id));
+            self.bundle.compute_ids.retain(|_, ids| {
+                ids.retain(|id| self.requested.contains_key(id));
+                !ids.is_empty()
+            });
+        } else {
+            self.client.protection.finish_publication(true);
         }
         self.client.published();
         // Adopt every grant synchronously. Another publication aggregates active
@@ -286,7 +323,9 @@ impl Coordinator {
         }
     }
 
-    /// Prepares client protection for index and MV outputs in a candidate or committed catalog.
+    /// Prepares client protection for index and MV outputs. Creation supplies an
+    /// oracle minimum, leaving its bound to the content transaction. An explicit
+    /// catalog supplies a selected window that must not move during reconstruction.
     /// The catalog still owns admission and bound validation. These requirements
     /// preserve the serving adapter's oracle window, independently of installation.
     /// Creator transactions add protection without carrying unrelated advancement
@@ -294,30 +333,64 @@ impl Coordinator {
     pub(super) async fn prepare_admission_timeline_publication(
         &mut self,
         client: Arc<QueryClient>,
-        candidate: &CatalogState,
+        source: AdmissionTimelineSource<'_>,
         collections: BTreeSet<GlobalId>,
     ) -> Result<AdmissionTimelinePublication, AdapterError> {
+        let (catalog, creator_ops) = match source {
+            AdmissionTimelineSource::Catalog(state) => (Some(state), None),
+            AdmissionTimelineSource::Creation(ops) => (None, Some(ops)),
+        };
+        let candidate = catalog.unwrap_or_else(|| self.catalog().state());
         let mut by_timeline = BTreeMap::new();
         for id in collections {
-            let Some(entry) = candidate.try_get_entry_by_global_id(&id) else {
+            let item = creator_ops
+                .and_then(|ops| {
+                    ops.iter().find_map(|op| match op {
+                        Op::CreateItem { item, .. } | Op::UpdateItem { to_item: item, .. }
+                            if item.global_ids().any(|item_id| item_id == id) =>
+                        {
+                            Some(item)
+                        }
+                        _ => None,
+                    })
+                })
+                .or_else(|| {
+                    candidate
+                        .try_get_entry_by_global_id(&id)
+                        .map(|entry| entry.item())
+                });
+            let Some(item) = item else {
                 continue;
             };
-            let (cluster, inputs) = match entry.item() {
+            let (cluster, inputs, context) = match item {
                 CatalogItem::Index(index) => (
                     Some(index.cluster_id),
                     candidate.logical_collection_inputs([index.on]),
+                    Catalog::validate_timeline_context_in(candidate, [index.on])?,
                 ),
                 // The maintained requirement protects MV inputs. This grant
                 // protects the persisted output itself.
-                CatalogItem::MaterializedView(_) => (None, BTreeSet::new()),
+                CatalogItem::MaterializedView(mv) => (
+                    None,
+                    BTreeSet::new(),
+                    Catalog::validate_timeline_context_in(
+                        candidate,
+                        mv.locally_optimized_expr.depends_on(),
+                    )?,
+                ),
                 _ => continue,
             };
-            let Some(floor) = candidate
+            let floor = if creator_ops.is_some() {
+                // This is only an oracle minimum, never an admitted permission.
+                Timestamp::MIN
+            } else if let Some(floor) = candidate
                 .collection_compaction_bounds()
                 .get(&id)
                 .and_then(|bound| bound.as_option())
                 .copied()
-            else {
+            {
+                floor
+            } else {
                 continue;
             };
             if inputs.iter().any(|id| {
@@ -328,7 +401,6 @@ impl Coordinator {
             }) {
                 continue;
             }
-            let context = Catalog::validate_timeline_context_in(candidate, [id])?;
             if let TimelineContext::TimelineDependent(timeline) = context {
                 by_timeline
                     .entry(timeline)
@@ -356,17 +428,25 @@ impl Coordinator {
                 requested.insert(id, floor.max(read_ts));
             }
         }
-        let requested = candidate
-            .expand_client_read_requirements(client.protection.incarnation(), requested)?;
+        let requested = match catalog {
+            Some(candidate) => candidate
+                .expand_client_read_requirements(client.protection.incarnation(), requested)?,
+            None => requested,
+        };
         let requirements = client
             .protection
-            .prepare_grant_publication(requested.clone());
+            .prepare_grant_publication(if creator_ops.is_some() {
+                BTreeMap::new()
+            } else {
+                requested.clone()
+            });
         Ok(AdmissionTimelinePublication {
             client,
             bundle,
             requested,
             inputs,
             requirements,
+            resolve_birth: creator_ops.is_some(),
         })
     }
 
@@ -837,9 +917,10 @@ impl Coordinator {
             ReadProtectionPublication::Runtime => {
                 self.transact_client_protection_inner(op, once).await
             }
-            ReadProtectionPublication::Bootstrap(updates) => {
-                self.bootstrap_catalog_transact(vec![op], updates).await
-            }
+            ReadProtectionPublication::Bootstrap(updates) => self
+                .bootstrap_catalog_transact(vec![op], updates)
+                .await
+                .map(|result| result.created_client_incarnations),
         };
         // Indeterminate outcomes terminate before this point. Only a definitive
         // result can release the pending barrier or authorize the local grant.

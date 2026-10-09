@@ -73,10 +73,16 @@ await can make an earlier refresh stale. A structural change invalidates prepara
 before retry. Sampled compaction and reclamation proposals instead retain their
 prefix check so their owners resample, rather than replaying them after catch-up.
 
-Creator admission also catches up after allocation and before its dry-run open.
+Creator admission also catches up after allocation and before preparing its grant.
 Recheck the revision, incarnation and resource limits after catch-up. A builtin
 index admitted by a peer already has a committed window, not a new creator birth.
 Transaction open and compare-and-append still enforce subsequent freshness.
+Ordinary DDL derives the creator grant inside the real admission candidate, at
+the maximum of the admitted bound and the client's oracle minimum. The pending
+local barrier retains committed grants until the definitive outcome. Successful
+completion adopts the exact committed map and issues the new timeline tokens
+before another publication can release them. Explicit reconstruction windows
+remain fixed rather than becoming another automatic birth.
 
 Incarnation renewal retains committed requirements without preparing an advancing
 aggregate. It does not acknowledge pending grants or clear their acquisition

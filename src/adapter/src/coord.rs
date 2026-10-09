@@ -2702,7 +2702,7 @@ impl Coordinator {
         &mut self,
         ops: Vec<crate::catalog::Op>,
         builtin_table_updates: &mut Vec<BuiltinTableUpdate>,
-    ) -> Result<Vec<u64>, AdapterError> {
+    ) -> Result<crate::catalog::TransactionResult, AdapterError> {
         let revision = self.catalog().transient_revision();
         loop {
             let write_ts = self.get_catalog_write_ts().await;
@@ -2711,9 +2711,9 @@ impl Coordinator {
                 .transact(None, write_ts, None, ops.clone())
                 .await
             {
-                Ok(result) => {
-                    builtin_table_updates.extend(result.builtin_table_updates);
-                    return Ok(result.created_client_incarnations);
+                Ok(mut result) => {
+                    builtin_table_updates.append(&mut result.builtin_table_updates);
+                    return Ok(result);
                 }
                 Err(error) => {
                     self.refresh_bootstrap_catalog_after_conflict(
@@ -2938,6 +2938,7 @@ impl Coordinator {
                 )
                 .await?;
             let incarnation = incarnations
+                .created_client_incarnations
                 .into_iter()
                 .next()
                 .expect("created bootstrap client");
@@ -2968,12 +2969,16 @@ impl Coordinator {
                 // the serving window throughout bootstrap, including plan reuse.
                 let state = self.catalog().state().clone();
                 let publication = self
-                    .prepare_admission_timeline_publication(Arc::clone(client), &state, indexes)
+                    .prepare_admission_timeline_publication(
+                        Arc::clone(client),
+                        read_protection::AdmissionTimelineSource::Catalog(&state),
+                        indexes,
+                    )
                     .await?;
                 let result = self
                     .bootstrap_catalog_transact(vec![publication.op()], &mut builtin_table_updates)
                     .await;
-                index_timeline_holds.extend(publication.finish(result.is_ok()));
+                index_timeline_holds.extend(publication.finish(result.as_ref().ok()));
                 result?;
             }
         }
@@ -3105,7 +3110,7 @@ impl Coordinator {
                     let publication = self
                         .prepare_admission_timeline_publication(
                             Arc::clone(client),
-                            &candidate,
+                            read_protection::AdmissionTimelineSource::Catalog(&candidate),
                             indexes,
                         )
                         .await?;
@@ -3123,7 +3128,7 @@ impl Coordinator {
                     .bootstrap_catalog_transact(selections, &mut builtin_table_updates)
                     .await;
                 if let Some(publication) = publication {
-                    index_timeline_holds.extend(publication.finish(result.is_ok()));
+                    index_timeline_holds.extend(publication.finish(result.as_ref().ok()));
                 } else {
                     client.protection.finish_publication(result.is_ok());
                 }

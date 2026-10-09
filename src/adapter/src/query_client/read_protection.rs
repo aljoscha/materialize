@@ -114,6 +114,10 @@ impl ClientReadProtection {
         self.inner.finish_publication(committed)
     }
 
+    pub(crate) fn finish_grant_publication(&self, requirements: BTreeMap<GlobalId, Timestamp>) {
+        self.inner.finish_grant_publication(requirements)
+    }
+
     pub(crate) fn mark_closed(&self) {
         self.inner.mark_closed()
     }
@@ -161,6 +165,37 @@ mod tests {
     fn publish(client: &ClientReadProtection, extra: BTreeMap<GlobalId, Timestamp>) {
         client.prepare_publication(extra);
         client.finish_publication(true);
+    }
+
+    #[mz_ore::test]
+    fn catalog_resolved_grants_require_completion_before_acquisition() {
+        let client = ClientReadProtection::new(1);
+        publish(&client, requirements(&[(3, 5)]));
+        assert_eq!(
+            client.prepare_grant_publication(BTreeMap::new()),
+            requirements(&[(3, 5)])
+        );
+        assert!(
+            client
+                .try_acquire(
+                    &bundle(),
+                    &requirements(&[(1, 20), (2, 20)]),
+                    &dependencies()
+                )
+                .expect("client open")
+                .is_none()
+        );
+        client.finish_grant_publication(requirements(&[(1, 20), (2, 20), (3, 5)]));
+        let holds = acquire(&client, 20);
+        // Adoption owns only the requested tokens. An unrelated retained grant
+        // remains eligible for release by the next aggregate publication.
+        assert_eq!(
+            client.prepare_publication(BTreeMap::new()),
+            requirements(&[(1, 20), (2, 20)])
+        );
+        client.finish_publication(true);
+        drop(holds);
+        assert!(client.active_frontiers().is_empty());
     }
 
     #[mz_ore::test]

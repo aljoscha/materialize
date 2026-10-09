@@ -1619,27 +1619,17 @@ impl Coordinator {
                 });
             }
             if !collections.is_empty() {
-                let conn =
-                    conn_id.map(|id| self.active_conns.get(id).expect("connection must exist"));
-                let (candidate, _) = trace_catalog_await!(
-                    "creator_admission_dry_run",
-                    self.catalog()
-                        .transact_incremental_dry_run(
-                            self.catalog().state(),
-                            ops.clone(),
-                            conn,
-                            None,
-                            oracle_write_ts,
-                        )
-                        .await
-                )?;
                 // Common admission computes the floor. Protect the creating
                 // client's timeline in that same commit, before any publisher
                 // can advance a new MV output or index toward a future refresh.
                 let publication = trace_catalog_await!(
                     "creator_admission_timeline_grant",
-                    self.prepare_admission_timeline_publication(client, &candidate, collections)
-                        .await
+                    self.prepare_admission_timeline_publication(
+                        client,
+                        super::read_protection::AdmissionTimelineSource::Creation(&ops),
+                        collections,
+                    )
+                    .await
                 )?;
                 ops.push(publication.op());
                 timeline_publication = Some(publication);
@@ -1745,8 +1735,8 @@ impl Coordinator {
                         break Err(error);
                     }
                     if timeline_publication.is_some() {
-                        // Fresh admission sampled its floor from this prefix.
-                        // Recompute it together with the creator's requirement.
+                        // Resolve the publication barrier before the owner
+                        // revalidates preparation and refreshes its oracle window.
                         break Err(error);
                     }
                     if let Some(client) = &self.query_client
@@ -1783,7 +1773,7 @@ impl Coordinator {
             }
         };
         let admission_holds = timeline_publication
-            .map(|publication| publication.finish(result.is_ok()))
+            .map(|publication| publication.finish(result.as_ref().ok()))
             .unwrap_or_else(crate::ReadHolds::new);
         let result = result?;
 
@@ -1794,6 +1784,7 @@ impl Coordinator {
             catalog_updates,
             audit_events,
             created_client_incarnations,
+            creator_read_requirements: _,
         } = result;
 
         if let Some(conn) = conn
@@ -2494,6 +2485,7 @@ impl Coordinator {
                 | Op::CreateClientIncarnation { .. }
                 | Op::RenewClientIncarnation { .. }
                 | Op::PublishClientReadRequirements { .. }
+                | Op::PublishCreatorReadRequirements { .. }
                 | Op::ReclaimClientIncarnation { .. }
                 | Op::Comment { .. }
                 | Op::CheckClusterState { .. }
