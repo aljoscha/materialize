@@ -20,6 +20,7 @@ use mz_catalog::memory::objects::CatalogItem;
 #[cfg(test)]
 use mz_catalog::read_protection::publication::PublicationCandidates;
 use mz_catalog::read_protection::publication::publication_candidates;
+use mz_expr::CollectionPlan;
 use mz_repr::{GlobalId, Timestamp};
 #[cfg(test)]
 use mz_storage_client::storage_collections::CollectionFrontiers;

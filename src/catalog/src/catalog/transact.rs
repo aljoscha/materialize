@@ -5552,7 +5552,11 @@ mod tests {
             persist,
             storage,
             mz_ore::now::SYSTEM_TIME.clone(),
-            Some(format!("local-az1-{organization}-0").parse().unwrap()),
+            Some(
+                format!("local-az1-{organization}-0")
+                    .parse()
+                    .expect("valid test environment ID"),
+            ),
             &mz_build_info::DUMMY_BUILD_INFO,
             BTreeMap::from([("enable_catalog_read_protection".into(), "true".into())]),
             &bootstrap,
@@ -5561,11 +5565,13 @@ mod tests {
         )
         .await
         .expect("open protected catalog");
-        let database = catalog.resolve_database(DEFAULT_DATABASE_NAME).unwrap();
+        let database = catalog
+            .resolve_database(DEFAULT_DATABASE_NAME)
+            .expect("default database exists");
         let database_spec = ResolvedDatabaseSpecifier::Id(database.id());
         let schema = catalog
             .resolve_schema_in_database(&database_spec, DEFAULT_SCHEMA, &SYSTEM_CONN_ID)
-            .unwrap();
+            .expect("default schema exists");
         let qualifiers = ItemQualifiers {
             database_spec,
             schema_spec: schema.id.clone(),
@@ -5583,7 +5589,7 @@ mod tests {
                 ],
             )
             .await
-            .unwrap()
+            .expect("create protection clients")
             .created_client_incarnations;
         let incarnation = clients[0];
         let leaf_client = clients[1];
@@ -5601,7 +5607,10 @@ mod tests {
                 ),
             ),
         ] {
-            let (id, gid) = catalog.allocate_user_id_for_test().await.unwrap();
+            let (id, gid) = catalog
+                .allocate_user_id_for_test()
+                .await
+                .expect("allocate input identity");
             let item = catalog
                 .state
                 .with_enable_for_item_parsing(|state| {
@@ -5616,7 +5625,7 @@ mod tests {
                         None,
                     )
                 })
-                .unwrap();
+                .expect("parse input definition");
             let ts = catalog.current_upper().await;
             catalog
                 .transact(
@@ -5634,7 +5643,7 @@ mod tests {
                     }],
                 )
                 .await
-                .unwrap();
+                .expect("create input relation");
             if name == "creator_input" {
                 input_birth = ts;
             }
@@ -5654,7 +5663,7 @@ mod tests {
                 }],
             )
             .await
-            .unwrap();
+            .expect("commit existing protection");
 
         let mut ops = Vec::new();
         for (name, sql) in [
@@ -5675,7 +5684,10 @@ mod tests {
                 format!("CREATE TABLE {prefix}.creator_closed (a int)"),
             ),
         ] {
-            let (id, gid) = catalog.allocate_user_id_for_test().await.unwrap();
+            let (id, gid) = catalog
+                .allocate_user_id_for_test()
+                .await
+                .expect("allocate creator identity");
             let item = catalog
                 .state
                 .with_enable_for_item_parsing(|state| {
@@ -5690,7 +5702,7 @@ mod tests {
                         None,
                     )
                 })
-                .unwrap();
+                .expect("parse creator definition");
             ops.push(Op::CreateItem {
                 id,
                 name: QualifiedItemName {
@@ -5744,7 +5756,10 @@ mod tests {
             minimums: BTreeMap::from([(index, minimum)]),
         });
         let ts = catalog.current_upper().await;
-        let result = catalog.transact(None, ts, None, ops).await.unwrap();
+        let result = catalog
+            .transact(None, ts, None, ops)
+            .await
+            .expect("commit admission and creator grants");
         let expected = BTreeMap::from([(input, input_birth), (index, minimum), (mv, input_birth)]);
         // The fresh client's index grant expands through the view to its leaf.
         assert_eq!(
@@ -5786,7 +5801,7 @@ mod tests {
                 .state()
                 .get_entry(&ids["creator_mv"].0)
                 .materialized_view()
-                .unwrap()
+                .expect("created item is a materialized view")
                 .initial_as_of,
             Some(Antichain::from_elem(input_birth))
         );
@@ -5804,7 +5819,7 @@ mod tests {
                 }],
             )
             .await
-            .unwrap();
+            .expect("publish aggregate advancement");
 
         // Existing permission is not rebased to an oracle minimum, and an
         // omitted committed requirement cannot be advanced or released.
@@ -5824,7 +5839,7 @@ mod tests {
                 }],
             )
             .await
-            .unwrap();
+            .expect("retain existing admission requirements");
         assert_eq!(
             skipped.creator_read_requirements[&incarnation],
             BTreeMap::from([(input, minimum), (index, minimum)])
@@ -5851,7 +5866,7 @@ mod tests {
                 }],
             )
             .await
-            .unwrap();
+            .expect("reclaim protection client");
         let ts = catalog.current_upper().await;
         assert!(
             catalog
