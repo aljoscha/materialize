@@ -9,7 +9,7 @@
 
 """One serial, read-only observer for the original CI140146 quickstart failure.
 
-Run as root on the CI host, after builds. Never owns or stops the workload.
+Run as the CI agent on the host, after builds. Never owns or stops the workload.
 A dispatched request failure disables HTTP, since server work may outlive curl.
 Connection refusal can retry because no server work was submitted.
 """
@@ -75,17 +75,37 @@ def limit_output():
     resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024**2, 64 * 1024**2))
 
 
-def request(out, label, pid, address, endpoint, seconds, *, expected_start):
-    # Relative addressing avoids Unix path-length inflation. The only TCP
-    # endpoint is the local adapter's published administrative port.
+def request(
+    out,
+    label,
+    pid,
+    address,
+    endpoint,
+    seconds,
+    *,
+    expected_start,
+    container_id,
+    payload=None,
+):
+    # One direct curl in the pinned fixture container reaches the replica's
+    # Unix socket without host root access or another Python interpreter.
+    # CLI rusage is recorded below. The transient curl runs in the fixture
+    # cgroup, whose accounting is sampled, not in the observer's child tree.
     if address.startswith("/"):
-        connection = ["--unix-socket", address[1:], "http://localhost" + endpoint]
-        cwd = f"/proc/{pid}/root"
+        command = ["docker", "exec", container_id, "/usr/bin/curl"]
+        connection = ["--unix-socket", address, "http://localhost" + endpoint]
     elif address.startswith("http://127.0.0.1:"):
+        command = ["/usr/bin/curl"]
         connection = [address + endpoint]
-        cwd = None
     else:
         raise ValueError("expected the captured workload's local endpoint")
+    if payload is not None:
+        connection += [
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            json.dumps(payload),
+        ]
     record = dict(
         start=now(),
         address=address,
@@ -93,6 +113,8 @@ def request(out, label, pid, address, endpoint, seconds, *, expected_start):
         before=accounting(),
         target_before=process(pid),
         expected_start=expected_start,
+        container_id=container_id,
+        payload=payload,
     )
     if (
         record["target_before"] is None
@@ -108,7 +130,7 @@ def request(out, label, pid, address, endpoint, seconds, *, expected_start):
         try:
             result = subprocess.run(
                 [
-                    "/usr/bin/curl",
+                    *command,
                     "-fsS",
                     "--max-time",
                     str(seconds),
@@ -116,7 +138,6 @@ def request(out, label, pid, address, endpoint, seconds, *, expected_start):
                     str(64 * 1024**2),
                     *connection,
                 ],
-                cwd=cwd,
                 stdout=body,
                 stderr=err,
                 timeout=seconds + 2,
@@ -304,14 +325,19 @@ def main(out):
                         "/heap",
                         15,
                         expected_start=target["start"],
+                        container_id=container["Id"],
                     )
                     requests_enabled = result is not False
                     if result is not None:
                         heaps += 1
                     if result is True and catalog_address:
-                        for label, endpoint in (
-                            ("catalog", "/api/catalog/dump"),
-                            ("frontiers", "/metrics/mz_frontier"),
+                        for label, endpoint, payload in (
+                            (
+                                "objects",
+                                "/api/sql",
+                                {"query": "SELECT id, name FROM mz_catalog.mz_objects"},
+                            ),
+                            ("frontiers", "/metrics/mz_frontier", None),
                         ):
                             if not requests_enabled or stop.exists():
                                 break
@@ -329,6 +355,8 @@ def main(out):
                                 endpoint,
                                 3,
                                 expected_start=container_process["start"],
+                                container_id=container["Id"],
+                                payload=payload,
                             )
                             requests_enabled = result is not False
                 if (
@@ -346,6 +374,7 @@ def main(out):
                         "/metrics",
                         3,
                         expected_start=target["start"],
+                        container_id=container["Id"],
                     )
                     requests_enabled = result is not False
                     next_metrics = time.monotonic() + 10

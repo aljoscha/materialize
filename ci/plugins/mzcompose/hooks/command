@@ -489,7 +489,7 @@ if [ "${CI_M2_BOUNDED_OBSERVER:-0}" = 1 ] && [ "${BUILDKITE_PARALLEL_JOB:-0}" = 
   observer_dir="m2-observer-$BUILDKITE_JOB_ID"
   mkdir -p "$observer_dir"
   git rev-parse HEAD > "$observer_dir/revision.txt"
-  sudo -n python3 ci/test/m2-bounded-observe.py "$PWD/$observer_dir/capture" > "$observer_dir/observer.log" 2>&1 &
+  python3 ci/test/m2-bounded-observe.py "$PWD/$observer_dir/capture" > "$observer_dir/observer.log" 2>&1 &
   observer_pid=$!
 fi
 # sed command to filter out ANSI command codes in run.log, while keeping them in Buildkite's view
