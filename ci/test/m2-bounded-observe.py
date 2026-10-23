@@ -161,6 +161,7 @@ def request(
 def main(out):
     out.mkdir(parents=True, exist_ok=False)
     assert PARENT.is_dir(), "original CI parent cgroup is missing"
+    early_metrics = os.environ.get("CI_M2_EARLY_METRICS", "1") == "1"
     (out / "host.json").write_text(
         json.dumps(
             dict(
@@ -171,6 +172,7 @@ def main(out):
                 effective_uid=os.geteuid(),
                 observer_pid=os.getpid(),
                 python_version=sys.version,
+                early_metrics=early_metrics,
             )
         )
     )
@@ -364,6 +366,7 @@ def main(out):
                     and not stop.exists()
                     and sum(p.stat().st_size for p in out.glob("*.body"))
                     <= 192 * 1024**2
+                    and (early_metrics or heaps > 0)
                     and time.monotonic() >= next_metrics
                 ):
                     result = request(
