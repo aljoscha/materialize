@@ -173,6 +173,7 @@ def main(out):
                 observer_pid=os.getpid(),
                 python_version=sys.version,
                 early_metrics=early_metrics,
+                discovery_delay_seconds=240,
                 cpu_after_final_heap={"seconds": 5, "hz": 99},
             )
         )
@@ -187,6 +188,11 @@ def main(out):
     next_metrics = 0
     deadline = time.monotonic() + 900
     reason = "observer_deadline"
+    # Keep discovery and sampling out of the observed startup/stall window.
+    # The overall observer deadline still includes this delay.
+    discovery_at = time.monotonic() + 240
+    while time.monotonic() < discovery_at and not stop.exists():
+        time.sleep(1)
     with (out / "samples.jsonl").open("w") as log:
         while time.monotonic() < deadline and not stop.exists():
             if container is None:
