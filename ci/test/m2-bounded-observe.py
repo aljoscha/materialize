@@ -173,6 +173,7 @@ def main(out):
                 observer_pid=os.getpid(),
                 python_version=sys.version,
                 early_metrics=early_metrics,
+                cpu_after_final_heap={"seconds": 5, "hz": 99},
             )
         )
     )
@@ -332,41 +333,27 @@ def main(out):
                     requests_enabled = result is not False
                     if result is not None:
                         heaps += 1
-                    if result is True and catalog_address:
-                        for label, endpoint, payload in (
-                            (
-                                "objects",
-                                "/api/sql",
-                                {"query": "SELECT id, name FROM mz_catalog.mz_objects"},
-                            ),
-                            ("frontiers", "/metrics/mz_frontier", None),
-                        ):
-                            if not requests_enabled or stop.exists():
-                                break
-                            if (
-                                sum(p.stat().st_size for p in out.glob("*.body"))
-                                > 192 * 1024**2
-                            ):
-                                requests_enabled = False
-                                break
-                            result = request(
-                                out,
-                                f"{label}-{heaps}",
-                                container_process["pid"],
-                                catalog_address,
-                                endpoint,
-                                3,
-                                expected_start=container_process["start"],
-                                container_id=container["Id"],
-                                payload=payload,
-                            )
-                            requests_enabled = result is not False
+                    # CPU sampling suspends heap sampling. Capture it only after
+                    # the final heap so both heap snapshots cover allocations.
+                    if result is True and heaps == 2 and not stop.exists():
+                        result = request(
+                            out,
+                            "cpu-after-heap-2",
+                            current["pid"],
+                            address,
+                            "/cpu",
+                            8,
+                            expected_start=target["start"],
+                            container_id=container["Id"],
+                            payload={"seconds": 5, "hz": 99, "merge_threads": False},
+                        )
+                        requests_enabled = result is not False
                 if (
                     requests_enabled
                     and not stop.exists()
                     and sum(p.stat().st_size for p in out.glob("*.body"))
                     <= 192 * 1024**2
-                    and (early_metrics or heaps > 0)
+                    and early_metrics
                     and time.monotonic() >= next_metrics
                 ):
                     result = request(
