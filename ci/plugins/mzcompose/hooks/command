@@ -18,6 +18,9 @@ set -euo pipefail
 # host paths. See CI_BUILDER_FIXED_WORKDIR in bin/ci-builder.
 export CI_BUILDER_FIXED_WORKDIR=0
 
+observer_pid=""
+observer_dir=""
+
 builder=${BUILDKITE_PLUGIN_MZCOMPOSE_CI_BUILDER:-min}
 
 if is_truthy "${CI_HEAP_PROFILES:-}"; then
@@ -145,6 +148,12 @@ cleanup() {
   ELAPSED=$((END_TIME - START_TIME))
   if [ $ELAPSED -ge $((BUILDKITE_TIMEOUT * 60)) ]; then
     printf "\n%s\n" "$BUILDKITE_LABEL: test timed out" >> run.log
+  fi
+
+  if [ -n "$observer_pid" ]; then
+    touch "$observer_dir/stop"
+    wait "$observer_pid"
+    echo "$?" > "$observer_dir/observer-exit.txt"
   fi
 
   # A composition that holds resources outside of Docker, such as a Cloud
@@ -302,6 +311,11 @@ cleanup() {
         sudo systemctl restart docker
         bin/ci-builder run "$builder" timeout 60s bin/mzcompose --find "$BUILDKITE_PLUGIN_MZCOMPOSE_COMPOSITION" down --timeout=1 --volumes
     }
+  fi
+
+  if [ -n "$observer_dir" ]; then
+    tar -czf "$observer_dir.tar.gz" "$observer_dir"
+    buildkite-agent artifact upload "$observer_dir.tar.gz"
   fi
 
   echo "Finding core files"
@@ -471,6 +485,13 @@ trap cleanup EXIT SIGTERM SIGINT
 
 # When cancelled, always count as failed!
 TEST_RESULT=1
+if [ "${CI_M2_BOUNDED_OBSERVER:-0}" = 1 ] && [ "${BUILDKITE_PARALLEL_JOB:-0}" = 1 ]; then
+  observer_dir="m2-observer-$BUILDKITE_JOB_ID"
+  mkdir -p "$observer_dir"
+  git rev-parse HEAD > "$observer_dir/revision.txt"
+  sudo -n python3 ci/test/m2-bounded-observe.py "$PWD/$observer_dir/capture" > "$observer_dir/observer.log" 2>&1 &
+  observer_pid=$!
+fi
 # sed command to filter out ANSI command codes in run.log, while keeping them in Buildkite's view
 {
   set -o pipefail
