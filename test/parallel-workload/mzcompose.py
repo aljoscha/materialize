@@ -205,7 +205,6 @@ def workflow_catalog_transactions(
         "authorization",
         "rename-noop",
         "show-create",
-        "explain-schema",
         "explain-rejection",
         "description",
         "swap",
@@ -273,8 +272,8 @@ def workflow_catalog_transactions(
                     description_outcome(c)
                 elif case == "explain-rejection":
                     explain_ddl_rejection(c)
-                elif case in ("show-create", "explain-schema"):
-                    catalog_result_outcome(c, schema_result=case == "explain-schema")
+                elif case == "show-create":
+                    catalog_result_outcome(c)
                 elif case == "swap":
                     schema_swap(c)
                 elif case == "source-drop":

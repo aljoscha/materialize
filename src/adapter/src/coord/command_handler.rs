@@ -1388,7 +1388,6 @@ impl Coordinator {
                     | Statement::Declare(_)
                     | Statement::Discard(_)
                     | Statement::Execute(_)
-                    | Statement::ExplainSinkSchema(_)
                     | Statement::Fetch(_)
                     | Statement::Prepare(_)
                     | Statement::Rollback(_)
@@ -1407,9 +1406,9 @@ impl Coordinator {
                     | Statement::ExplainPushdown(_)
                     | Statement::ExplainAnalyzeObject(_)
                     | Statement::ExplainAnalyzeCluster(_)
+                    | Statement::ExplainSinkSchema(_)
                     | Statement::ExplainTimestamp(_) => {
                         // These results are not retained and checked during DDL replay.
-                        // EXPLAIN SINK SCHEMA is covered by CatalogResultCommand.
                         if ctx.session().transaction().is_ddl() {
                             return ctx.retire(Err(AdapterError::DDLOnlyTransaction));
                         }

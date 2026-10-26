@@ -52,7 +52,7 @@ use mz_timestamp_oracle::TimestampOracle;
 // Import `plan` module, but only import select elements to avoid merge conflicts on use statements.
 use mz_sql::plan::{
     AlterConnectionAction, AlterConnectionPlan, ExplainSinkSchemaPlan, Explainee,
-    ExplaineeStatement, Plan, PlannedAlterRoleOption, PlannedRoleVariable, SideEffectingFunc,
+    ExplaineeStatement, PlannedAlterRoleOption, PlannedRoleVariable, SideEffectingFunc,
     UpdatePrivilege, VariableValue,
 };
 use mz_sql::session::metadata::SessionMetadata;
@@ -1308,9 +1308,13 @@ impl Coordinator {
 
     pub(super) fn sequence_explain_schema(
         &self,
-        plan: ExplainSinkSchemaPlan,
+        ExplainSinkSchemaPlan { json_schema, .. }: ExplainSinkSchemaPlan,
     ) -> Result<ExecuteResponse, AdapterError> {
-        let row = catalog::command::CatalogResultCommand::result(&Plan::ExplainSinkSchema(plan))?;
+        let value: serde_json::Value = serde_json::from_str(&json_schema).map_err(|error| {
+            AdapterError::Explain(mz_repr::explain::ExplainError::SerdeJsonError(error))
+        })?;
+        let json = mz_repr::explain::json::json_string(&value);
+        let row = Row::pack_slice(&[Datum::String(&json)]);
         Ok(Self::send_immediate_rows(row))
     }
 
