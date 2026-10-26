@@ -42,6 +42,7 @@ from materialize.mzcompose.services.toxiproxy import Toxiproxy
 from materialize.parallel_workload.catalog_transactions import (
     catalog_result_outcome,
     description_outcome,
+    explain_ddl_rejection,
     hammer,
     independent_ddl,
     late_binding,
@@ -205,6 +206,7 @@ def workflow_catalog_transactions(
         "rename-noop",
         "show-create",
         "explain-schema",
+        "explain-rejection",
         "description",
         "swap",
         "hammer",
@@ -269,6 +271,8 @@ def workflow_catalog_transactions(
                     rename_noop(c)
                 elif case == "description":
                     description_outcome(c)
+                elif case == "explain-rejection":
+                    explain_ddl_rejection(c)
                 elif case in ("show-create", "explain-schema"):
                     catalog_result_outcome(c, schema_result=case == "explain-schema")
                 elif case == "swap":

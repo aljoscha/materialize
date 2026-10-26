@@ -27,6 +27,47 @@ def execute(conn: Connection, statement: str) -> Cursor:
     return conn.execute(statement.encode())
 
 
+def explain_ddl_rejection(c: Composition) -> None:
+    with c.sql_connection() as txn:
+        execute(txn, "CREATE SCHEMA ddl_explain_rejection")
+        execute(txn, "CREATE VIEW ddl_explain_rejection.original AS SELECT 42 AS value")
+        for explain in (
+            "EXPLAIN RAW PLAN FOR VIEW {}",
+            "EXPLAIN RAW PLAN FOR SELECT * FROM {}",
+        ):
+            standalone = explain.format("ddl_explain_rejection.original")
+            assert execute(txn, standalone).fetchall()
+            execute(txn, "BEGIN")
+            assert execute(txn, standalone).fetchall()
+            execute(txn, "COMMIT")
+            for mode in ("direct", "prepared", "implicit"):
+                rename = "ALTER VIEW ddl_explain_rejection.original RENAME TO observed"
+                statement = explain.format("ddl_explain_rejection.observed")
+                if mode == "implicit":
+                    statement = f"{rename}; {statement}"
+                else:
+                    execute(txn, "BEGIN")
+                    execute(txn, rename)
+                    if mode == "prepared":
+                        execute(txn, f"PREPARE ddl_explain AS {statement}")
+                        statement = "EXECUTE ddl_explain"
+                try:
+                    result = execute(txn, statement)
+                    while result.nextset():
+                        pass
+                except Error as error:
+                    assert error.sqlstate == "25000", error
+                    assert "restricted to just modifying objects" in str(error)
+                else:
+                    raise AssertionError(f"EXPLAIN was allowed in DDL mode: {mode}")
+                finally:
+                    execute(txn, "ROLLBACK")
+                execute(txn, "DEALLOCATE ALL")
+                assert execute(
+                    txn, "SELECT * FROM ddl_explain_rejection.original"
+                ).fetchall() == [(42,)]
+
+
 def catalog_result_outcome(c: Composition, schema_result: bool) -> None:
     for interference in ("definition", "unrelated", "equivalent_replacement"):
         schema = f"ddl_catalog_result_{int(schema_result)}_{interference}"
