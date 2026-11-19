@@ -143,7 +143,7 @@ impl Coordinator {
                 df.clone(),
                 mz_repr::explain::ExplainFormat::Text,
                 &mz_repr::explain::ExplainConfig {
-                    redacted: true,
+                    redacted: false,
                     ..Default::default()
                 },
                 &config.features,

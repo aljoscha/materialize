@@ -155,7 +155,8 @@ failed program against the changed namespace.
 
 Pass `--show-plan` to `competition.py run` to print each installed physical plan.
 In psql, use `SET emit_plan_insights_notice = on` before the block for the
-same notice. A retry reads the same arrangement and emits no second plan.
+same notice. It includes literal values, so use demo data when recording.
+A retry reads the same arrangement and emits no second plan.
 
 ## Constraints
 
