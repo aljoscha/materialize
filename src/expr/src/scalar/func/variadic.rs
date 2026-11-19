@@ -803,6 +803,40 @@ impl LazyVariadicFunc for Greatest {
     }
 }
 
+/// Ambiguity is data so a caller can attach the identity of the depender.
+#[sqlfunc]
+fn rewrite_catalog_schema(
+    sql: &str,
+    database: &str,
+    source: &str,
+    destination: &str,
+) -> Result<mz_repr::adt::jsonb::Jsonb, EvalError> {
+    use mz_sql_parser::ast::display::AstDisplay;
+    use mz_sql_parser::ast::rename::{RenameSchemaError, rename_schema_refs};
+
+    mz_sql_parser::ast::Ident::new(destination)
+        .map_err(|e| EvalError::InvalidCatalogJson(e.to_string().into()))?;
+    let mut stmts = mz_sql_parser::parser::parse_statements(sql)
+        .map_err(|e| EvalError::InvalidCatalogJson(e.to_string().into()))?;
+    let [stmt] = &mut stmts[..] else {
+        return Err(EvalError::InvalidCatalogJson(
+            "expected one CREATE statement".into(),
+        ));
+    };
+    let result = match rename_schema_refs(&mut stmt.ast, database, source, destination) {
+        Ok(()) => serde_json::json!({"create_sql": stmt.ast.to_ast_string_stable()}),
+        Err(RenameSchemaError::Ambiguous((schema, item))) => {
+            serde_json::json!({"ambiguous_schema": schema, "item": item})
+        }
+        Err(RenameSchemaError::NotCreate) => {
+            return Err(EvalError::InvalidCatalogJson(
+                "expected a catalog CREATE statement".into(),
+            ));
+        }
+    };
+    Ok(mz_repr::adt::jsonb::Jsonb::from_serde_json(result).expect("valid JSONB"))
+}
+
 #[sqlfunc(sqlname = "hmac")]
 fn hmac_string(to_digest: &str, key: &str, typ: &str) -> Result<Vec<u8>, EvalError> {
     let to_digest = to_digest.as_bytes();
@@ -1875,6 +1909,7 @@ derive_variadic! {
     SplitPart(SplitPart),
     RegexpMatch(RegexpMatch),
     HmacString(HmacString),
+    RewriteCatalogSchema(RewriteCatalogSchema),
     HmacBytes(HmacBytes),
     ErrorIfNull(ErrorIfNull),
     DateBinTimestamp(DateBinTimestamp),

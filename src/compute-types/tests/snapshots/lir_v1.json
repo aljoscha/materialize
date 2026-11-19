@@ -3412,6 +3412,7 @@
     }
   },
   "Reverse": "UNITSTRUCT",
+  "RewriteCatalogSchema": "UNITSTRUCT",
   "Right": "UNITSTRUCT",
   "RoundFloat32": "UNITSTRUCT",
   "RoundFloat64": "UNITSTRUCT",
@@ -5704,6 +5705,11 @@
       "Replace": {
         "NEWTYPE": {
           "TYPENAME": "Replace"
+        }
+      },
+      "RewriteCatalogSchema": {
+        "NEWTYPE": {
+          "TYPENAME": "RewriteCatalogSchema"
         }
       },
       "SplitPart": {
