@@ -111,12 +111,21 @@ def inspect(conn, p, sid, outside_id, claimant_id):
     verify_data(conn, p, p + "_final", [1, 2])
 
 
-def run(writer, observer, log):
+def run(writer, observer, log, show_plan):
     p = "dt_" + uuid.uuid4().hex
     old, final, outside, claim = (
         p + "_" + s for s in ("old", "final", "outside", "claim")
     )
     w = writer.execute
+    if show_plan:
+
+        def print_plan(diag):
+            message = diag.message_primary or ""
+            if message.startswith("Deterministic transaction physical plan"):
+                print(message, flush=True)
+
+        writer.add_notice_handler(print_plan)
+        w("SET emit_plan_insights_notice = on")
     for c in (observer, writer):
         c.execute("SET statement_timeout = '120s'")
     w(f"CREATE SCHEMA {old}")
@@ -139,7 +148,11 @@ def run(writer, observer, log):
     w(f"ALTER SCHEMA {final} RENAME TO {claim}")
     w(f"INSERT INTO {claim}.dst VALUES (99)")
     claimant_id = compete(
-        writer, observer, log, f"CREATE SCHEMA {claim}", claimed=claim
+        writer,
+        observer,
+        log,
+        f"CREATE SCHEMA {claim}",
+        claimed=claim,
     )
     inspect(observer, p, ids[old], ids[outside], claimant_id)
     print(
@@ -156,7 +169,13 @@ def main():
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("run").add_argument("--server-log", required=True)
+    runner = commands.add_parser("run")
+    runner.add_argument("--server-log", required=True)
+    runner.add_argument(
+        "--show-plan",
+        action="store_true",
+        help="print the installed LIR for each paused commit",
+    )
     reader = commands.add_parser("inspect", help="read a completed run after restart")
     for arg in ("prefix", "schema_id", "outside_id", "claimant_id"):
         reader.add_argument(arg)
@@ -173,7 +192,7 @@ def main():
                 open(args.server_log, "rb") as log,
                 psycopg.connect(args.url, autocommit=True) as writer,
             ):
-                run(writer, observer, log)
+                run(writer, observer, log, args.show_plan)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,7 @@ impl Coordinator {
                 ));
             }
             let session = txn.ctx.session();
+            let emit_plan = session.vars().emit_plan_insights_notice();
             let cluster = self.catalog().active_cluster(session)?.id;
             let (tables, mut branches) = table_branches(
                 crate::frontend_deterministic::compile_table_diffs(&block.mutations)?,
@@ -86,7 +87,13 @@ impl Coordinator {
             let as_of = ts.step_back().ok_or(AdapterError::Unsupported(
                 "writing at the minimum timestamp",
             ))?;
-            let output = self.install_deterministic_compute(cluster, expr, as_of)?;
+            let (output, notice) =
+                self.install_deterministic_compute(cluster, expr, as_of, emit_plan)?;
+            if let Some(notice) = notice {
+                txn.ctx
+                    .session()
+                    .add_notice(crate::AdapterNotice::PlanInsights(notice));
+            }
             Ok((tables, layout, output, ts))
         }
         .await;

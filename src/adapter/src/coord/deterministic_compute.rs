@@ -60,7 +60,8 @@ impl Coordinator {
         cluster_id: ComputeInstanceId,
         output: MirRelationExpr,
         as_of: Timestamp,
-    ) -> Result<DeterministicCompute, AdapterError> {
+        emit_plan: bool,
+    ) -> Result<(DeterministicCompute, Option<String>), AdapterError> {
         let missing_cluster = || AdapterError::ConcurrentDependencyDrop {
             dependency_kind: "cluster",
             dependency_id: cluster_id.to_string(),
@@ -137,15 +138,37 @@ impl Coordinator {
         }
         let df = LirRelationExpr::finalize_dataflow(df, &config.features, None)
             .map_err(OptimizerError::from)?;
+        let notice = if emit_plan {
+            let text = crate::explain::explain_plan(
+                df.clone(),
+                mz_repr::explain::ExplainFormat::Text,
+                &mz_repr::explain::ExplainConfig {
+                    redacted: true,
+                    ..Default::default()
+                },
+                &config.features,
+                &self.catalog().for_system_session(),
+                Default::default(),
+                Some(&cluster.name),
+            )?;
+            Some(format!(
+                "Deterministic transaction physical plan (arrangement {index}):\n{text}"
+            ))
+        } else {
+            None
+        };
         let plan = PeekDataflowPlan::new(df, index, &typ);
         let desc = RelationDesc::new(typ, (0..arity).map(|i| format!("peek_{i}")));
         let (_, hold, mfp) = self.create_transient_peek_target(plan, arity, cluster_id)?;
-        Ok(DeterministicCompute {
-            cluster: cluster_id,
-            hold,
-            mfp,
-            desc,
-        })
+        Ok((
+            DeterministicCompute {
+                cluster: cluster_id,
+                hold,
+                mfp,
+                desc,
+            },
+            notice,
+        ))
     }
 
     /// Queues a full snapshot read. Consume the stream to EOF off the coordinator loop.

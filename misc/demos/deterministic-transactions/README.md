@@ -153,6 +153,10 @@ Repeat the observer checks: the final schema retains its ID, the claimed name
 has its own ID, and the table still contains only 1 and 2. Do not retry the
 failed program against the changed namespace.
 
+Pass `--show-plan` to `competition.py run` to print each installed physical plan.
+In psql, use `SET emit_plan_insights_notice = on` before the block for the
+same notice. A retry reads the same arrangement and emits no second plan.
+
 ## Constraints
 
 Inside the block, use schema renames and deterministic INSERT, UPDATE, or
