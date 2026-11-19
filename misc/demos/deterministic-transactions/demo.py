@@ -1,3 +1,12 @@
+# Copyright Materialize, Inc. and contributors. All rights reserved.
+#
+# Use of this software is governed by the Business Source License
+# included in the LICENSE file at the root of this repository.
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0.
+
 """Observe deterministic commit, rollback, and a conflicting schema rename."""
 
 import argparse
@@ -27,8 +36,15 @@ def schemas(conn, prefix):
 
 def observe(conn, prefix, names, visible, values):
     check("observer schemas", schemas(conn, prefix), names)
-    rows = conn.execute(f"SELECT n FROM {visible}.numbers ORDER BY n").fetchall()
-    check("observer rows", [n for (n,) in rows], values)
+    rows = conn.execute(
+        f"SELECT 'numbers' AS source, n FROM {visible}.numbers "
+        f"UNION ALL SELECT 'archive', n FROM {visible}.archive ORDER BY source, n"
+    ).fetchall()
+    check(
+        "observer rows (one snapshot)",
+        rows,
+        [(source, n) for source in ("archive", "numbers") for n in values],
+    )
 
 
 def run(writer, observer):
@@ -38,6 +54,7 @@ def run(writer, observer):
     w = writer.execute
     w(f"CREATE SCHEMA {old}")
     w(f"CREATE TABLE {old}.numbers (n int)")
+    w(f"CREATE TABLE {old}.archive (n int)")
     sid = schemas(observer, p)[old]
 
     w("BEGIN DETERMINISTIC TRANSACTION")
@@ -45,6 +62,7 @@ def run(writer, observer):
     w(f"INSERT INTO {mid}.numbers VALUES (1)")
     w(f"ALTER SCHEMA {mid} RENAME TO {final}")
     w(f"INSERT INTO {final}.numbers SELECT n + 1 FROM {final}.numbers")
+    w(f"INSERT INTO {final}.archive SELECT n FROM {final}.numbers")
     print("Before commit:")
     observe(observer, p, {old: sid}, old, [])
     w("COMMIT")
@@ -65,6 +83,7 @@ def run(writer, observer):
 
     w("BEGIN DETERMINISTIC TRANSACTION")
     w(f"INSERT INTO {final}.numbers VALUES (99)")
+    w(f"INSERT INTO {final}.archive VALUES (100)")
     w(f"ALTER SCHEMA {final} RENAME TO {claimed}")
     observer.execute(f"CREATE SCHEMA {claimed}")
     claimant_id = schemas(observer, p)[claimed]
@@ -95,7 +114,9 @@ def main():
     parser.add_argument("--url", default=os.environ.get("MZ_URL"))
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("run", help="create a fresh run and verify all three outcomes")
-    reader = commands.add_parser("inspect", help="verify a completed run without writes")
+    reader = commands.add_parser(
+        "inspect", help="verify a completed run without writes"
+    )
     reader.add_argument("prefix")
     reader.add_argument("schema_id")
     reader.add_argument("claimant_id")

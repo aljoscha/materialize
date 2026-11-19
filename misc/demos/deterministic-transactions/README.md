@@ -5,7 +5,14 @@ transactions**. Use a writable database where your role can create schemas
 and tables, and a cluster you can query. Use Python 3 with psycopg 3 in your
 client environment. No repository dependencies or server changes are needed.
 
-From this directory:
+To start the server in a fresh worktree, set `MZDEV_POSTGRES` to a dedicated
+PostgreSQL database and run `misc/demos/deterministic-transactions/start`.
+The launcher binds SQL to loopback and opts the fresh catalog into txn-WAL.
+Reuse the same worktree and database on restart. Never pass `--reset` to
+restart the demo. See [the storage contract](../../../src/catalog/DEMO-WAL.md).
+
+From this directory (or use the repository's `bin/pyactivate` in place of
+`python3`):
 
 ```sh
 export MZ_URL='postgresql://materialize@localhost:6875/materialize'
@@ -13,8 +20,8 @@ python3 demo.py run
 ```
 
 The runner opens two sessions. It creates a UUID-named schema, follows its
-catalog ID through two renames, and checks the full ordered row list, including
-duplicates. The observer checks state before and after commit, after an empty
+catalog ID through two renames, and reads both table shards in one query to
+check the exact row multiplicities. The observer checks state before and after commit, after an empty
 commit, after rollback, and after it claims a rename destination from the writer.
 A mismatch or unexpected SQL error exits nonzero. Nothing is dropped, even
 on failure. Use a quiet database to avoid unrelated concurrent catalog changes.
@@ -41,11 +48,13 @@ Run the blocks in order. Leave the observer in psql's default autocommit mode.
 -- Writer
 CREATE SCHEMA :"old";
 CREATE TABLE :"old".numbers (n int);
+CREATE TABLE :"old".archive (n int);
 BEGIN DETERMINISTIC TRANSACTION;
 ALTER SCHEMA :"old" RENAME TO :"mid";
 INSERT INTO :"mid".numbers VALUES (1);
 ALTER SCHEMA :"mid" RENAME TO :"last";
 INSERT INTO :"last".numbers SELECT n + 1 FROM :"last".numbers;
+INSERT INTO :"last".archive SELECT n FROM :"last".numbers;
 ```
 
 ```sql
