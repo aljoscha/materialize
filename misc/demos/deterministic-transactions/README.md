@@ -161,3 +161,13 @@ Standalone SELECT, arbitrary DDL, RETURNING, unstable expressions and
 order-sensitive operations such as LIMIT are not supported. Set up objects
 outside the block and inspect them through the observer. A successful staged
 statement does not mean the block will commit.
+
+The dataflow maintains a *candidate*, not a continual write. Only the
+coordinator's successful compare-and-append publishes it. Retries read the
+same arrangement. They do not install a new dataflow.
+
+The comparison covers the whole WAL, not just the transaction's inputs.
+Unrelated writes or other commit attempts can exhaust the 32-attempt limit.
+An unrelated catalog change can also invalidate a bound mutation. Use a
+dedicated cluster and database for this demo. If compute stops advancing,
+the internal peek does not yet implement client cancellation or a timeout.
