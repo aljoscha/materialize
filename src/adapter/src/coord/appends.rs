@@ -510,7 +510,12 @@ impl GroupCommitter {
         }
 
         if shared {
-            self.catalog_upper.materialize_committed_upper().await;
+            // The WAL has closed this timestamp, but physical catalog readers
+            // cannot follow its logical progress until the catalog applies it.
+            self.catalog_upper
+                .advance_upper(write_ts.advance_to)
+                .await
+                .unwrap_or_terminate("unable to materialize the committed catalog upper");
         }
         let now: Timestamp = (self.now)().into();
         crate::coord::timeline::check_runaway_write_ts(&now, write_ts.timestamp);

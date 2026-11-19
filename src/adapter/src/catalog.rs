@@ -188,12 +188,6 @@ impl CatalogUpperHandle {
         Ok(shared)
     }
 
-    pub(crate) async fn materialize_committed_upper(&self) {
-        // Fetching the logical upper also applies committed catalog batches for
-        // physical-shard readers, before moving the timestamp oracle.
-        self.storage.lock().await.current_upper().await;
-    }
-
     /// Advances the durable catalog upper to at least `new_upper`.
     pub async fn advance_upper(
         &self,

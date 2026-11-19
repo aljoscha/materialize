@@ -914,7 +914,9 @@ impl Coordinator {
                     .await
                     .timestamp
                     .max(self.catalog().current_upper().await);
-                self.catalog().advance_upper(ts).await?;
+                self.catalog().advance_upper(ts).await.unwrap_or_terminate(
+                    "unable to advance catalog upper for deterministic commit",
+                );
                 let certified = crate::frontend_deterministic::evaluate_deterministic(
                     &self.controller.storage_collections,
                     self.catalog(),
