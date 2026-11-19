@@ -388,7 +388,7 @@ fn optimize_mir_local(
 /// This is just a wrapper around [mz_transform::Optimizer::constant_optimizer],
 /// running it, and tracing the result plan.
 #[mz_ore::instrument(target = "optimizer", level = "debug", name = "constant")]
-fn optimize_mir_constant(
+pub(crate) fn optimize_mir_constant(
     expr: MirRelationExpr,
     ctx: &mut TransformCtx,
     limit: bool,

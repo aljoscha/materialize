@@ -25,6 +25,7 @@
 //! rollback cannot undo either secret writes or changes in external services.
 
 pub(crate) mod connection;
+mod schema_rename;
 pub(crate) mod source;
 pub(crate) mod source_statement;
 
@@ -295,6 +296,111 @@ impl CommandExecution<'_> {
             }
         }
         result
+    }
+}
+
+/// Unresolved schema renames whose outcomes have not been promised to the client.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SchemaRenameProgram {
+    steps: Vec<Arc<SchemaRenameStep>>,
+}
+
+#[derive(Debug)]
+struct SchemaRenameStep {
+    instruction: Option<schema_rename::Instruction>,
+    statement: Arc<Statement<Raw>>,
+    params: Params,
+    session: SessionMeta,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct SchemaRenameOutcome {
+    pub changed: bool,
+    pub notices: Vec<PlanNotice>,
+}
+
+impl SchemaRenameProgram {
+    pub(crate) fn supports(statement: &Statement<Raw>) -> bool {
+        matches!(statement, Statement::AlterObjectRename(rename)
+            if rename.object_type == mz_sql::ast::ObjectType::Schema)
+    }
+
+    /// Records the invoking session without binding names against an incomplete prefix.
+    pub(crate) fn push(
+        &mut self,
+        statement: Arc<Statement<Raw>>,
+        params: Params,
+        session: SessionMeta,
+    ) -> Result<(), AdapterError> {
+        if !Self::supports(&statement) {
+            return Err(AdapterError::Unsupported(
+                "statement in schema rename program",
+            ));
+        }
+        self.steps.push(Arc::new(SchemaRenameStep {
+            instruction: schema_rename::Instruction::lower(&statement, &session),
+            statement,
+            params,
+            session,
+        }));
+        Ok(())
+    }
+
+    /// Bind the longest valid namespace prefix. Its operations still need to run:
+    /// an earlier dependent-definition error takes precedence over a later name conflict.
+    pub(super) fn compile(
+        &self,
+        base: &CatalogState,
+    ) -> (Vec<Op>, Result<Vec<SchemaRenameOutcome>, AdapterError>) {
+        self.compile_user(base)
+            .unwrap_or_else(|| self.compile_sql(base))
+    }
+
+    /// Name resolution for subsequent DML needs only schema names, not rewritten
+    /// definitions, controller effects, or audit records.
+    pub(crate) fn preview(&self, base: &CatalogState) -> Option<CatalogState> {
+        let (ops, result) = self.compile(base);
+        result.ok()?;
+        let mut namespace = base.clone();
+        for op in &ops {
+            schema_rename::project(&mut namespace, op);
+        }
+        Some(namespace)
+    }
+
+    fn compile_sql(
+        &self,
+        base: &CatalogState,
+    ) -> (Vec<Op>, Result<Vec<SchemaRenameOutcome>, AdapterError>) {
+        let mut namespace = std::borrow::Cow::Borrowed(base);
+        let mut ops = Vec::with_capacity(self.steps.len());
+        let mut outcomes = Vec::with_capacity(self.steps.len());
+        for step in &self.steps {
+            let (plan, notices) =
+                match plan_command(&namespace, &step.statement, &step.params, &step.session) {
+                    Ok(prepared) => prepared,
+                    Err(error) => return (ops, Err(error)),
+                };
+            let changed = match plan {
+                Plan::AlterNoop(_) => false,
+                Plan::AlterSchemaRename(rename) => {
+                    let (database_spec, schema_spec) = rename.cur_schema_spec;
+                    let new_name = rename.new_schema_name;
+                    let op = Op::RenameSchema {
+                        database_spec,
+                        schema_spec,
+                        new_name,
+                        check_reserved_names: true,
+                    };
+                    schema_rename::project(namespace.to_mut(), &op);
+                    ops.push(op);
+                    true
+                }
+                _ => unreachable!("schema rename syntax only"),
+            };
+            outcomes.push(SchemaRenameOutcome { changed, notices });
+        }
+        (ops, Ok(outcomes))
     }
 }
 
@@ -666,4 +772,128 @@ pub(crate) fn plan_subsource(
         resolved_ids,
         available_source_references: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Catalog;
+    use crate::session::Session;
+
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)]
+    async fn schema_rename_program_conflicts_and_outcomes() {
+        Catalog::with_debug(|mut catalog| async move {
+            let mut session = Session::dummy();
+            session.initialize_role_metadata(mz_sql::session::user::MZ_SYSTEM_ROLE_ID);
+            session
+                .start_transaction(mz_ore::now::to_datetime(1000), None, None)
+                .expect("start transaction");
+            let program = |sql: &str| {
+                let mut program = SchemaRenameProgram::default();
+                for parsed in mz_sql_parser::parser::parse_statements(sql).expect("parse renames") {
+                    program
+                        .push(Arc::new(parsed.ast), Params::empty(), session.meta())
+                        .expect("record rename");
+                }
+                program
+            };
+
+            let ts = catalog.current_upper().await;
+            let revision = catalog.transient_revision();
+            let invalid_prefix = program(
+                "ALTER SCHEMA public RENAME TO mz_forbidden;
+                 ALTER SCHEMA missing RENAME TO ignored",
+            );
+            let Err(error) = catalog
+                .transact_schema_renames(ts, None, &invalid_prefix, None)
+                .await
+            else {
+                panic!("first rename should fail before the missing source")
+            };
+            assert_eq!(error.to_string(), "unacceptable schema name 'mz_forbidden'");
+
+            let conflict = program(
+                "ALTER SCHEMA public RENAME TO middle;
+                 ALTER SCHEMA middle RENAME TO middle",
+            );
+            let Err(error) = catalog
+                .transact_schema_renames(ts, None, &conflict, None)
+                .await
+            else {
+                panic!("occupied destination should abort the entire batch")
+            };
+            assert!(error.to_string().contains("already exists"), "{error}");
+            assert_eq!(catalog.current_upper().await, ts);
+            assert_eq!(catalog.transient_revision(), revision);
+
+            let id = catalog
+                .state()
+                .resolve_database("materialize")
+                .unwrap()
+                .schemas_by_name["public"];
+            // The second destination was occupied in the initial catalog and
+            // its source did not exist there. Both probes need the prefix.
+            let round_trip = program(
+                "ALTER SCHEMA public RENAME TO middle;
+                 ALTER SCHEMA materialize.middle RENAME TO public;
+                 ALTER SCHEMA IF EXISTS materialize.middle RENAME TO skipped",
+            );
+            let (writes, outcomes) = round_trip.compile_user(catalog.state()).expect("user path");
+            let (reference_writes, reference_outcomes) = round_trip.compile_sql(catalog.state());
+            let moves = |ops: Vec<Op>| {
+                ops.into_iter()
+                    .map(|op| match op {
+                        Op::RenameSchema {
+                            database_spec,
+                            schema_spec,
+                            new_name,
+                            check_reserved_names,
+                        } => (database_spec, schema_spec, new_name, check_reserved_names),
+                        _ => panic!("unexpected op"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let moves_observed = moves(writes);
+            assert_eq!(moves_observed, moves(reference_writes));
+            assert_eq!(moves_observed.len(), 2);
+            assert!(
+                moves_observed
+                    .iter()
+                    .all(|(_, schema, _, _)| *schema == mz_sql::names::SchemaSpecifier::Id(id))
+            );
+            assert_eq!(outcomes.unwrap(), reference_outcomes.unwrap());
+
+            let chain = program(
+                "ALTER SCHEMA public RENAME TO middle;
+                 ALTER SCHEMA IF EXISTS public RENAME TO skipped;
+                 ALTER SCHEMA middle RENAME TO last_name",
+            );
+            let (result, outcomes) = catalog
+                .transact_schema_renames(ts, None, &chain, None)
+                .await
+                .expect("commit rename chain");
+            assert_eq!(result.audit_events.len(), 2);
+            assert_eq!(
+                outcomes.iter().map(|o| o.changed).collect::<Vec<_>>(),
+                [true, false, true]
+            );
+            assert!(matches!(
+                outcomes[1].notices.as_slice(),
+                [PlanNotice::ObjectDoesNotExist { .. }]
+            ));
+            let names = &catalog
+                .state()
+                .resolve_database("materialize")
+                .unwrap()
+                .schemas_by_name;
+            assert_eq!(names.get("last_name"), Some(&id));
+            for name in ["public", "middle", "skipped"] {
+                assert!(!names.contains_key(name));
+            }
+            assert_eq!(catalog.transient_revision(), revision + 1);
+            catalog.expire().await;
+        })
+        .await;
+    }
 }

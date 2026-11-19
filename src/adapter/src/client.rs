@@ -854,6 +854,34 @@ impl SessionClient {
         // rather than the inner SQL.
         let portal_name = self.unroll_sql_execute(portal_name, logging).await?;
 
+        if self
+            .session()
+            .transaction()
+            .inner()
+            .is_some_and(|txn| txn.deterministic.is_some())
+        {
+            let stmt = self
+                .session()
+                .get_portal_unverified(&portal_name)
+                .and_then(|p| p.stmt.as_deref());
+            match stmt {
+                Some(
+                    Statement::Commit(_)
+                    | Statement::Rollback(_)
+                    | Statement::Insert(_)
+                    | Statement::Update(_)
+                    | Statement::Delete(_),
+                ) => {}
+                Some(Statement::AlterObjectRename(rename))
+                    if rename.object_type == mz_sql_parser::ast::ObjectType::Schema => {}
+                _ => {
+                    return Err(AdapterError::Unsupported(
+                        "this statement in a deterministic transaction",
+                    ));
+                }
+            }
+        }
+
         // Attempt peek sequencing in the session task.
         // If unsupported, fall back to the Coordinator path.
         let peek_result = self
@@ -1719,6 +1747,11 @@ impl SessionClient {
             TakeOver::StatementToRun,
         );
 
+        let deterministic = self
+            .session()
+            .transaction()
+            .inner()
+            .is_some_and(|txn| txn.deterministic.is_some());
         // Mirror the coordinator's transaction-state gate in `handle_execute`:
         // in a multi-statement transaction (an implicit batch or an explicit
         // block), the only DML allowed is an AST-constant INSERT without
@@ -1752,7 +1785,7 @@ impl SessionClient {
                             source, returning, ..
                         }) if returning.is_empty() && ConstantVisitor::insert_source(source)
                     );
-                    if !constant_insert {
+                    if !constant_insert && !deterministic {
                         return Err(prohibited_in_transaction(&stmt));
                     }
                 }
@@ -1853,6 +1886,7 @@ impl SessionClient {
         {
             let session = self.session.as_ref().expect("SessionClient invariant");
             if session.transaction().is_in_multi_statement_transaction()
+                && !deterministic
                 && !session.transaction().allows_writes()
             {
                 return Err(AdapterError::ReadOnlyTransaction);
@@ -1891,7 +1925,7 @@ impl SessionClient {
                 // other time-dependent reads correctly.
                 let has_read_deps = !insert_plan.values.depends_on().is_empty();
 
-                if !has_read_deps {
+                if !has_read_deps && !deterministic {
                     let optimized_mir = if insert_plan.values.as_const().is_some() {
                         // Already constant at HIR level - just lower without optimization
                         let expr = insert_plan
@@ -1986,6 +2020,36 @@ impl SessionClient {
                 ));
             }
         };
+
+        if deterministic {
+            if !rtw_plan.returning.is_empty() {
+                return Err(AdapterError::Unsupported(
+                    "RETURNING in a deterministic transaction",
+                ));
+            }
+            let response = match rtw_plan.kind {
+                MutationKind::Insert => ExecuteResponse::Inserted(0),
+                MutationKind::Update => ExecuteResponse::Updated(0),
+                MutationKind::Delete => ExecuteResponse::Deleted(0),
+            };
+            let mutation =
+                crate::frontend_deterministic::DeterministicMutation::prepare(&catalog, rtw_plan)?;
+            let block = self
+                .session()
+                .transaction_mut()
+                .inner_mut()
+                .and_then(|txn| txn.deterministic.as_mut())
+                .expect("checked above");
+            if *block
+                .catalog_revision
+                .get_or_insert(catalog.transient_revision())
+                != catalog.transient_revision()
+            {
+                return Err(AdapterError::DDLTransactionOutcomeChanged);
+            }
+            block.mutations.push(mutation);
+            return Ok(Some(response));
+        }
 
         // The syntactic predicate for "reads persisted state", see the module
         // docs on `session_read_then_write`. Inside a transaction, only a write

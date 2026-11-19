@@ -881,6 +881,109 @@ impl Coordinator {
         }
     }
 
+    pub(super) async fn commit_deterministic_block(
+        &mut self,
+        ctx: &mut ExecuteContext,
+        block: crate::session::DeterministicBlock,
+    ) -> Result<(), AdapterError> {
+        if self.controller.read_only() {
+            return Err(AdapterError::ReadOnly);
+        }
+        if block
+            .catalog_revision
+            .is_some_and(|revision| revision != self.catalog().transient_revision())
+        {
+            return Err(AdapterError::DDLTransactionOutcomeChanged);
+        }
+        if !self.catalog().shares_table_wal().await {
+            return Err(AdapterError::Unsupported(
+                "deterministic transactions outside a demo WAL environment",
+            ));
+        }
+        let guard = self
+            .serialized_ddl
+            .try_lock_owned()
+            .map_err(|_| AdapterError::DDLTransactionOutcomeChanged)?;
+        let conn_id = ctx.session().conn_id().clone();
+        let result = async {
+            // Only a failed exact-timestamp CAS is retryable. Each attempt reads
+            // a newly closed WAL snapshot and evaluates the full program again.
+            for _ in 0..8 {
+                let ts = self
+                    .get_local_write_ts()
+                    .await
+                    .timestamp
+                    .max(self.catalog().current_upper().await);
+                self.catalog().advance_upper(ts).await?;
+                let certified = crate::frontend_deterministic::evaluate_deterministic(
+                    &self.controller.storage_collections,
+                    self.catalog(),
+                    &block.mutations,
+                    &Default::default(),
+                    ts,
+                )
+                .await?;
+                let mut tables = mz_catalog::durable::TableDiffs::new();
+                let storage = self.catalog().state().storage_metadata();
+                for (id, (gid, rows)) in certified.writes {
+                    if self
+                        .catalog()
+                        .try_get_entry(&id)
+                        .map(|e| e.latest_global_id())
+                        != Some(gid)
+                    {
+                        return Err(AdapterError::ConcurrentDependencyMutation {
+                            dependency_id: id.to_string(),
+                        });
+                    }
+                    tables.insert(storage.get_collection_shard(gid)?, rows);
+                }
+                let conn = self.active_conns.get(&conn_id).expect("active connection");
+                match Box::pin(Arc::make_mut(&mut self.catalog).transact_schema_renames(
+                    certified.write_ts,
+                    Some(conn),
+                    &block.renames,
+                    Some(tables),
+                ))
+                .await
+                {
+                    Err(AdapterError::ReadThenWriteContention) => continue,
+                    other => return other.map(|result| (ts, result)),
+                }
+            }
+            Err(AdapterError::ReadThenWriteContention)
+        }
+        .await;
+        self.release_ddl_lock(guard);
+        let (
+            ts,
+            (
+                TransactionResult {
+                    builtin_table_updates,
+                    catalog_updates,
+                    audit_events,
+                },
+                outcomes,
+            ),
+        ) = result?;
+        self.apply_local_write(ts).await;
+        ctx.session_mut().apply_write(ts);
+        self.track_catalog_audit_events(Some(&conn_id), audit_events);
+        let updates = self.builtin_table_update().execute(builtin_table_updates);
+        self.finish_catalog_transaction(Some(ctx), updates, catalog_updates)
+            .await;
+        tracing::debug!(
+            renames = outcomes.iter().filter(|outcome| outcome.changed).count(),
+            "committed schema rename program"
+        );
+        for outcome in outcomes {
+            for notice in outcome.notices {
+                ctx.session().add_notice(notice.into());
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn catalog_transact_commands(
         &mut self,
         ctx: &mut ExecuteContext,

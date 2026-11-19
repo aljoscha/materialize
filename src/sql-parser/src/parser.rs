@@ -9203,13 +9203,22 @@ impl<'a> Parser<'a> {
     fn parse_start_transaction(&mut self) -> Result<Statement<Raw>, ParserError> {
         self.expect_keyword(TRANSACTION)?;
         Ok(Statement::StartTransaction(StartTransactionStatement {
+            deterministic: false,
             modes: self.parse_transaction_modes(false)?,
         }))
     }
 
     fn parse_begin(&mut self) -> Result<Statement<Raw>, ParserError> {
+        if self.parse_keyword(DETERMINISTIC) {
+            self.expect_keyword(TRANSACTION)?;
+            return Ok(Statement::StartTransaction(StartTransactionStatement {
+                deterministic: true,
+                modes: vec![],
+            }));
+        }
         let _ = self.parse_one_of_keywords(&[TRANSACTION, WORK]);
         Ok(Statement::StartTransaction(StartTransactionStatement {
+            deterministic: false,
             modes: self.parse_transaction_modes(false)?,
         }))
     }

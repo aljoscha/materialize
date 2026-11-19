@@ -1275,6 +1275,38 @@ impl Coordinator {
         //    DDL. If the lock could not be acquired, the DDL is put into the VecDeque where it
         //    awaits dequeuing caused by the lock being released.
 
+        if ctx
+            .session()
+            .transaction()
+            .inner()
+            .is_some_and(|txn| txn.deterministic.is_some())
+        {
+            if crate::catalog::command::SchemaRenameProgram::supports(&stmt) {
+                let meta = ctx.session().meta();
+                let block = ctx
+                    .session_mut()
+                    .transaction_mut()
+                    .inner_mut()
+                    .and_then(|txn| txn.deterministic.as_mut())
+                    .expect("checked above");
+                let staged = block.renames.push(stmt, params, meta);
+                if staged.is_ok() {
+                    block.namespace = block.renames.preview(self.catalog().state());
+                    block
+                        .catalog_revision
+                        .get_or_insert(self.catalog().transient_revision());
+                }
+                return ctx.retire(staged.map(|()| {
+                    ExecuteResponse::AlteredObject(mz_sql::catalog::ObjectType::Schema)
+                }));
+            }
+            if !matches!(&*stmt, Statement::Commit(_) | Statement::Rollback(_)) {
+                return ctx.retire(Err(AdapterError::Unsupported(
+                    "this statement in a deterministic transaction",
+                )));
+            }
+        }
+
         if StatementKind::from(&*stmt).is_explain() {
             if let Err(error) = ctx.session_mut().transaction_mut().record_explain() {
                 return ctx.retire(Err(error));

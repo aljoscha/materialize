@@ -2075,7 +2075,7 @@ fn build_no_rows_response(kind: &MutationKind) -> ExecuteResponse {
 /// - DELETE: Negates the expression to produce `(row, -1)` diffs
 /// - UPDATE: Unions negated old rows with mapped new rows to produce both
 ///   `(old_row, -1)` and `(new_row, +1)` diffs
-fn apply_mutation_to_mir(
+pub(crate) fn apply_mutation_to_mir(
     expr: MirRelationExpr,
     kind: &MutationKind,
     assignments: &BTreeMap<usize, MirScalarExpr>,

@@ -1869,10 +1869,14 @@ impl Coordinator {
         ctx: &mut ExecuteContext,
         action: EndTransactionAction,
     ) -> Result<Option<TransactionOps>, AdapterError> {
-        let (txn, retire_notify) = self.clear_transaction(ctx.session_mut()).await;
+        let (mut txn, retire_notify) = self.clear_transaction(ctx.session_mut()).await;
         ctx.delay_response_until(retire_notify);
 
         if let EndTransactionAction::Commit = action {
+            if let Some(block) = txn.inner_mut().and_then(|txn| txn.deterministic.take()) {
+                Box::pin(self.commit_deterministic_block(ctx, *block)).await?;
+                return Ok(None);
+            }
             if let Some(mut ops) = txn.into_ops() {
                 match &mut ops {
                     TransactionOps::Writes(writes) => {

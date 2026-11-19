@@ -34,7 +34,7 @@ use mz_audit_log::{
 };
 use mz_catalog::SYSTEM_CONN_ID;
 use mz_catalog::builtin::BuiltinLog;
-use mz_catalog::durable::{DryRunTransaction, NetworkPolicy, Snapshot, Transaction};
+use mz_catalog::durable::{DryRunTransaction, NetworkPolicy, Snapshot, TableDiffs, Transaction};
 use mz_catalog::expr_cache::{LocalExpressions, latest_item_version};
 use mz_catalog::memory::error::{AmbiguousRename, Error, ErrorKind};
 use mz_catalog::memory::objects::{
@@ -77,6 +77,7 @@ use tracing::{info, trace};
 use uuid::Uuid;
 
 use crate::AdapterError;
+use crate::catalog::command::{SchemaRenameOutcome, SchemaRenameProgram};
 use crate::catalog::state::LocalExpressionCache;
 use crate::catalog::{
     BuiltinTableUpdate, Catalog, CatalogState, UpdatePrivilegeVariant,
@@ -866,6 +867,57 @@ impl Catalog {
         commands: &mut [super::command::CatalogCommand],
         responses: &mut BTreeMap<usize, CommandResponse>,
     ) -> Result<TransactionResult, CommandExecutionError> {
+        self.commit_program(
+            storage_collections,
+            oracle_write_ts,
+            session,
+            TransactionOperations::Commands {
+                commands,
+                responses,
+            },
+            Ok(None),
+        )
+        .await
+    }
+
+    /// Evaluates the entire program under the caller's DDL lock. Outcomes and
+    /// catalog implications may be published only after this returns success.
+    ///
+    /// With `Some(tables)`, commit at exactly `oracle_write_ts` or fail.
+    /// The caller must validate the table writes and must not submit them separately.
+    pub(crate) async fn transact_schema_renames(
+        &mut self,
+        oracle_write_ts: mz_repr::Timestamp,
+        session: Option<&ConnMeta>,
+        program: &SchemaRenameProgram,
+        tables: Option<TableDiffs>,
+    ) -> Result<(TransactionResult, Vec<SchemaRenameOutcome>), AdapterError> {
+        let (ops, outcomes) = program.compile(&self.state);
+        let (outcomes, commit) = match outcomes {
+            Ok(outcomes) => (outcomes, Ok(tables)),
+            Err(error) => (Vec::new(), Err(error)),
+        };
+        let result = self
+            .commit_program(
+                None,
+                oracle_write_ts,
+                session,
+                TransactionOperations::Raw(ops),
+                commit,
+            )
+            .await
+            .map_err(CommandExecutionError::into_adapter_error)?;
+        Ok((result, outcomes))
+    }
+
+    async fn commit_program(
+        &mut self,
+        storage_collections: Option<&mut Arc<dyn StorageCollections + Send + Sync>>,
+        oracle_write_ts: mz_repr::Timestamp,
+        session: Option<&ConnMeta>,
+        operations: TransactionOperations<'_>,
+        commit: Result<Option<TableDiffs>, AdapterError>,
+    ) -> Result<TransactionResult, CommandExecutionError> {
         fail::fail_point!("catalog_transact", |arg| {
             Err(AdapterError::Unstructured(anyhow::anyhow!("failpoint: {arg:?}")).into())
         });
@@ -877,16 +929,17 @@ impl Catalog {
             .transaction()
             .await
             .unwrap_or_terminate("starting catalog command transaction");
-        let commit_ts = std::cmp::max(oracle_write_ts, tx.upper());
+        let commit_ts = if matches!(commit, Ok(Some(_))) {
+            oracle_write_ts
+        } else {
+            std::cmp::max(oracle_write_ts, tx.upper())
+        };
         let new_state = Self::transact_inner(
             TransactInnerMode::Commit,
             storage_collections,
             commit_ts,
             session,
-            TransactionOperations::Commands {
-                commands,
-                responses,
-            },
+            operations,
             BTreeSet::new(),
             &mut builtin_table_updates,
             &mut catalog_updates,
@@ -895,9 +948,30 @@ impl Catalog {
             &self.state,
         )
         .await?;
-        tx.commit(commit_ts)
-            .await
-            .unwrap_or_terminate("catalog command transaction commit must succeed");
+        match commit? {
+            None => tx
+                .commit(commit_ts)
+                .await
+                .unwrap_or_terminate("catalog command transaction commit must succeed"),
+            Some(tables) => {
+                use mz_catalog::durable::{CatalogError, DurableCatalogError};
+                match tx.commit_with_table_diffs(commit_ts, tables).await {
+                    // Storage rejects unavailable participants, ownership and upper
+                    // conflicts before committing. Never publish the candidate on conflict.
+                    Err(CatalogError::Durable(DurableCatalogError::WalTimestampPassed(_))) => {
+                        return Err(AdapterError::ReadThenWriteContention.into());
+                    }
+                    Err(error @ CatalogError::Durable(DurableCatalogError::NotWritable(_))) => {
+                        return Err(AdapterError::from(error).into());
+                    }
+                    result => {
+                        let upper =
+                            result.unwrap_or_terminate("catalog and table commit must succeed");
+                        assert_eq!(upper, commit_ts.step_forward());
+                    }
+                }
+            }
+        }
         drop(storage);
         self.publish_transaction_state(new_state);
         Ok(TransactionResult {

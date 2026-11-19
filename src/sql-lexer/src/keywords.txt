@@ -154,6 +154,7 @@ Delimiter
 Delta
 Desc
 Details
+Deterministic
 Direction
 Discard
 Disk
