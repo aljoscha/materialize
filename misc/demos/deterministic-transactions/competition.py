@@ -26,12 +26,15 @@ EVENT = re.compile(
 )
 
 
-def read_event(log, attempt):
+def read_event(log, attempt, commit=None):
     deadline = time.monotonic() + 60
     line = b""
     while time.monotonic() < deadline:
         chunk = log.readline()
         if not chunk:
+            if commit is not None and commit.done():
+                commit.result()
+                raise RuntimeError("COMMIT returned before the candidate barrier")
             time.sleep(0.05)
             continue
         line += chunk
@@ -53,7 +56,7 @@ def compete(writer, observer, log, mutation, claimed=None):
         observer.execute(HOOK.format("return"))
         try:
             commit = pool.submit(writer.execute, "COMMIT")
-            arrangement, ts = read_event(log, 1)
+            arrangement, ts = read_event(log, 1, commit)
             if commit.done():
                 commit.result()
                 raise RuntimeError("COMMIT did not pause")

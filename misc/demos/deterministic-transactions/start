@@ -8,4 +8,4 @@ sed 's/0\.0\.0\.0:/127.0.0.1:/g' \
   src/materialized/ci/listener_configs/v26_32_0/no_auth.json > mzdata/demo-listeners.json
 export MZ_DEMO_CATALOG_TXN_WAL=1
 exec bin/environmentd --listeners-config-path "$PWD/mzdata/demo-listeners.json" -- \
-  --orchestrator-process-tcp-proxy-listen-addr=127.0.0.1
+  --unsafe-mode --orchestrator-process-tcp-proxy-listen-addr=127.0.0.1
