@@ -7,7 +7,7 @@
 # the Business Source License, use of this software will be governed
 # by the Apache License, Version 2.0.
 
-"""Observe deterministic commit, rollback, and a conflicting schema rename."""
+"""Observe declarative commit, rollback, and a conflicting schema rename."""
 
 import argparse
 import os
@@ -57,7 +57,7 @@ def run(writer, observer):
     w(f"CREATE TABLE {old}.archive (n int)")
     sid = schemas(observer, p)[old]
 
-    w("BEGIN DETERMINISTIC TRANSACTION")
+    w("BEGIN DECLARATIVE TRANSACTION")
     w(f"ALTER SCHEMA {old} RENAME TO {mid}")
     w(f"INSERT INTO {mid}.numbers VALUES (1)")
     w(f"ALTER SCHEMA {mid} RENAME TO {final}")
@@ -69,19 +69,19 @@ def run(writer, observer):
     print("After commit:")
     observe(observer, p, {final: sid}, final, [1, 2])
 
-    w("BEGIN DETERMINISTIC TRANSACTION")
+    w("BEGIN DECLARATIVE TRANSACTION")
     w("COMMIT")
     print("After an empty commit (no reapplication):")
     observe(observer, p, {final: sid}, final, [1, 2])
 
-    w("BEGIN DETERMINISTIC TRANSACTION")
+    w("BEGIN DECLARATIVE TRANSACTION")
     w(f"UPDATE {final}.numbers SET n = n + 10")
     w(f"ALTER SCHEMA {final} RENAME TO {mid}")
     w("ROLLBACK")
     print("After rollback:")
     observe(observer, p, {final: sid}, final, [1, 2])
 
-    w("BEGIN DETERMINISTIC TRANSACTION")
+    w("BEGIN DECLARATIVE TRANSACTION")
     w(f"INSERT INTO {final}.numbers VALUES (99)")
     w(f"INSERT INTO {final}.archive VALUES (100)")
     w(f"ALTER SCHEMA {final} RENAME TO {claimed}")

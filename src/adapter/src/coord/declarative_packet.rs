@@ -69,7 +69,7 @@ impl CandidateLayout {
 
     pub(super) fn unpack(&self, row: &Row) -> Result<(usize, Row), AdapterError> {
         let invalid =
-            || AdapterError::internal("deterministic commit", "invalid compute candidate tag");
+            || AdapterError::internal("declarative commit", "invalid compute candidate tag");
         let mut datums = row.iter();
         let Some(Datum::Int64(tag)) = datums.next() else {
             return Err(invalid());

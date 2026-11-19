@@ -534,7 +534,7 @@ impl Plan {
 
 #[derive(Debug)]
 pub struct StartTransactionPlan {
-    pub deterministic: bool,
+    pub declarative: bool,
     pub access: Option<TransactionAccessMode>,
     pub isolation_level: Option<TransactionIsolationLevel>,
 }

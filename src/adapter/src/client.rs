@@ -858,7 +858,7 @@ impl SessionClient {
             .session()
             .transaction()
             .inner()
-            .is_some_and(|txn| txn.deterministic.is_some())
+            .is_some_and(|txn| txn.declarative.is_some())
         {
             let stmt = self
                 .session()
@@ -876,7 +876,7 @@ impl SessionClient {
                     if rename.object_type == mz_sql_parser::ast::ObjectType::Schema => {}
                 _ => {
                     return Err(AdapterError::Unsupported(
-                        "this statement in a deterministic transaction",
+                        "this statement in a declarative transaction",
                     ));
                 }
             }
@@ -1748,11 +1748,11 @@ impl SessionClient {
             TakeOver::StatementToRun,
         );
 
-        let deterministic = self
+        let declarative = self
             .session()
             .transaction()
             .inner()
-            .is_some_and(|txn| txn.deterministic.is_some());
+            .is_some_and(|txn| txn.declarative.is_some());
         // Mirror the coordinator's transaction-state gate in `handle_execute`:
         // in a multi-statement transaction (an implicit batch or an explicit
         // block), the only DML allowed is an AST-constant INSERT without
@@ -1786,7 +1786,7 @@ impl SessionClient {
                             source, returning, ..
                         }) if returning.is_empty() && ConstantVisitor::insert_source(source)
                     );
-                    if !constant_insert && !deterministic {
+                    if !constant_insert && !declarative {
                         return Err(prohibited_in_transaction(&stmt));
                     }
                 }
@@ -1887,7 +1887,7 @@ impl SessionClient {
         {
             let session = self.session.as_ref().expect("SessionClient invariant");
             if session.transaction().is_in_multi_statement_transaction()
-                && !deterministic
+                && !declarative
                 && !session.transaction().allows_writes()
             {
                 return Err(AdapterError::ReadOnlyTransaction);
@@ -1926,7 +1926,7 @@ impl SessionClient {
                 // other time-dependent reads correctly.
                 let has_read_deps = !insert_plan.values.depends_on().is_empty();
 
-                if !has_read_deps && !deterministic {
+                if !has_read_deps && !declarative {
                     let optimized_mir = if insert_plan.values.as_const().is_some() {
                         // Already constant at HIR level - just lower without optimization
                         let expr = insert_plan
@@ -2022,10 +2022,10 @@ impl SessionClient {
             }
         };
 
-        if deterministic {
+        if declarative {
             if !rtw_plan.returning.is_empty() {
                 return Err(AdapterError::Unsupported(
-                    "RETURNING in a deterministic transaction",
+                    "RETURNING in a declarative transaction",
                 ));
             }
             let response = match rtw_plan.kind {
@@ -2034,12 +2034,12 @@ impl SessionClient {
                 MutationKind::Delete => ExecuteResponse::Deleted(0),
             };
             let mutation =
-                crate::frontend_deterministic::DeterministicMutation::prepare(&catalog, rtw_plan)?;
+                crate::frontend_declarative::DeclarativeMutation::prepare(&catalog, rtw_plan)?;
             let block = self
                 .session()
                 .transaction_mut()
                 .inner_mut()
-                .and_then(|txn| txn.deterministic.as_mut())
+                .and_then(|txn| txn.declarative.as_mut())
                 .expect("checked above");
             if *block
                 .catalog_revision

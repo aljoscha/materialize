@@ -22,9 +22,9 @@ from concurrent.futures import ThreadPoolExecutor
 import psycopg
 from demo import check, schemas
 
-HOOK = "SET unsafe_failpoints = 'deterministic_candidate_before_cas={}'"
+HOOK = "SET unsafe_failpoints = 'declarative_candidate_before_cas={}'"
 EVENT = re.compile(
-    rb"deterministic candidate read subscribe=(t[0-9]+) attempt=([0-9]+) write_ts=([0-9]+)\b"
+    rb"declarative candidate read subscribe=(t[0-9]+) attempt=([0-9]+) write_ts=([0-9]+)\b"
 )
 
 
@@ -245,9 +245,7 @@ def run(writer, observer, raw, log, show_plan):
 
         def print_plan(diag):
             message = diag.message_primary or ""
-            if message.startswith(
-                "Deterministic transaction physical plan (subscribe "
-            ):
+            if message.startswith("Declarative transaction physical plan (subscribe "):
                 print(message, flush=True)
 
         writer.add_notice_handler(print_plan)
@@ -271,11 +269,11 @@ def run(writer, observer, raw, log, show_plan):
     # Race the allocator in a DDL-only transaction, then race the source in
     # the mixed transaction without invalidating those table bindings.
     mid = p + "_mid"
-    w("BEGIN DETERMINISTIC TRANSACTION")
+    w("BEGIN DECLARATIVE TRANSACTION")
     w(f"ALTER SCHEMA {old} RENAME TO {mid}")
     _, alloc_ts = compete(writer, observer, log, f"CREATE SCHEMA race_{p}")
 
-    w("BEGIN DETERMINISTIC TRANSACTION")
+    w("BEGIN DECLARATIVE TRANSACTION")
     w(f"ALTER SCHEMA {mid} RENAME TO {final}")
     w(f"INSERT INTO {final}.dst SELECT n FROM {final}.src")
     _, ts = compete(writer, observer, log, f"UPDATE {mid}.src SET n = 2 WHERE n = 0")
@@ -287,7 +285,7 @@ def run(writer, observer, raw, log, show_plan):
     observer.execute(f"INSERT INTO {final}.src VALUES (3)")
     verify_data(observer, p, final, [1, 2, 3], [1, 2])
 
-    w("BEGIN DETERMINISTIC TRANSACTION")
+    w("BEGIN DECLARATIVE TRANSACTION")
     w(f"ALTER SCHEMA {final} RENAME TO {claim}")
     w(f"INSERT INTO {claim}.dst VALUES (99)")
     claimant_id, _ = compete(

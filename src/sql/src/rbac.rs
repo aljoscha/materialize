@@ -1759,7 +1759,7 @@ fn generate_rbac_requirements(
         | Plan::ResetVariable(plan::ResetVariablePlan { name: _ })
         | Plan::SetTransaction(plan::SetTransactionPlan { local: _, modes: _ })
         | Plan::StartTransaction(plan::StartTransactionPlan {
-            deterministic: _,
+            declarative: _,
             access: _,
             isolation_level: _,
         })

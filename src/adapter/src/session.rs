@@ -407,7 +407,7 @@ impl Session {
                     completion_owner: TransactionCompletionOwner::Coordinator,
                     pcx: self.new_pcx(wall_time),
                     ops: TransactionOps::None,
-                    deterministic: None,
+                    declarative: None,
                     pending_ddl_inspections: Vec::new(),
                     contains_explain: false,
                     access,
@@ -443,7 +443,7 @@ impl Session {
                 completion_owner: TransactionCompletionOwner::Session,
                 pcx: self.new_pcx(wall_time),
                 ops: TransactionOps::None,
-                deterministic: None,
+                declarative: None,
                 pending_ddl_inspections: Vec::new(),
                 contains_explain: false,
                 access: None,
@@ -724,7 +724,7 @@ impl Session {
                 pending_ddl_inspections: _,
                 contains_explain: _,
                 completion_owner: _,
-                deterministic: None,
+                declarative: None,
             }) => Some(determination.clone()),
             _ => None,
         }
@@ -748,7 +748,7 @@ impl Session {
                 pending_ddl_inspections: _,
                 contains_explain: _,
                 completion_owner: _,
-                deterministic: None,
+                declarative: None,
             })
         )
     }
@@ -1407,7 +1407,7 @@ impl TransactionStatus {
 
     /// Snapshot of the catalog that reflects DDL operations run in this transaction.
     pub fn catalog_state(&self) -> Option<&CatalogState> {
-        if let Some(block) = self.inner().and_then(|txn| txn.deterministic.as_ref()) {
+        if let Some(block) = self.inner().and_then(|txn| txn.declarative.as_ref()) {
             return block.namespace.as_ref();
         }
         match self.inner() {
@@ -1674,7 +1674,7 @@ pub struct Transaction {
     pub pcx: PlanContext,
     /// Transaction operations.
     pub ops: TransactionOps,
-    pub(crate) deterministic: Option<Box<DeterministicBlock>>,
+    pub(crate) declarative: Option<Box<DeclarativeBlock>>,
     /// Catalog results and descriptions awaiting a possible transition to DDL mode.
     pending_ddl_inspections: Vec<DdlInspection>,
     contains_explain: bool,
@@ -1688,10 +1688,10 @@ pub struct Transaction {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DeterministicBlock {
+pub(crate) struct DeclarativeBlock {
     pub renames: crate::catalog::command::SchemaRenameProgram,
     pub namespace: Option<CatalogState>,
-    pub mutations: Vec<crate::frontend_deterministic::DeterministicMutation>,
+    pub mutations: Vec<crate::frontend_declarative::DeclarativeMutation>,
     // The plan and its authorization were obtained from this catalog revision.
     pub catalog_revision: Option<u64>,
 }

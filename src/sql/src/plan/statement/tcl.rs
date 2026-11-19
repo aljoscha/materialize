@@ -33,14 +33,11 @@ pub fn describe_start_transaction(
 
 pub fn plan_start_transaction(
     _: &StatementContext,
-    StartTransactionStatement {
-        deterministic,
-        modes,
-    }: StartTransactionStatement,
+    StartTransactionStatement { declarative, modes }: StartTransactionStatement,
 ) -> Result<Plan, PlanError> {
     let (access, isolation_level) = verify_transaction_modes(modes)?;
     Ok(Plan::StartTransaction(StartTransactionPlan {
-        deterministic,
+        declarative,
         access,
         isolation_level,
     }))

@@ -54,8 +54,8 @@ use crate::telemetry::{EventDetails, SegmentClientExt};
 use crate::util::ResultExt;
 use crate::{AdapterError, ExecuteContext, catalog, flags};
 
-mod deterministic;
-pub use deterministic::MultiTableWriteAttempt;
+mod declarative;
+pub use declarative::MultiTableWriteAttempt;
 
 #[derive(Debug)]
 pub struct PendingSourceStatement {

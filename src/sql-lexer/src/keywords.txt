@@ -142,6 +142,7 @@ Debug
 Debugging
 Dec
 Decimal
+Declarative
 Declare
 Decoding
 Decorrelated
@@ -154,7 +155,6 @@ Delimiter
 Delta
 Desc
 Details
-Deterministic
 Direction
 Discard
 Disk

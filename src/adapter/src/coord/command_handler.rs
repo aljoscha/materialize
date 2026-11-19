@@ -1283,7 +1283,7 @@ impl Coordinator {
             .session()
             .transaction()
             .inner()
-            .is_some_and(|txn| txn.deterministic.is_some())
+            .is_some_and(|txn| txn.declarative.is_some())
         {
             if crate::catalog::command::SchemaRenameProgram::supports(&stmt) {
                 let meta = ctx.session().meta();
@@ -1291,7 +1291,7 @@ impl Coordinator {
                     .session_mut()
                     .transaction_mut()
                     .inner_mut()
-                    .and_then(|txn| txn.deterministic.as_mut())
+                    .and_then(|txn| txn.declarative.as_mut())
                     .expect("checked above");
                 let staged = block.renames.push(stmt, params, meta);
                 if staged.is_ok() {
@@ -1306,7 +1306,7 @@ impl Coordinator {
             }
             if !matches!(&*stmt, Statement::Commit(_) | Statement::Rollback(_)) {
                 return ctx.retire(Err(AdapterError::Unsupported(
-                    "this statement in a deterministic transaction",
+                    "this statement in a declarative transaction",
                 )));
             }
         }

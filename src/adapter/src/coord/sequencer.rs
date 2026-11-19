@@ -313,14 +313,14 @@ impl Coordinator {
                     ctx.retire(result);
                 }
                 Plan::StartTransaction(plan) => {
-                    if plan.deterministic
+                    if plan.declarative
                         && (matches!(
                             ctx.session().transaction(),
                             TransactionStatus::InTransaction(_)
                         ) || ctx.session().transaction().contains_ops())
                     {
                         return ctx.retire(Err(AdapterError::Unsupported(
-                            "starting a deterministic block inside another transaction",
+                            "starting a declarative block inside another transaction",
                         )));
                     }
                     if matches!(
@@ -335,13 +335,13 @@ impl Coordinator {
                         plan.access,
                         plan.isolation_level,
                     );
-                    if result.is_ok() && plan.deterministic {
+                    if result.is_ok() && plan.declarative {
                         ctx.session_mut().require_coordinator_completion();
                         ctx.session_mut()
                             .transaction_mut()
                             .inner_mut()
                             .expect("started transaction")
-                            .deterministic = Some(Default::default());
+                            .declarative = Some(Default::default());
                     }
                     ctx.retire(result.map(|_| ExecuteResponse::StartedTransaction))
                 }

@@ -13,9 +13,9 @@ use super::*;
 
 use crate::command::Command;
 use crate::coord::appends::WriteResult;
-use crate::coord::deterministic_packet::{CandidateLayout, table_branches};
+use crate::coord::declarative_packet::{CandidateLayout, table_branches};
 use crate::frontend_read_then_write::CandidateSubscription;
-use crate::session::DeterministicBlock;
+use crate::session::DeclarativeBlock;
 use mz_ore::collections::CollectionExt;
 use mz_repr::{Datum, Diff, Row};
 use mz_sql::plan::{Params, Plan};
@@ -54,7 +54,7 @@ fn decode_candidate(
 ) -> Result<Candidate, AdapterError> {
     let mut catalog = Vec::new();
     let mut notices = BTreeMap::new();
-    let invalid = || AdapterError::internal("deterministic commit", "invalid candidate envelope");
+    let invalid = || AdapterError::internal("declarative commit", "invalid candidate envelope");
     let mut writes: TableWrites = tables
         .iter()
         .map(|(id, gid)| (*id, (*gid, Vec::new())))
@@ -116,7 +116,7 @@ fn decode_candidate(
 }
 
 impl Coordinator {
-    async fn deterministic_write_timestamp(&mut self) -> Timestamp {
+    async fn declarative_write_timestamp(&mut self) -> Timestamp {
         let ts = self
             .get_local_write_ts()
             .await
@@ -125,14 +125,14 @@ impl Coordinator {
         self.catalog()
             .advance_upper(ts)
             .await
-            .unwrap_or_terminate("unable to advance catalog upper for deterministic commit");
+            .unwrap_or_terminate("unable to advance catalog upper for declarative commit");
         ts
     }
 
-    pub(crate) async fn sequence_deterministic_commit(
+    pub(crate) async fn sequence_declarative_commit(
         &mut self,
         txn: PendingTxn,
-        block: DeterministicBlock,
+        block: DeclarativeBlock,
     ) {
         let prepared = async {
             if self.controller.read_only() {
@@ -140,16 +140,16 @@ impl Coordinator {
             }
             if !self.catalog().shares_table_wal().await {
                 return Err(AdapterError::Unsupported(
-                    "deterministic transactions outside a demo WAL environment",
+                    "declarative transactions outside a demo WAL environment",
                 ));
             }
             let session = txn.ctx.session();
             let emit_plan = session.vars().emit_plan_insights_notice();
             let cluster = self.catalog().active_cluster(session)?.id;
             let (tables, mut branches) = table_branches(
-                crate::frontend_deterministic::compile_table_diffs(&block.mutations)?,
+                crate::frontend_declarative::compile_table_diffs(&block.mutations)?,
             );
-            let ts = self.deterministic_write_timestamp().await;
+            let ts = self.declarative_write_timestamp().await;
             let catalog_branch = cluster_mir(&block.renames, self.catalog(), u64::from(ts))?;
             branches.push(catalog_branch);
             // Independently lowered branches each start numbering local Gets
@@ -168,7 +168,7 @@ impl Coordinator {
                 session_uuid: txn.ctx.session().uuid(),
             };
             let (output, rx, notice) = self
-                .install_deterministic_compute(cluster, expr, as_of, emit_plan, owner)
+                .install_declarative_compute(cluster, expr, as_of, emit_plan, owner)
                 .await?;
             if let Some(notice) = notice {
                 txn.ctx
@@ -206,7 +206,7 @@ impl Coordinator {
         );
         let tx = self.internal_cmd_tx.clone();
         let mut txn = txn;
-        mz_ore::task::spawn(|| "deterministic-subscribe-occ", async move {
+        mz_ore::task::spawn(|| "declarative-subscribe-occ", async move {
             let mut state = CandidateSubscription::new(write_ts, max_size);
             for attempt in 0..=max_retries {
                 let read = async {
@@ -215,9 +215,9 @@ impl Coordinator {
                         state.push(rx.recv().await)?;
                     }
                     let rows = state.certified_rows().expect("certified");
-                    tracing::info!(subscribe = %sink_id, attempt = attempt + 1, %write_ts, "deterministic candidate read");
+                    tracing::info!(subscribe = %sink_id, attempt = attempt + 1, %write_ts, "declarative candidate read");
                     if attempt == 0 {
-                        catalog_preparation_test_pause("deterministic_candidate_before_cas").await;
+                        catalog_preparation_test_pause("declarative_candidate_before_cas").await;
                     }
                     Ok::<_, AdapterError>(decode_candidate(&layout, &tables, rows))
                 };
@@ -372,7 +372,7 @@ impl Coordinator {
                 self.catalog()
                     .advance_upper(next_eligible_timestamp)
                     .await
-                    .unwrap_or_terminate("unable to sync catalog for deterministic retry");
+                    .unwrap_or_terminate("unable to sync catalog for declarative retry");
                 match retry.send((
                     txn,
                     WriteResult::TimestampPassed {
@@ -387,7 +387,7 @@ impl Coordinator {
         }
         self.connection_cancel_watches
             .remove(txn.ctx.session().conn_id());
-        self.finish_deterministic_compute(sink_id).await;
+        self.finish_declarative_compute(sink_id).await;
         DdlCommitContext::Transaction(txn).finish(result);
     }
 }
@@ -417,7 +417,7 @@ fn cluster_mir(
     let (Plan::Select(plan), _) = mz_sql::plan::plan(None, &trusted, stmt, &Params::empty(), &ids)?
     else {
         return Err(AdapterError::internal(
-            "deterministic commit",
+            "declarative commit",
             "expected a SELECT plan",
         ));
     };
@@ -427,7 +427,7 @@ fn cluster_mir(
         || plan.finishing.offset != 0
     {
         return Err(AdapterError::internal(
-            "deterministic commit",
+            "declarative commit",
             "unexpected catalog query finishing",
         ));
     }

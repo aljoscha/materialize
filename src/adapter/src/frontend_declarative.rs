@@ -22,7 +22,7 @@ use crate::error::AdapterError;
 use crate::frontend_read_then_write::apply_mutation_to_mir;
 
 #[derive(Debug)]
-pub(crate) struct DeterministicMutation {
+pub(crate) struct DeclarativeMutation {
     id: CatalogItemId,
     generation: GlobalId,
     desc: RelationDesc,
@@ -30,7 +30,7 @@ pub(crate) struct DeterministicMutation {
     mutation: MirRelationExpr,
 }
 
-impl DeterministicMutation {
+impl DeclarativeMutation {
     /// Use the statement's authorized catalog snapshot, including prior staged DDL.
     pub(crate) fn prepare(
         catalog: &Catalog,
@@ -38,12 +38,12 @@ impl DeterministicMutation {
     ) -> Result<Self, AdapterError> {
         if !plan.returning.is_empty() || !plan.finishing.is_trivial(plan.selection.arity()) {
             return Err(AdapterError::Unsupported(
-                "RETURNING or nontrivial finishing in deterministic mutations",
+                "RETURNING or nontrivial finishing in declarative mutations",
             ));
         }
         if plan.selection.contains_unmaterializable() {
             return Err(AdapterError::Unsupported(
-                "unstable expressions in deterministic mutations",
+                "unstable expressions in declarative mutations",
             ));
         }
         let table = |id: CatalogItemId| {
@@ -58,7 +58,7 @@ impl DeterministicMutation {
                 )
             {
                 return Err(AdapterError::Unsupported(
-                    "deterministic mutations on relations other than writable user tables",
+                    "declarative mutations on relations other than writable user tables",
                 ));
             }
             Ok(entry)
@@ -100,7 +100,7 @@ impl DeterministicMutation {
         });
         if unsupported {
             return Err(AdapterError::Unsupported(
-                "this relational operator in deterministic mutations",
+                "this relational operator in declarative mutations",
             ));
         }
         Ok(Self {
@@ -117,9 +117,8 @@ impl DeterministicMutation {
 }
 
 fn validate_scalar(root: &MirScalarExpr) -> Result<(), AdapterError> {
-    let err = || {
-        AdapterError::Unsupported("unstable or unbounded expressions in deterministic mutations")
-    };
+    let err =
+        || AdapterError::Unsupported("unstable or unbounded expressions in declarative mutations");
     let mut todo = vec![root];
     while let Some(expr) = todo.pop() {
         match expr {
@@ -158,7 +157,7 @@ fn changed(id: impl std::fmt::Display) -> AdapterError {
     }
 }
 
-fn validate_generations(statements: &[DeterministicMutation]) -> Result<(), AdapterError> {
+fn validate_generations(statements: &[DeclarativeMutation]) -> Result<(), AdapterError> {
     let mut generations = BTreeMap::new();
     for s in statements {
         for (id, gid) in s
@@ -181,7 +180,7 @@ fn validate_generations(statements: &[DeterministicMutation]) -> Result<(), Adap
 /// Compile cumulative signed writes at a common input timestamp. These collections
 /// can contain retractions and cannot be peeked as ordinary result rows.
 pub(crate) fn compile_table_diffs(
-    mutations: &[DeterministicMutation],
+    mutations: &[DeclarativeMutation],
 ) -> Result<BTreeMap<(CatalogItemId, GlobalId), MirRelationExpr>, AdapterError> {
     validate_generations(mutations)?;
     // Each prefix is a Let binding. Inlining it at every read would double the
@@ -248,7 +247,7 @@ pub(crate) fn compile_table_diffs(
 }
 
 fn check_write_columns(
-    stmt: &DeterministicMutation,
+    stmt: &DeclarativeMutation,
     delta: MirRelationExpr,
 ) -> Result<MirRelationExpr, AdapterError> {
     use mz_expr::func::variadic::ErrorIfNull;
@@ -313,14 +312,14 @@ mod tests {
         *bytes = bytes.saturating_add(u64::try_from(row.byte_len().max(1)).unwrap_or(u64::MAX));
         if *bytes > limit {
             return Err(AdapterError::ResultSize(format!(
-                "deterministic transaction exceeds {limit} bytes"
+                "declarative transaction exceeds {limit} bytes"
             )));
         }
         Ok(())
     }
 
     fn evaluate(
-        statements: &[DeterministicMutation],
+        statements: &[DeclarativeMutation],
         mut snapshot: BTreeMap<GlobalId, Rows>,
         write_ts: Timestamp,
         features: &OptimizerFeatures,
@@ -360,7 +359,7 @@ mod tests {
                     optimize_mir_constant(expr, &mut ctx, true)
                 })?;
             let (rows, _) = result.as_const_mut().ok_or(AdapterError::Unsupported(
-                "deterministic mutation too large or complex for constant evaluation",
+                "declarative mutation too large or complex for constant evaluation",
             ))?;
             let rows = rows.as_mut().map_err(|e| e.clone())?;
             consolidate(rows);
@@ -419,7 +418,7 @@ mod tests {
         let target = ReprRelationType::from(desc.typ());
         let mut nullable = target.clone();
         nullable.column_types[0].nullable = true;
-        let insert = DeterministicMutation {
+        let insert = DeclarativeMutation {
             id,
             generation,
             desc: desc.clone(),
@@ -429,7 +428,7 @@ mod tests {
                 typ: nullable,
             },
         };
-        let delete = DeterministicMutation {
+        let delete = DeclarativeMutation {
             id,
             generation,
             desc: desc.clone(),
@@ -441,7 +440,7 @@ mod tests {
             .remove(&(id, generation))
             .unwrap();
         let result = evaluate(
-            &[DeterministicMutation {
+            &[DeclarativeMutation {
                 id,
                 generation,
                 desc,
@@ -471,7 +470,7 @@ mod tests {
         let typ = ReprRelationType::from(desc.typ());
         let row = |n| Row::pack_slice(&[Datum::Int64(n)]);
         let source = MirRelationExpr::global_get(a, typ.clone());
-        let stmt = |id, generation, mutation: MirRelationExpr| DeterministicMutation {
+        let stmt = |id, generation, mutation: MirRelationExpr| DeclarativeMutation {
             id: CatalogItemId::User(id),
             generation,
             inputs: mutation
@@ -512,7 +511,7 @@ mod tests {
             assert_eq!(output.write_ts, Timestamp::new(target));
             for (&(id, generation), delta) in &compiled {
                 assert_eq!(delta.depends_on(), BTreeSet::from([a]));
-                let output_stmt = DeterministicMutation {
+                let output_stmt = DeclarativeMutation {
                     id,
                     generation,
                     mutation: delta.clone(),

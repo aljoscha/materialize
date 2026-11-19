@@ -1,4 +1,4 @@
-# Record a deterministic transaction in two psql sessions
+# Record a declarative transaction in two psql sessions
 
 Both demos pause the writer after compute has returned its first result but
 before the coordinator can commit it. Change an input in the other session,
@@ -36,7 +36,7 @@ For the video, keep the raw server log off screen. In a small third pane,
 show only the candidate reads:
 
 ```sh
-tail -n 0 -f server.log | grep --line-buffered -oE 'deterministic candidate read subscribe=t[0-9]+ attempt=[0-9]+ write_ts=[0-9]+'
+tail -n 0 -f server.log | grep --line-buffered -oE 'declarative candidate read subscribe=t[0-9]+ attempt=[0-9]+ write_ts=[0-9]+'
 ```
 
 ## Take 1: a new row changes the answer
@@ -51,7 +51,7 @@ CREATE TABLE take1_old.dst (n int);
 INSERT INTO take1_old.src VALUES (1);
 
 SET emit_plan_insights_notice = on;
-BEGIN DETERMINISTIC TRANSACTION;
+BEGIN DECLARATIVE TRANSACTION;
 ALTER SCHEMA take1_old RENAME TO take1_final;
 INSERT INTO take1_final.dst SELECT n FROM take1_final.src;
 ```
@@ -59,7 +59,7 @@ INSERT INTO take1_final.dst SELECT n FROM take1_final.src;
 **B** arms the pause:
 
 ```sql
-SET unsafe_failpoints = 'deterministic_candidate_before_cas=return';
+SET unsafe_failpoints = 'declarative_candidate_before_cas=return';
 ```
 
 **A** commits:
@@ -75,7 +75,7 @@ see the old name and the empty destination. Insert a row and release A:
 ```sql
 SELECT * FROM take1_old.dst;  -- zero rows
 INSERT INTO take1_old.src VALUES (2);
-SET unsafe_failpoints = 'deterministic_candidate_before_cas=off';
+SET unsafe_failpoints = 'declarative_candidate_before_cas=off';
 ```
 
 **A** sees `COMMIT` succeed. The log shows `attempt=2` with the same
@@ -91,13 +91,13 @@ SELECT n FROM take1_final.dst ORDER BY n;  -- 1, 2
 Continue in the same sessions. **B** arms the pause again:
 
 ```sql
-SET unsafe_failpoints = 'deterministic_candidate_before_cas=return';
+SET unsafe_failpoints = 'declarative_candidate_before_cas=return';
 ```
 
 **A** tries to rename the schema and insert a row under its new name:
 
 ```sql
-BEGIN DETERMINISTIC TRANSACTION;
+BEGIN DECLARATIVE TRANSACTION;
 ALTER SCHEMA take1_final RENAME TO take1_claim;
 INSERT INTO take1_claim.dst VALUES (99);
 COMMIT;
@@ -107,7 +107,7 @@ Wait for this transaction's `attempt=1`. **B** takes the name and releases A:
 
 ```sql
 CREATE SCHEMA take1_claim;
-SET unsafe_failpoints = 'deterministic_candidate_before_cas=off';
+SET unsafe_failpoints = 'declarative_candidate_before_cas=off';
 ```
 
 **A** gets `schema 'take1_claim' already exists`. The second read used the

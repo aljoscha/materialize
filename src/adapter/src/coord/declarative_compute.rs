@@ -25,8 +25,8 @@ use crate::optimize::{Optimize, OptimizerConfig, subscribe};
 impl Coordinator {
     /// Subscribes to an authorized MIR output, including a snapshot at `as_of`.
     /// Drain the receiver off the coordinator loop. After success, call
-    /// `finish_deterministic_compute` on every exit, even if the receiver closed.
-    pub(super) async fn install_deterministic_compute(
+    /// `finish_declarative_compute` on every exit, even if the receiver closed.
+    pub(super) async fn install_declarative_compute(
         &mut self,
         cluster_id: ComputeInstanceId,
         output: MirRelationExpr,
@@ -79,7 +79,7 @@ impl Coordinator {
             sink_id,
             true,
             None,
-            format!("deterministic-{sink_id}"),
+            format!("declarative-{sink_id}"),
             config,
             self.optimizer_metrics(),
         );
@@ -92,7 +92,7 @@ impl Coordinator {
         let since = read_holds.least_valid_read();
         if !since.less_equal(&as_of) {
             return Err(AdapterError::Unstructured(anyhow::anyhow!(
-                "deterministic transaction inputs are not readable at {as_of} (since: {since:?})"
+                "declarative transaction inputs are not readable at {as_of} (since: {since:?})"
             )));
         }
         let lir = optimizer.catch_unwind_optimize(mir.resolve(Antichain::from_elem(as_of)))?;
@@ -111,7 +111,7 @@ impl Coordinator {
                 Some(&cluster.name),
             )?;
             Some(format!(
-                "Deterministic transaction physical plan (subscribe {sink_id}):\n{text}"
+                "Declarative transaction physical plan (subscribe {sink_id}):\n{text}"
             ))
         } else {
             None
@@ -139,7 +139,7 @@ impl Coordinator {
         Ok((sink_id, rows, notice))
     }
 
-    pub(super) async fn finish_deterministic_compute(&mut self, sink_id: GlobalId) {
+    pub(super) async fn finish_declarative_compute(&mut self, sink_id: GlobalId) {
         self.drop_internal_subscribe(sink_id).await;
     }
 }

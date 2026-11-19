@@ -1768,9 +1768,9 @@ impl Coordinator {
         let (mut txn, retire_notify) = self.clear_transaction(ctx.session_mut()).await;
         ctx.delay_response_until(retire_notify);
         if let EndTransactionAction::Commit = action
-            && let Some(block) = txn.inner_mut().and_then(|txn| txn.deterministic.take())
+            && let Some(block) = txn.inner_mut().and_then(|txn| txn.declarative.take())
         {
-            self.sequence_deterministic_commit(
+            self.sequence_declarative_commit(
                 PendingTxn {
                     ctx,
                     response,

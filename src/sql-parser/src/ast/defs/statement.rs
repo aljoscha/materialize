@@ -4157,14 +4157,14 @@ impl<T: AstInfo> AstDisplay for ShowCreateClusterStatement<T> {
 /// `{ BEGIN [ TRANSACTION | WORK ] | START TRANSACTION } ...`
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StartTransactionStatement {
-    pub deterministic: bool,
+    pub declarative: bool,
     pub modes: Vec<TransactionMode>,
 }
 
 impl AstDisplay for StartTransactionStatement {
     fn fmt<W: fmt::Write>(&self, f: &mut AstFormatter<W>) {
-        if self.deterministic {
-            f.write_str("BEGIN DETERMINISTIC TRANSACTION");
+        if self.declarative {
+            f.write_str("BEGIN DECLARATIVE TRANSACTION");
         } else {
             f.write_str("START TRANSACTION");
         }
