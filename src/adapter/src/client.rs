@@ -1437,6 +1437,7 @@ impl SessionClient {
                 | Command::InjectAuditEvents { .. }
                 | Command::RegisterConnectionCancelWatch { .. }
                 | Command::CreateInternalSubscribe { .. }
+                | Command::AttemptMultiTableTimestampedWrite(_)
                 | Command::AttemptWrite { .. }
                 | Command::DropInternalSubscribe { .. } => {}
             };

@@ -11,32 +11,78 @@
 
 use super::*;
 
-use crate::coord::deterministic_compute::DeterministicCompute;
+use crate::command::Command;
+use crate::coord::appends::WriteResult;
 use crate::coord::deterministic_packet::{CandidateLayout, table_branches};
-use crate::coord::peek::PeekResponseUnary;
+use crate::frontend_read_then_write::CandidateSubscription;
 use crate::session::DeterministicBlock;
-use futures::StreamExt;
 use mz_ore::collections::CollectionExt;
 use mz_repr::{Diff, Row};
 use mz_sql::plan::{Params, Plan};
+use tokio::sync::oneshot;
+
+type TableWrites = BTreeMap<CatalogItemId, (GlobalId, Vec<(Row, Diff)>)>;
 
 #[derive(Debug)]
-struct Run {
-    txn: PendingTxn,
-    output: DeterministicCompute,
-    layout: CandidateLayout,
-    tables: Vec<(CatalogItemId, GlobalId, Diff)>,
-    renames: catalog::command::SchemaRenameProgram,
-    rbac_enabled: bool,
-    revision: Option<u64>,
-    attempt: usize,
+enum AttemptInput {
+    Certified(Result<Candidate, AdapterError>),
+    Aborted(AdapterError),
 }
 
 #[derive(Debug)]
-pub struct DeterministicReady {
-    run: Run,
+struct Candidate {
+    writes: TableWrites,
+    catalog: catalog::SchemaRenameCandidate,
+    outcomes: Vec<catalog::command::SchemaRenameOutcome>,
+}
+
+#[derive(Debug)]
+pub struct MultiTableWriteAttempt {
+    txn: PendingTxn,
     write_ts: Timestamp,
-    rows: Result<Vec<Row>, AdapterError>,
+    sink_id: GlobalId,
+    revision: Option<u64>,
+    rbac_enabled: bool,
+    candidate: AttemptInput,
+    retry: Option<oneshot::Sender<(PendingTxn, WriteResult)>>,
+}
+
+fn decode_candidate(
+    layout: &CandidateLayout,
+    tables: &[(CatalogItemId, GlobalId)],
+    renames: &catalog::command::SchemaRenameProgram,
+    rows: &[(Row, Diff)],
+) -> Result<Candidate, AdapterError> {
+    let mut catalog_rows = Vec::new();
+    let mut writes: TableWrites = tables
+        .iter()
+        .map(|(id, gid)| (*id, (*gid, Vec::new())))
+        .collect();
+    for (row, diff) in rows {
+        let (branch, payload) = layout.unpack(row)?;
+        if branch == tables.len() {
+            if *diff != Diff::ONE {
+                return Err(AdapterError::internal(
+                    "deterministic commit",
+                    "invalid catalog row multiplicity",
+                ));
+            }
+            catalog_rows.push(payload);
+        } else {
+            writes
+                .get_mut(&tables[branch].0)
+                .expect("target branch")
+                .1
+                .push((payload, *diff));
+        }
+    }
+    let (catalog, outcomes) =
+        catalog::command::cluster_rename::decode_candidate(renames, catalog_rows)?;
+    Ok(Candidate {
+        writes,
+        catalog,
+        outcomes,
+    })
 }
 
 impl Coordinator {
@@ -87,144 +133,168 @@ impl Coordinator {
             let as_of = ts.step_back().ok_or(AdapterError::Unsupported(
                 "writing at the minimum timestamp",
             ))?;
-            let (output, notice) =
-                self.install_deterministic_compute(cluster, expr, as_of, emit_plan)?;
+            let owner = crate::active_compute_sink::ActiveSubscribeOwner::Session {
+                conn_id: txn.ctx.session().conn_id().clone(),
+                session_uuid: txn.ctx.session().uuid(),
+            };
+            let (output, rx, notice) = self
+                .install_deterministic_compute(cluster, expr, as_of, emit_plan, owner)
+                .await?;
             if let Some(notice) = notice {
                 txn.ctx
                     .session()
                     .add_notice(crate::AdapterNotice::PlanInsights(notice));
             }
-            Ok((tables, layout, output, ts))
+            Ok((tables, layout, output, rx, ts))
         }
         .await;
-        match prepared {
-            Ok((tables, layout, output, ts)) => self.read_deterministic_candidate(
-                Run {
-                    txn,
-                    output,
-                    layout,
-                    tables,
-                    renames: block.renames,
-                    rbac_enabled: self.catalog().system_config().enable_rbac_checks(),
-                    revision: block.catalog_revision,
-                    attempt: 1,
-                },
-                ts,
-            ),
-            Err(e) => DdlCommitContext::Transaction(txn).finish(Err(e)),
-        }
-    }
-
-    fn read_deterministic_candidate(&mut self, run: Run, write_ts: Timestamp) {
-        let ts = write_ts.step_back().expect("nonzero write timestamp");
-        let result = self.peek_deterministic_compute(
-            &run.output,
-            ts,
-            None,
-            Some(run.txn.ctx.session().vars().max_query_result_size()),
-        );
-        let mut stream = match result {
-            Ok(stream) => stream,
-            Err(e) => {
-                self.finish_deterministic_compute(run.output);
-                DdlCommitContext::Transaction(run.txn).finish(Err(e));
-                return;
-            }
+        let (tables, layout, sink_id, mut rx, mut write_ts) = match prepared {
+            Ok(p) => p,
+            Err(e) => return DdlCommitContext::Transaction(txn).finish(Err(e)),
         };
+        let max_retries = self.catalog().system_config().max_occ_retries();
+        let max_size = self
+            .catalog()
+            .system_config()
+            .max_result_size()
+            .min(txn.ctx.session().vars().max_query_result_size());
+        let rbac_enabled = self.catalog().system_config().enable_rbac_checks();
+        let timeout = *txn.ctx.session().vars().statement_timeout();
+        let deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        self.connection_cancel_watches.insert(
+            txn.ctx.session().conn_id().clone(),
+            (cancel_tx, cancel_rx.clone()),
+        );
         let tx = self.internal_cmd_tx.clone();
-        mz_ore::task::spawn(|| "deterministic-candidate-read", async move {
-            let rows = async {
-                let mut data = Vec::new();
-                while let Some(response) = stream.next().await {
-                    match response {
-                        PeekResponseUnary::Rows(mut rows) => {
-                            while let Some(row) = rows.next() {
-                                data.push(row.to_owned());
-                            }
-                        }
-                        PeekResponseUnary::Error(e) => return Err(e),
-                        PeekResponseUnary::Canceled => return Err(AdapterError::Canceled),
-                        PeekResponseUnary::DependencyDropped(d) => {
-                            return Err(d.to_concurrent_dependency_drop());
-                        }
+        let mut txn = txn;
+        mz_ore::task::spawn(|| "deterministic-subscribe-occ", async move {
+            let mut state = CandidateSubscription::new(write_ts, max_size);
+            for attempt in 0..=max_retries {
+                let read = async {
+                    state.advance_to(write_ts)?;
+                    while state.certified_rows().is_none() {
+                        state.push(rx.recv().await)?;
                     }
-                }
-                Ok(data)
-            }
-            .await;
-            tracing::info!(arrangement = %run.output.index_id(), attempt = run.attempt, %write_ts, "deterministic candidate read");
-            if run.attempt == 1 {
-                catalog_preparation_test_pause("deterministic_candidate_before_cas").await;
-            }
-            let _ = tx.send(Message::DeterministicCandidateReady(Box::new(
-                DeterministicReady {
-                    run,
+                    let rows = state.certified_rows().expect("certified");
+                    tracing::info!(subscribe = %sink_id, attempt = attempt + 1, %write_ts, "deterministic candidate read");
+                    if attempt == 0 {
+                        catalog_preparation_test_pause("deterministic_candidate_before_cas").await;
+                    }
+                    Ok::<_, AdapterError>(decode_candidate(&layout, &tables, &block.renames, rows))
+                };
+                let timeout = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                let candidate = tokio::select! {
+                    biased;
+                    _ = cancel_rx.changed() => AttemptInput::Aborted(AdapterError::Canceled),
+                    _ = timeout => AttemptInput::Aborted(AdapterError::StatementTimeout),
+                    result = read => match result {
+                        Ok(rows) => AttemptInput::Certified(rows),
+                        Err(error) => AttemptInput::Aborted(error),
+                    }
+                };
+                let (result_tx, result_rx) = oneshot::channel();
+                let request = MultiTableWriteAttempt {
+                    txn,
+                    sink_id,
+                    candidate,
                     write_ts,
-                    rows,
-                },
-            )));
+                    rbac_enabled,
+                    revision: block.catalog_revision,
+                    retry: (attempt < max_retries).then_some(result_tx),
+                };
+                if tx
+                    .send(Message::Command(
+                        OpenTelemetryContext::obtain(),
+                        Command::AttemptMultiTableTimestampedWrite(Box::new(request)),
+                    ))
+                    .is_err()
+                {
+                    return;
+                }
+                // Only a definitive refusal returns the context for another try.
+                let Ok((
+                    context,
+                    WriteResult::TimestampPassed {
+                        next_eligible_timestamp,
+                        ..
+                    },
+                )) = result_rx.await
+                else {
+                    return;
+                };
+                txn = context;
+                write_ts = next_eligible_timestamp;
+            }
         });
     }
 
-    pub(crate) async fn deterministic_candidate_ready(&mut self, ready: DeterministicReady) {
-        let DeterministicReady {
-            mut run,
+    pub(crate) async fn handle_attempt_multi_table_timestamped_write(
+        &mut self,
+        request: MultiTableWriteAttempt,
+    ) {
+        let MultiTableWriteAttempt {
+            mut txn,
             write_ts,
-            rows,
-        } = ready;
+            sink_id,
+            revision,
+            rbac_enabled,
+            candidate,
+            retry,
+        } = request;
+        let certified = matches!(candidate, AttemptInput::Certified(_));
         let result = async {
-            let rows = rows?;
-            let mut catalog_rows = Vec::new();
-            let mut diffs = mz_catalog::durable::TableDiffs::new();
-            let storage = self.catalog().state().storage_metadata();
-            for row in rows {
-                let (branch, payload) = run.layout.unpack(&row)?;
-                if branch == run.tables.len() {
-                    catalog_rows.push(payload);
-                } else {
-                    let (id, generation, sign) = run.tables[branch];
-                    if self
-                        .catalog()
-                        .try_get_entry(&id)
-                        .map(|e| e.latest_global_id())
-                        != Some(generation)
-                    {
-                        return Err(AdapterError::ConcurrentDependencyMutation {
-                            dependency_id: id.to_string(),
-                        });
-                    }
-                    diffs
-                        .entry(storage.get_collection_shard(generation)?)
-                        .or_default()
-                        .push((payload, sign));
-                }
+            if self.controller.read_only() {
+                return Err(AdapterError::ReadOnly);
             }
-            // RBAC mode is a literal in the maintained program. Role and
-            // grant rows are live inputs, but changing the mode invalidates it.
-            if run.rbac_enabled != self.catalog().system_config().enable_rbac_checks() {
+            let conn_id = txn.ctx.session().conn_id().clone();
+            if !self.active_conns.contains_key(&conn_id) {
+                return Err(AdapterError::Canceled);
+            }
+            if rbac_enabled != self.catalog().system_config().enable_rbac_checks() {
                 return Err(AdapterError::DDLTransactionOutcomeChanged);
             }
-            let (candidate, outcomes) = match catalog::command::cluster_rename::decode_candidate(
-                &run.renames,
-                catalog_rows,
-            ) {
-                Ok(candidate) => candidate,
-                Err(_) if self.catalog().current_upper().await > write_ts => {
-                    return Err(AdapterError::ReadThenWriteContention);
-                }
-                Err(e) => return Err(e),
-            };
-            let conn_id = run.txn.ctx.session().conn_id().clone();
-            // A move or privilege change can invalidate the table identities or
-            // permissions used at SQL bind time, even if the cluster read succeeds.
-            if run
-                .revision
-                .is_some_and(|r| r != self.catalog().transient_revision())
+            if self
+                .connection_cancel_watches
+                .get(&conn_id)
+                .is_none_or(|(_, watch)| *watch.borrow())
             {
-                if write_ts < self.catalog().current_upper().await {
+                return Err(AdapterError::Canceled);
+            }
+            let candidate = match candidate {
+                AttemptInput::Aborted(error) => return Err(error),
+                AttemptInput::Certified(Err(_))
+                    if self.catalog().current_upper().await > write_ts =>
+                {
+                    return Err(AdapterError::ReadThenWriteContention);
+                }
+                AttemptInput::Certified(rows) => rows?,
+            };
+            if revision.is_some_and(|r| r != self.catalog().transient_revision()) {
+                if self.catalog().current_upper().await > write_ts {
                     return Err(AdapterError::ReadThenWriteContention);
                 }
                 return Err(AdapterError::DDLTransactionOutcomeChanged);
+            }
+            let storage = self.catalog().state().storage_metadata();
+            let mut diffs = mz_catalog::durable::TableDiffs::new();
+            for (id, (gid, rows)) in candidate.writes {
+                if self
+                    .catalog()
+                    .try_get_entry(&id)
+                    .map(|e| e.latest_global_id())
+                    != Some(gid)
+                {
+                    return Err(AdapterError::ConcurrentDependencyMutation {
+                        dependency_id: id.to_string(),
+                    });
+                }
+                diffs.insert(storage.get_collection_shard(gid)?, rows);
             }
             let conn = self
                 .active_conns
@@ -235,7 +305,7 @@ impl Coordinator {
                 .try_lock_owned()
                 .map_err(|_| AdapterError::ReadThenWriteContention)?;
             let result = Arc::make_mut(&mut self.catalog)
-                .transact_schema_rename_candidate(write_ts, Some(conn), candidate, diffs)
+                .transact_schema_rename_candidate(write_ts, Some(conn), candidate.catalog, diffs)
                 .await;
             self.release_ddl_lock(guard);
             let TransactionResult {
@@ -244,25 +314,43 @@ impl Coordinator {
                 audit_events,
             } = result?;
             self.apply_local_write(write_ts).await;
-            run.txn.ctx.session_mut().apply_write(write_ts);
+            txn.ctx.session_mut().apply_write(write_ts);
             self.track_catalog_audit_events(Some(&conn_id), audit_events);
             let updates = self.builtin_table_update().execute(builtin_table_updates);
-            self.finish_catalog_transaction(Some(&mut run.txn.ctx), updates, catalog_updates)
+            self.finish_catalog_transaction(Some(&mut txn.ctx), updates, catalog_updates)
                 .await;
-            for notice in outcomes.into_iter().flat_map(|outcome| outcome.notices) {
-                run.txn.ctx.session().add_notice(notice.into());
+            for notice in candidate.outcomes.into_iter().flat_map(|o| o.notices) {
+                txn.ctx.session().add_notice(notice.into());
             }
             Ok(())
         }
         .await;
-        if matches!(result, Err(AdapterError::ReadThenWriteContention)) && run.attempt < 32 {
-            run.attempt += 1;
-            let ts = self.deterministic_write_timestamp().await;
-            self.read_deterministic_candidate(run, ts);
-        } else {
-            self.finish_deterministic_compute(run.output);
-            DdlCommitContext::Transaction(run.txn).finish(result);
+        if certified
+            && matches!(result, Err(AdapterError::ReadThenWriteContention))
+            && let Some(retry) = retry
+        {
+            let next_eligible_timestamp = self.catalog().current_upper().await;
+            if next_eligible_timestamp > write_ts {
+                self.catalog()
+                    .advance_upper(next_eligible_timestamp)
+                    .await
+                    .unwrap_or_terminate("unable to sync catalog for deterministic retry");
+                match retry.send((
+                    txn,
+                    WriteResult::TimestampPassed {
+                        target_timestamp: write_ts,
+                        next_eligible_timestamp,
+                    },
+                )) {
+                    Ok(()) => return,
+                    Err((context, _)) => txn = context,
+                }
+            }
         }
+        self.connection_cancel_watches
+            .remove(txn.ctx.session().conn_id());
+        self.finish_deterministic_compute(sink_id).await;
+        DdlCommitContext::Transaction(txn).finish(result);
     }
 }
 

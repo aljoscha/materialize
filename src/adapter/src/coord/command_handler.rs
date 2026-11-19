@@ -615,6 +615,10 @@ impl Coordinator {
                     )
                     .await;
                 }
+                Command::AttemptMultiTableTimestampedWrite(attempt) => {
+                    self.handle_attempt_multi_table_timestamped_write(*attempt)
+                        .await
+                }
                 Command::AttemptWrite {
                     attempt,
                     target_id,

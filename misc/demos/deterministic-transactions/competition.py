@@ -22,7 +22,7 @@ from demo import check, schemas
 
 HOOK = "SET unsafe_failpoints = 'deterministic_candidate_before_cas={}'"
 EVENT = re.compile(
-    rb"deterministic candidate read arrangement=(t[0-9]+) attempt=([0-9]+) write_ts=([0-9]+)\b"
+    rb"deterministic candidate read subscribe=(t[0-9]+) attempt=([0-9]+) write_ts=([0-9]+)\b"
 )
 
 
@@ -43,10 +43,10 @@ def read_event(log, attempt, commit=None):
         match = EVENT.search(line)
         line = b""
         if match:
-            arrangement, n, ts = match.groups()
+            subscription, n, ts = match.groups()
             check("attempt", int(n), attempt)
-            print(f"arrangement={arrangement.decode('ascii')} write_ts={int(ts)}")
-            return arrangement, int(ts)
+            print(f"subscribe={subscription.decode('ascii')} write_ts={int(ts)}")
+            return subscription, int(ts)
     raise TimeoutError(f"No candidate read for attempt {attempt} within 60s")
 
 
@@ -56,7 +56,7 @@ def compete(writer, observer, log, mutation, claimed=None):
         observer.execute(HOOK.format("return"))
         try:
             commit = pool.submit(writer.execute, "COMMIT")
-            arrangement, ts = read_event(log, 1, commit)
+            subscription, ts = read_event(log, 1, commit)
             if commit.done():
                 commit.result()
                 raise RuntimeError("COMMIT did not pause")
@@ -76,14 +76,19 @@ def compete(writer, observer, log, mutation, claimed=None):
             if claimed is not None:
                 raise RuntimeError("COMMIT accepted an occupied destination")
         retry, new_ts = read_event(log, 2)
-        check("retry arrangement", retry, arrangement)
+        check("retry subscription", retry, subscription)
         check("write timestamp advanced", new_ts > ts, True)
         return claimant_id
 
 
-def verify_data(conn, p, schema, values):
+def verify_data(conn, p, schema, src_values, dst_values):
     outside = p + "_outside"
-    for relation in (f"{schema}.src", f"{schema}.dst", f"{schema}.v", f"{outside}.v"):
+    for relation, values in (
+        (f"{schema}.src", src_values),
+        (f"{schema}.dst", dst_values),
+        (f"{schema}.v", dst_values),
+        (f"{outside}.v", dst_values),
+    ):
         rows = conn.execute(f"SELECT n FROM {relation} ORDER BY n").fetchall()
         check(relation, rows, [(n,) for n in values])
     # Read persisted CREATE SQL, not just query results from already-bound IDs.
@@ -108,7 +113,7 @@ def inspect(conn, p, sid, outside_id, claimant_id):
         schemas(conn, p),
         {p + "_final": sid, p + "_outside": outside_id, p + "_claim": claimant_id},
     )
-    verify_data(conn, p, p + "_final", [1, 2])
+    verify_data(conn, p, p + "_final", [1, 2, 3], [1, 2])
 
 
 def run(writer, observer, log, show_plan):
@@ -121,7 +126,9 @@ def run(writer, observer, log, show_plan):
 
         def print_plan(diag):
             message = diag.message_primary or ""
-            if message.startswith("Deterministic transaction physical plan"):
+            if message.startswith(
+                "Deterministic transaction physical plan (subscribe "
+            ):
                 print(message, flush=True)
 
         writer.add_notice_handler(print_plan)
@@ -131,7 +138,7 @@ def run(writer, observer, log, show_plan):
     w(f"CREATE SCHEMA {old}")
     w(f"CREATE SCHEMA {outside}")
     w(f"CREATE TABLE {old}.src (n int)")
-    w(f"INSERT INTO {old}.src VALUES (1)")
+    w(f"INSERT INTO {old}.src VALUES (0), (1)")
     w(f"CREATE TABLE {old}.dst (n int)")
     w(f"CREATE VIEW {old}.v AS SELECT n FROM {old}.dst")
     w(f"CREATE VIEW {outside}.v AS SELECT n FROM {old}.v")
@@ -140,9 +147,11 @@ def run(writer, observer, log, show_plan):
     w("BEGIN DETERMINISTIC TRANSACTION")
     w(f"ALTER SCHEMA {old} RENAME TO {final}")
     w(f"INSERT INTO {final}.dst SELECT n FROM {final}.src")
-    compete(writer, observer, log, f"INSERT INTO {old}.src VALUES (2)")
+    compete(writer, observer, log, f"UPDATE {old}.src SET n = 2 WHERE n = 0")
     check("after retry", schemas(observer, p), {final: ids[old], outside: ids[outside]})
-    verify_data(observer, p, final, [1, 2])
+    verify_data(observer, p, final, [1, 2], [1, 2])
+    observer.execute(f"INSERT INTO {final}.src VALUES (3)")
+    verify_data(observer, p, final, [1, 2, 3], [1, 2])
 
     w("BEGIN DETERMINISTIC TRANSACTION")
     w(f"ALTER SCHEMA {final} RENAME TO {claim}")

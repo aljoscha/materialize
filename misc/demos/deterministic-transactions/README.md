@@ -2,7 +2,7 @@
 
 Both demos pause the writer after compute has returned its first result but
 before the coordinator can commit it. Change an input in the other session,
-then watch the writer retry on the **same arrangement ID**.
+then watch the writer retry on the **same subscription ID**.
 
 ## Start the demo
 
@@ -28,7 +28,7 @@ For the video, keep the raw server log off screen. In a small third pane,
 show only the candidate reads:
 
 ```sh
-tail -n 0 -f server.log | grep --line-buffered -oE 'deterministic candidate read arrangement=t[0-9]+ attempt=[0-9]+ write_ts=[0-9]+'
+tail -n 0 -f server.log | grep --line-buffered -oE 'deterministic candidate read subscribe=t[0-9]+ attempt=[0-9]+ write_ts=[0-9]+'
 ```
 
 ## Take 1: a new row changes the answer
@@ -71,7 +71,7 @@ SET unsafe_failpoints = 'deterministic_candidate_before_cas=off';
 ```
 
 **A** sees `COMMIT` succeed. The log shows `attempt=2` with the same
-arrangement ID. Row 2 arrived after the first read, but both rows were
+subscription ID. Row 2 arrived after the first read, but both rows were
 copied exactly once:
 
 ```sql
@@ -103,7 +103,7 @@ SET unsafe_failpoints = 'deterministic_candidate_before_cas=off';
 ```
 
 **A** gets `schema 'take1_claim' already exists`. The second read used the
-same arrangement as the first read of this transaction. The original name
+same subscription as the first read of this transaction. The original name
 still works, and row 99 was never published:
 
 ```sql

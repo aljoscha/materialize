@@ -7,13 +7,13 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-//! A single arrangement can carry branches with unrelated SQL row types.
+//! A single subscription can carry branches with unrelated SQL row types.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
 
 use mz_expr::{MirRelationExpr, MirScalarExpr};
-use mz_repr::{CatalogItemId, Datum, Diff, GlobalId, ReprRelationType, ReprScalarType, Row};
+use mz_repr::{CatalogItemId, Datum, GlobalId, ReprRelationType, ReprScalarType, Row};
 
 use crate::AdapterError;
 
@@ -83,18 +83,9 @@ impl CandidateLayout {
     }
 }
 
-/// Peeks reject negative multiplicities. Export positive and negative parts
-/// separately so a delete carries the original row with positive multiplicity.
+/// SUBSCRIBE transports signed multiplicities directly.
 pub(super) fn table_branches(
     tables: BTreeMap<(CatalogItemId, GlobalId), MirRelationExpr>,
-) -> (Vec<(CatalogItemId, GlobalId, Diff)>, Vec<MirRelationExpr>) {
-    let mut info = Vec::new();
-    let mut exprs = Vec::new();
-    for ((id, generation), delta) in tables {
-        info.push((id, generation, Diff::ONE));
-        exprs.push(delta.clone().threshold());
-        info.push((id, generation, -Diff::ONE));
-        exprs.push(delta.negate().threshold());
-    }
-    (info, exprs)
+) -> (Vec<(CatalogItemId, GlobalId)>, Vec<MirRelationExpr>) {
+    tables.into_iter().unzip()
 }

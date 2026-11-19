@@ -55,7 +55,7 @@ use crate::util::ResultExt;
 use crate::{AdapterError, ExecuteContext, catalog, flags};
 
 mod deterministic;
-pub use deterministic::DeterministicReady;
+pub use deterministic::MultiTableWriteAttempt;
 
 #[derive(Debug)]
 pub struct PendingSourceStatement {

@@ -182,7 +182,7 @@ pub(crate) fn candidate_sql(
     Ok(sql)
 }
 
-/// Decode complete peek results. Never apply edits from a partial peek.
+/// Decode a complete catalog candidate. Never apply edits from a partial result.
 pub(crate) fn decode_candidate(
     program: &SchemaRenameProgram,
     rows: impl IntoIterator<Item = mz_repr::Row>,

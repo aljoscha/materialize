@@ -399,6 +399,9 @@ pub enum Command {
         tx: oneshot::Sender<Result<mpsc::UnboundedReceiver<PeekResponseUnary>, AdapterError>>,
     },
 
+    /// Publishes one certified catalog and table candidate at its exact WAL timestamp.
+    AttemptMultiTableTimestampedWrite(Box<crate::coord::MultiTableWriteAttempt>),
+
     /// Submits a write attempt. Carries the accumulated diffs to write.
     ///
     /// `write_ts` selects between two modes:
@@ -481,6 +484,7 @@ impl Command {
             | Command::InjectAuditEvents { .. }
             | Command::RegisterConnectionCancelWatch { .. }
             | Command::CreateInternalSubscribe { .. }
+            | Command::AttemptMultiTableTimestampedWrite(_)
             | Command::AttemptWrite { .. }
             | Command::DropInternalSubscribe { .. } => None,
         }
@@ -524,6 +528,7 @@ impl Command {
             | Command::InjectAuditEvents { .. }
             | Command::RegisterConnectionCancelWatch { .. }
             | Command::CreateInternalSubscribe { .. }
+            | Command::AttemptMultiTableTimestampedWrite(_)
             | Command::AttemptWrite { .. }
             | Command::DropInternalSubscribe { .. } => None,
         }

@@ -235,6 +235,7 @@ pub mod catalog_implications;
 mod caught_up;
 mod command_handler;
 mod ddl;
+pub use ddl::MultiTableWriteAttempt;
 pub(crate) mod group_sync;
 mod hydration_history;
 mod indexes;
@@ -374,7 +375,6 @@ pub enum Message {
         pending: ddl::PendingDdlCommit,
         otel_ctx: OpenTelemetryContext,
     },
-    DeterministicCandidateReady(Box<ddl::DeterministicReady>),
     /// Initiates a group commit.
     GroupCommitInitiate(Span, Option<GroupCommitPermit>),
     /// Finalizes an applied group commit.
@@ -522,6 +522,9 @@ impl Message {
                 Command::InjectAuditEvents { .. } => "inject-audit-events",
                 Command::RegisterConnectionCancelWatch { .. } => "register-connection-cancel-watch",
                 Command::CreateInternalSubscribe { .. } => "create-internal-subscribe",
+                Command::AttemptMultiTableTimestampedWrite(_) => {
+                    "attempt-multi-table-timestamped-write"
+                }
                 Command::AttemptWrite { .. } => "attempt-write",
                 Command::DropInternalSubscribe { .. } => "drop-internal-subscribe",
             },
@@ -539,7 +542,6 @@ impl Message {
             } => "controller_ready(internal)",
             Message::PurifiedStatementReady(_) => "purified_statement_ready",
             Message::SourceStatementReady { .. } => "source_statement_ready",
-            Message::DeterministicCandidateReady(_) => "deterministic_candidate_ready",
             Message::DdlCommandsReady { .. } => "ddl_commands_ready",
             Message::GroupCommitInitiate(..) => "group_commit_initiate",
             Message::GroupCommitApplied { .. } => "group_commit_applied",

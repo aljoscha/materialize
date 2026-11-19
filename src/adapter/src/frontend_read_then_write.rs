@@ -1483,7 +1483,8 @@ impl PeekClient {
         write_oracle: Option<Arc<dyn TimestampOracle<Timestamp> + Send + Sync>>,
         attempt_state: &WriteAttemptState,
     ) -> (usize, Result<OccOutcome, AdapterError>) {
-        let mut state = OccState::new();
+        let mut retry_count = 0;
+        let mut state = SubscribeAccumulator::new();
 
         // The timestamp the next attempt writes at, chosen when we are first
         // ready to attempt one and replaced only by a conflict. `None` until
@@ -1523,7 +1524,7 @@ impl PeekClient {
             // returns to this one, raising `retry_count` towards
             // `max_occ_retries`, so neither arm spins.
             let attempt_write = match write_target {
-                Some(target) if state.current_upper.is_some_and(|upper| upper >= target) => true,
+                Some(target) if state.certified(target) => true,
                 _ => {
                     let msg = match subscribe_handle.recv().await {
                         Some(msg) => msg,
@@ -1622,10 +1623,6 @@ impl PeekClient {
                 break result;
             }
 
-            let upper = state
-                .current_upper
-                .expect("a write attempt requires an observed frontier");
-
             let target = match write_target {
                 Some(target) => target,
                 None => {
@@ -1681,7 +1678,7 @@ impl PeekClient {
             // A write at `target` needs every diff below it, which is what
             // progress at or above `target` certifies. Waiting for the next
             // message is bounded by `statement_timeout`, like every wait here.
-            if upper < target {
+            if !state.certified(target) {
                 continue;
             }
 
@@ -1763,14 +1760,14 @@ impl PeekClient {
                     // everything below the new target, and the fold then moves
                     // the diffs in between into the payload.
                     write_target = Some(next_eligible_timestamp);
-                    state.retry_count += 1;
+                    retry_count += 1;
                     // Cancellation wins over the retry budget: if both apply,
                     // the user asked us to stop and that is the more truthful
                     // answer.
                     if let Some(error) = attempt_state.requested_error() {
                         break Err(error);
                     }
-                    if state.retry_count > max_occ_retries {
+                    if retry_count > max_occ_retries {
                         // Contention is a user-visible condition, not an
                         // internal invariant violation, and every attempt was
                         // refused before anything was appended, so the
@@ -1778,7 +1775,7 @@ impl PeekClient {
                         break Err(AdapterError::ReadThenWriteContention);
                     }
                     tracing::debug!(
-                        retry_count = state.retry_count,
+                        retry_count,
                         write_ts = %target,
                         next_eligible_timestamp = %next_eligible_timestamp,
                         "OCC write conflict, retrying"
@@ -1788,7 +1785,7 @@ impl PeekClient {
             }
         };
 
-        (state.retry_count, result)
+        (retry_count, result)
     }
 }
 
@@ -1802,11 +1799,11 @@ struct ValidationResult {
     table_desc: RelationDesc,
 }
 
-/// Accumulated state for the OCC loop in `run_occ_loop`.
+/// Signed subscribe updates split at a monotonically increasing write target.
 ///
 /// Every diff the subscribe ever sent is kept, split at [`Self::split`]. The
 /// split only rises, so each diff crosses it once.
-struct OccState {
+struct SubscribeAccumulator {
     /// Consolidated net diffs from strictly below [`Self::split`].
     payload: Vec<(Row, Diff)>,
     /// Diffs at or above [`Self::split`], consolidated by `(row, timestamp)`.
@@ -1816,8 +1813,7 @@ struct OccState {
     /// Timestamp of the last progress message, which certifies that no diff
     /// will arrive below it.
     current_upper: Option<Timestamp>,
-    retry_count: usize,
-    /// Row bytes held in `payload` and `pending` together, which is what the
+    /// Row bytes (at least one per entry) held in `payload` and `pending` together, which is what the
     /// `max_result_size` check measures. `pending` is consolidated by
     /// `(row, timestamp)`, so a row touched at several timestamps occupies
     /// several entries until a rising split folds them together, and the count
@@ -1825,14 +1821,13 @@ struct OccState {
     byte_size: u64,
 }
 
-impl OccState {
+impl SubscribeAccumulator {
     fn new() -> Self {
         Self {
             payload: Vec::new(),
             pending: Vec::new(),
             split: None,
             current_upper: None,
-            retry_count: 0,
             byte_size: 0,
         }
     }
@@ -1878,11 +1873,11 @@ impl OccState {
         self.byte_size = self
             .payload
             .iter()
-            .map(|(row, _)| u64::cast_from(row.byte_len()))
+            .map(|(row, _)| u64::cast_from(row.byte_len().max(1)))
             .chain(
                 self.pending
                     .iter()
-                    .map(|(row, _, _)| u64::cast_from(row.byte_len())),
+                    .map(|(row, _, _)| u64::cast_from(row.byte_len().max(1))),
             )
             .sum();
     }
@@ -1917,134 +1912,194 @@ enum ProcessResult {
 /// the payload takes in a diff that is concurrent with that write.
 fn process_message(
     response: PeekResponseUnary,
-    state: &mut OccState,
+    state: &mut SubscribeAccumulator,
     as_of: Timestamp,
     fold_target: Timestamp,
     max_result_size: u64,
     table_desc: &RelationDesc,
 ) -> ProcessResult {
-    match response {
-        PeekResponseUnary::Rows(mut rows) => {
-            let mut saw_progress = false;
-
-            while let Some(row) = rows.next() {
-                let mut datums = row.iter();
-
-                // Extract mz_timestamp (SubscribeOutput::Diffs format:
-                // mz_timestamp, mz_progressed, mz_diff, ...data columns...).
-                //
-                // Format drift would mean we'd silently commit an incorrect
-                // write, so surface every shape mismatch as an internal
-                // error rather than panicking the process.
-                let Some(ts_datum) = datums.next() else {
-                    return ProcessResult::Error(AdapterError::Internal(
-                        "missing mz_timestamp in subscribe output".into(),
-                    ));
+    match state.process_response(response, fold_target, max_result_size, Some(table_desc)) {
+        Err(e) => ProcessResult::Error(e),
+        Ok(saw_progress) => {
+            // The initial progress at as_of precedes the snapshot.
+            if saw_progress
+                && state.is_empty()
+                && let Some(upper) = state.current_upper.filter(|upper| *upper > as_of)
+            {
+                return ProcessResult::NoRowsMatched {
+                    empty_as_of: empty_as_of(upper.min(fold_target)),
                 };
-                let ts = match ts_datum {
-                    mz_repr::Datum::Numeric(n) => match n.0.try_into() {
-                        Ok(ts_u64) => Timestamp::new(ts_u64),
-                        Err(_) => {
-                            return ProcessResult::Error(AdapterError::Internal(format!(
-                                "mz_timestamp in subscribe output is not a valid u64: {n}"
-                            )));
-                        }
-                    },
-                    other => {
-                        return ProcessResult::Error(AdapterError::Internal(format!(
-                            "unexpected mz_timestamp datum: {other:?}"
-                        )));
-                    }
-                };
+            }
+            ProcessResult::Continue {
+                ready_to_write: saw_progress && !state.is_empty(),
+            }
+        }
+    }
+}
 
-                let Some(progressed_datum) = datums.next() else {
-                    return ProcessResult::Error(AdapterError::Internal(
-                        "missing mz_progressed in subscribe output".into(),
-                    ));
-                };
-                let is_progress = matches!(progressed_datum, mz_repr::Datum::True);
+impl SubscribeAccumulator {
+    fn certified(&self, target: Timestamp) -> bool {
+        self.current_upper.is_some_and(|upper| upper >= target)
+    }
 
-                if is_progress {
-                    state.current_upper = Some(ts);
-                    saw_progress = true;
+    fn process_response(
+        &mut self,
+        response: PeekResponseUnary,
+        fold_target: Timestamp,
+        max_result_size: u64,
+        table_desc: Option<&RelationDesc>,
+    ) -> Result<bool, AdapterError> {
+        match response {
+            PeekResponseUnary::Rows(mut rows) => {
+                let mut saw_progress = false;
 
-                    // Fold and consolidate incrementally on each progress
-                    // message. This keeps memory bounded by the consolidated
-                    // size and makes the byte_size check below accurate (except
-                    // for rows received between two progress messages, which is
-                    // a small window).
-                    state.fold_below(fold_target);
+                while let Some(row) = rows.next() {
+                    let mut datums = row.iter();
 
-                    // NOTE: The first progress message is always at `as_of`,
-                    // emitted by `ActiveSubscribe::initialize` before any data
-                    // batch, so the accumulation is empty there whatever the
-                    // snapshot holds. Later progress is gated on `batch.upper >
-                    // as_of` (see `crate::active_compute_sink`), so `ts > as_of`
-                    // is what distinguishes a real answer from that first one.
+                    // Extract mz_timestamp (SubscribeOutput::Diffs format:
+                    // mz_timestamp, mz_progressed, mz_diff, ...data columns...).
                     //
-                    // Nothing accumulated at all, so no write is coming and the
-                    // loop would otherwise wait for diffs that will not arrive.
-                    // Our view is complete below `ts` and the payload covers
-                    // below `fold_target`, so the emptiness holds as of one below
-                    // the earlier of the two.
-                    if ts > as_of && state.is_empty() {
-                        return ProcessResult::NoRowsMatched {
-                            empty_as_of: empty_as_of(std::cmp::min(ts, fold_target)),
-                        };
-                    }
-                } else {
-                    let Some(diff_datum) = datums.next() else {
-                        return ProcessResult::Error(AdapterError::Internal(
-                            "missing mz_diff in subscribe output".into(),
+                    // Format drift would mean we'd silently commit an incorrect
+                    // write, so surface every shape mismatch as an internal
+                    // error rather than panicking the process.
+                    let Some(ts_datum) = datums.next() else {
+                        return Err(AdapterError::Internal(
+                            "missing mz_timestamp in subscribe output".into(),
                         ));
                     };
-                    let diff = match diff_datum {
-                        mz_repr::Datum::Int64(d) => Diff::from(d),
+                    let ts = match ts_datum {
+                        mz_repr::Datum::Numeric(n) => match n.0.try_into() {
+                            Ok(ts_u64) => Timestamp::new(ts_u64),
+                            Err(_) => {
+                                return Err(AdapterError::Internal(format!(
+                                    "mz_timestamp in subscribe output is not a valid u64: {n}"
+                                )));
+                            }
+                        },
                         other => {
-                            return ProcessResult::Error(AdapterError::Internal(format!(
-                                "unexpected mz_diff datum while processing read-then-write: {other:?}"
+                            return Err(AdapterError::Internal(format!(
+                                "unexpected mz_timestamp datum: {other:?}"
                             )));
                         }
                     };
 
-                    let data_row = Row::pack(datums);
+                    let Some(progressed_datum) = datums.next() else {
+                        return Err(AdapterError::Internal(
+                            "missing mz_progressed in subscribe output".into(),
+                        ));
+                    };
+                    let is_progress = match progressed_datum {
+                        mz_repr::Datum::True => true,
+                        mz_repr::Datum::False => false,
+                        other => {
+                            return Err(AdapterError::Internal(format!(
+                                "unexpected mz_progressed datum: {other:?}"
+                            )));
+                        }
+                    };
 
-                    // Validate constraints for rows being added (positive diff)
-                    if diff.is_positive() {
-                        for (idx, datum) in data_row.iter().enumerate() {
-                            if let Err(e) = table_desc.constraints_met(idx, &datum) {
-                                return ProcessResult::Error(e.into());
+                    if is_progress {
+                        self.current_upper = Some(ts);
+                        saw_progress = true;
+
+                        // Fold and consolidate incrementally on each progress
+                        // message. This keeps memory bounded by the consolidated
+                        // size and makes the byte_size check below accurate (except
+                        // for rows received between two progress messages, which is
+                        // a small window).
+                        self.fold_below(fold_target);
+                    } else {
+                        let Some(diff_datum) = datums.next() else {
+                            return Err(AdapterError::Internal(
+                                "missing mz_diff in subscribe output".into(),
+                            ));
+                        };
+                        let diff = match diff_datum {
+                            mz_repr::Datum::Int64(d) => Diff::from(d),
+                            other => {
+                                return Err(AdapterError::Internal(format!(
+                                    "unexpected mz_diff datum while processing read-then-write: {other:?}"
+                                )));
+                            }
+                        };
+
+                        let data_row = Row::pack(datums);
+
+                        // Validate constraints for rows being added (positive diff)
+                        if let Some(table_desc) = table_desc.filter(|_| diff.is_positive()) {
+                            for (idx, datum) in data_row.iter().enumerate() {
+                                table_desc.constraints_met(idx, &datum)?;
                             }
                         }
-                    }
 
-                    state.byte_size = state
-                        .byte_size
-                        .saturating_add(u64::cast_from(data_row.byte_len()));
-                    if state.byte_size > max_result_size {
-                        return ProcessResult::Error(AdapterError::ResultSize(format!(
-                            "result exceeds max size of {}",
-                            ByteSize::b(max_result_size)
-                        )));
+                        self.byte_size = self
+                            .byte_size
+                            .saturating_add(u64::cast_from(data_row.byte_len().max(1)));
+                        if self.byte_size > max_result_size {
+                            return Err(AdapterError::ResultSize(format!(
+                                "result exceeds max size of {}",
+                                ByteSize::b(max_result_size)
+                            )));
+                        }
+                        self.pending.push((data_row, ts, diff));
                     }
-                    state.pending.push((data_row, ts, diff));
                 }
-            }
 
-            // The complement of the zero-row exit above: something accumulated
-            // means a write is coming, nothing at all means there is none.
-            let ready_to_write = saw_progress && !state.is_empty();
-            ProcessResult::Continue { ready_to_write }
+                Ok(saw_progress)
+            }
+            PeekResponseUnary::Error(e) => Err(e),
+            // `Unstructured` would misclassify an ordinary concurrent DDL race
+            // as an internal error (XX000).
+            PeekResponseUnary::DependencyDropped(dep) => Err(dep.to_concurrent_dependency_drop()),
+            PeekResponseUnary::Canceled => Err(AdapterError::Canceled),
         }
-        PeekResponseUnary::Error(e) => {
-            ProcessResult::Error(AdapterError::Unstructured(anyhow::anyhow!(e)))
+    }
+}
+
+/// Signed internal result for one subscription. Targets must follow the
+/// subscription's as_of and may only advance. Discard the state on error.
+pub(crate) struct CandidateSubscription {
+    state: SubscribeAccumulator,
+    write_ts: Timestamp,
+    max_result_size: u64,
+}
+
+impl CandidateSubscription {
+    pub(crate) fn new(write_ts: Timestamp, max_result_size: u64) -> Self {
+        Self {
+            state: SubscribeAccumulator::new(),
+            write_ts,
+            max_result_size,
         }
-        // `Unstructured` would misclassify an ordinary concurrent DDL race
-        // as an internal error (XX000).
-        PeekResponseUnary::DependencyDropped(dep) => {
-            ProcessResult::Error(dep.to_concurrent_dependency_drop())
+    }
+
+    /// Feed one receiver result. Clean EOF certifies every target, but does
+    /// not move buffered updates across the target.
+    pub(crate) fn push(&mut self, response: Option<PeekResponseUnary>) -> Result<(), AdapterError> {
+        if let Some(response) = response {
+            self.state
+                .process_response(response, self.write_ts, self.max_result_size, None)?;
+        } else {
+            self.state.current_upper = Some(Timestamp::MAX);
+            self.state.fold_below(self.write_ts);
         }
-        PeekResponseUnary::Canceled => ProcessResult::Error(AdapterError::Canceled),
+        Ok(())
+    }
+
+    pub(crate) fn advance_to(&mut self, write_ts: Timestamp) -> Result<(), AdapterError> {
+        if write_ts < self.write_ts {
+            return Err(AdapterError::Internal("candidate target regressed".into()));
+        }
+        self.state.fold_below(write_ts);
+        self.write_ts = write_ts;
+        Ok(())
+    }
+
+    /// None until the frontier certifies the signed multiset below write_ts.
+    pub(crate) fn certified_rows(&self) -> Option<&[(Row, Diff)]> {
+        self.state
+            .certified(self.write_ts)
+            .then_some(&self.state.payload)
     }
 }
 
@@ -2167,10 +2222,82 @@ mod tests {
         PeekResponseUnary::Rows(Box::new(row.into_row_iter()))
     }
 
+    fn data(ts: u64, value: i64, diff: i64) -> Row {
+        Row::pack_slice(&[
+            Datum::from(numeric::Numeric::from(ts)),
+            Datum::False,
+            Datum::Int64(diff),
+            Datum::Int64(value),
+        ])
+    }
+
+    #[mz_ore::test]
+    fn candidate_retargets_across_buffered_data_and_progress() {
+        let mut sub = CandidateSubscription::new(Timestamp::new(10), 1024);
+        sub.push(Some(progress(9))).unwrap();
+        let rows = vec![
+            data(9, 1, -3),
+            data(9, 1, 1),
+            data(10, 1, 2),
+            data(12, 2, 3),
+        ];
+        sub.push(Some(PeekResponseUnary::Rows(Box::new(
+            rows.into_row_iter(),
+        ))))
+        .unwrap();
+        assert!(sub.certified_rows().is_none());
+        sub.push(Some(progress(12))).unwrap();
+        assert_eq!(
+            sub.certified_rows().unwrap(),
+            &[(row(1), Diff::from(-2i64))]
+        );
+
+        // A retry already covered by progress must not wait for another message.
+        sub.advance_to(Timestamp::new(12)).unwrap();
+        assert!(sub.certified_rows().unwrap().is_empty());
+        sub.advance_to(Timestamp::new(13)).unwrap();
+        assert!(sub.certified_rows().is_none());
+        sub.push(Some(progress(13))).unwrap();
+        assert_eq!(sub.certified_rows().unwrap(), &[(row(2), Diff::from(3i64))]);
+    }
+
+    #[mz_ore::test]
+    fn candidate_end_certifies_without_including_future_data() {
+        let mut sub = CandidateSubscription::new(Timestamp::new(10), 1024);
+        sub.push(Some(PeekResponseUnary::Rows(Box::new(
+            data(10, 1, -1).into_row_iter(),
+        ))))
+        .unwrap();
+        sub.push(None).unwrap();
+        assert!(sub.certified_rows().unwrap().is_empty());
+        sub.advance_to(Timestamp::new(11)).unwrap();
+        assert_eq!(
+            sub.certified_rows().unwrap(),
+            &[(row(1), Diff::from(-1i64))]
+        );
+    }
+
+    #[mz_ore::test]
+    fn candidate_limits_pending_data_and_propagates_stream_errors() {
+        let mut sub = CandidateSubscription::new(Timestamp::new(10), 0);
+        assert!(matches!(
+            sub.push(Some(PeekResponseUnary::Rows(Box::new(
+                data(100, 1, 1).into_row_iter()
+            )))),
+            Err(AdapterError::ResultSize(_))
+        ));
+        let mut sub = CandidateSubscription::new(Timestamp::new(10), 1024);
+        sub.push(Some(progress(10))).unwrap();
+        assert!(matches!(
+            sub.push(Some(PeekResponseUnary::Canceled)),
+            Err(AdapterError::Canceled)
+        ));
+    }
+
     /// Accumulates `(row value, timestamp, diff)` triples the way
     /// `process_message` does, without going through a subscribe.
-    fn accumulate(diffs: impl IntoIterator<Item = (i64, u64, i64)>) -> OccState {
-        let mut state = OccState::new();
+    fn accumulate(diffs: impl IntoIterator<Item = (i64, u64, i64)>) -> SubscribeAccumulator {
+        let mut state = SubscribeAccumulator::new();
         for (value, ts, diff) in diffs {
             state
                 .pending
@@ -2279,7 +2406,7 @@ mod tests {
         // First pass, where the fold target is `as_of + 1`. The answer holds at
         // `as_of`, which the caller linearized before the subscribe started, so
         // it costs no wait however far out the frontier is.
-        let mut state = OccState::new();
+        let mut state = SubscribeAccumulator::new();
         match process_message(
             progress(u64::MAX / 2),
             &mut state,
@@ -2296,7 +2423,7 @@ mod tests {
         // holds at one below the target, the same timestamp a write there would
         // have been read at.
         let fold_target = Timestamp::new(20);
-        let mut state = OccState::new();
+        let mut state = SubscribeAccumulator::new();
         match process_message(
             progress(u64::MAX / 2),
             &mut state,
@@ -2313,7 +2440,7 @@ mod tests {
 
         // A frontier below the target certifies less, so the answer holds one
         // below the frontier instead.
-        let mut state = OccState::new();
+        let mut state = SubscribeAccumulator::new();
         match process_message(
             progress(15),
             &mut state,
