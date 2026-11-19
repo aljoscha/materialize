@@ -221,7 +221,14 @@ async fn demo_wal_recovery_and_fencing() {
     ));
     assert_eq!(wal.current_upper().await, ts);
     let mut txn = first.transaction().await.unwrap();
-    txn.set_setting("mixed".into(), Some("one".into())).unwrap();
+    let catalog_row = r#"{"kind":"Setting","key":{"name":"mixed"},"value":{"value":"one"}}"#
+        .parse::<mz_repr::adt::jsonb::Jsonb>()
+        .unwrap()
+        .into_row();
+    assert!(
+        txn.stage_catalog_diffs(vec![(catalog_row, Diff::ONE)])
+            .unwrap()
+    );
     let _ = txn.get_and_commit_op_updates();
     let upper = txn
         .commit_with_table_diffs(

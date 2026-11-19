@@ -32,6 +32,13 @@ use crate::TimestampExplanation;
 /// severe enough to warrant failing a query entirely.
 #[derive(Clone, Debug)]
 pub enum AdapterNotice {
+    /// A client diagnostic selected by a trusted transaction dataflow.
+    DataflowDiagnostic {
+        code: SqlState,
+        message: String,
+        detail: Option<String>,
+        hint: Option<String>,
+    },
     DatabaseAlreadyExists {
         name: String,
     },
@@ -227,7 +234,9 @@ impl AdapterNotice {
             AdapterNotice::VarDefaultUpdated { .. } => Severity::Notice,
             AdapterNotice::StartupOnlyVarUpdated { .. } => Severity::Warning,
             AdapterNotice::Welcome(_) => Severity::Notice,
-            AdapterNotice::PlanInsights(_) => Severity::Notice,
+            AdapterNotice::DataflowDiagnostic { .. } | AdapterNotice::PlanInsights(_) => {
+                Severity::Notice
+            }
             AdapterNotice::ExecutionTime(_) => Severity::Notice,
             AdapterNotice::IntrospectionClusterUsage => Severity::Warning,
             AdapterNotice::AutoRouteIntrospectionQueriesUsage => Severity::Warning,
@@ -240,6 +249,7 @@ impl AdapterNotice {
     /// Reports additional details about the notice, if any are available.
     pub fn detail(&self) -> Option<String> {
         match self {
+            Self::DataflowDiagnostic { detail, .. } => detail.clone(),
             AdapterNotice::PlanNotice(notice) => notice.detail(),
             AdapterNotice::ExecutionTime(time) => Some(
                 serde_json::json!({
@@ -277,6 +287,7 @@ impl AdapterNotice {
     /// Reports a hint for the user about how the notice could be addressed.
     pub fn hint(&self) -> Option<String> {
         match self {
+            Self::DataflowDiagnostic { hint, .. } => hint.clone(),
             AdapterNotice::DatabaseDoesNotExist { name: _ } => Some("Create the database with CREATE DATABASE or pick an extant database with SET DATABASE = name. List available databases with SHOW DATABASES.".into()),
             AdapterNotice::ClusterDoesNotExist { name: _ } => Some("Create the cluster with CREATE CLUSTER or pick an extant cluster with SET CLUSTER = name. List available clusters with SHOW CLUSTERS.".into()),
             AdapterNotice::DefaultClusterDoesNotExist {
@@ -373,6 +384,7 @@ impl AdapterNotice {
             AdapterNotice::VarDefaultUpdated { .. } => SqlState::SUCCESSFUL_COMPLETION,
             AdapterNotice::StartupOnlyVarUpdated { .. } => SqlState::WARNING,
             AdapterNotice::Welcome(_) => SqlState::SUCCESSFUL_COMPLETION,
+            AdapterNotice::DataflowDiagnostic { code, .. } => code.clone(),
             AdapterNotice::PlanInsights(_) => SqlState::from_code("MZ001"),
             AdapterNotice::ExecutionTime(_) => SqlState::from_code("MZ012"),
             AdapterNotice::IntrospectionClusterUsage => SqlState::WARNING,
@@ -580,6 +592,7 @@ impl fmt::Display for AdapterNotice {
                 var_name.quoted()
             ),
             AdapterNotice::Welcome(message) => message.fmt(f),
+            AdapterNotice::DataflowDiagnostic { message, .. } => f.write_str(message),
             AdapterNotice::PlanInsights(message) => message.fmt(f),
             AdapterNotice::ExecutionTime(time) => {
                 write!(

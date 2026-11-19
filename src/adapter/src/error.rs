@@ -49,6 +49,13 @@ use crate::peek_client::CollectionLookupError;
 /// Errors that can occur in the coordinator.
 #[derive(Debug)]
 pub enum AdapterError {
+    /// A client diagnostic selected by a trusted transaction dataflow.
+    DataflowDiagnostic {
+        code: SqlState,
+        message: String,
+        detail: Option<String>,
+        hint: Option<String>,
+    },
     /// A `SUBSCRIBE` was requested whose `UP TO` bound precedes its `as_of` timestamp
     AbsurdSubscribeBounds {
         as_of: mz_repr::Timestamp,
@@ -572,6 +579,7 @@ impl AdapterError {
     /// Reports additional details about the error, if any are available.
     pub fn detail(&self) -> Option<String> {
         match self {
+            Self::DataflowDiagnostic { detail, .. } => detail.clone(),
             AdapterError::AmbiguousSystemColumnReference => {
                 Some("This is a current limitation in Materialize".into())
             }
@@ -816,6 +824,7 @@ impl AdapterError {
     /// Reports a hint for the user about how the error could be fixed.
     pub fn hint(&self) -> Option<String> {
         match self {
+            Self::DataflowDiagnostic { hint, .. } => hint.clone(),
             AdapterError::AmbiguousSystemColumnReference => Some(
                 "Rewrite the view to refer to all columns by name. Expand all wildcards and \
                 convert all NATURAL JOINs to USING joins."
@@ -1107,6 +1116,7 @@ impl AdapterError {
             AdapterError::UnrecognizedConfigurationParam(_) => SqlState::UNDEFINED_OBJECT,
             AdapterError::Unsupported(..) => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::UnavailableFeature { .. } => SqlState::FEATURE_NOT_SUPPORTED,
+            AdapterError::DataflowDiagnostic { code, .. } => code.clone(),
             AdapterError::Unstructured(_) => SqlState::INTERNAL_ERROR,
             AdapterError::UntargetedLogRead { .. } => SqlState::FEATURE_NOT_SUPPORTED,
             AdapterError::DDLTransactionOutcomeChanged => SqlState::T_R_SERIALIZATION_FAILURE,
@@ -1521,6 +1531,7 @@ impl fmt::Display for AdapterError {
                 write!(f, "role {} does not exist", name.quoted())
             }
             AdapterError::Unsupported(features) => write!(f, "{} are not supported", features),
+            AdapterError::DataflowDiagnostic { message, .. } => f.write_str(message),
             AdapterError::Unstructured(e) => write!(f, "{}", e.display_with_causes()),
             AdapterError::WriteOnlyTransaction => f.write_str("transaction in write-only mode"),
             AdapterError::UnknownPreparedStatement(name) => {

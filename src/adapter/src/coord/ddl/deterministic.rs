@@ -17,7 +17,7 @@ use crate::coord::deterministic_packet::{CandidateLayout, table_branches};
 use crate::frontend_read_then_write::CandidateSubscription;
 use crate::session::DeterministicBlock;
 use mz_ore::collections::CollectionExt;
-use mz_repr::{Diff, Row};
+use mz_repr::{Datum, Diff, Row};
 use mz_sql::plan::{Params, Plan};
 use tokio::sync::oneshot;
 
@@ -32,8 +32,8 @@ enum AttemptInput {
 #[derive(Debug)]
 struct Candidate {
     writes: TableWrites,
-    catalog: catalog::SchemaRenameCandidate,
-    outcomes: Vec<catalog::command::SchemaRenameOutcome>,
+    catalog: Vec<(Row, Diff)>,
+    notices: Vec<crate::AdapterNotice>,
 }
 
 #[derive(Debug)]
@@ -50,10 +50,11 @@ pub struct MultiTableWriteAttempt {
 fn decode_candidate(
     layout: &CandidateLayout,
     tables: &[(CatalogItemId, GlobalId)],
-    renames: &catalog::command::SchemaRenameProgram,
     rows: &[(Row, Diff)],
 ) -> Result<Candidate, AdapterError> {
-    let mut catalog_rows = Vec::new();
+    let mut catalog = Vec::new();
+    let mut notices = BTreeMap::new();
+    let invalid = || AdapterError::internal("deterministic commit", "invalid candidate envelope");
     let mut writes: TableWrites = tables
         .iter()
         .map(|(id, gid)| (*id, (*gid, Vec::new())))
@@ -61,13 +62,44 @@ fn decode_candidate(
     for (row, diff) in rows {
         let (branch, payload) = layout.unpack(row)?;
         if branch == tables.len() {
-            if *diff != Diff::ONE {
-                return Err(AdapterError::internal(
-                    "deterministic commit",
-                    "invalid catalog row multiplicity",
-                ));
+            let [Datum::String(channel), data] = payload.unpack()[..] else {
+                return Err(invalid());
+            };
+            match channel {
+                "catalog" => catalog.push((Row::pack([data]), *diff)),
+                "error" | "notice" if *diff == Diff::ONE => {
+                    let json = mz_repr::adt::jsonb::JsonbRef::from_datum(data).to_serde_json();
+                    let message = json["message"].as_str().ok_or_else(invalid)?.to_owned();
+                    let code = json["code"].as_str().ok_or_else(invalid)?;
+                    let code = tokio_postgres::error::SqlState::from_code(code);
+                    let detail = json["detail"].as_str().map(str::to_owned);
+                    let hint = json["hint"].as_str().map(str::to_owned);
+                    if channel == "error" {
+                        return Err(AdapterError::DataflowDiagnostic {
+                            code,
+                            message,
+                            detail,
+                            hint,
+                        });
+                    }
+                    let step = json["step"].as_i64().ok_or_else(invalid)?;
+                    if notices
+                        .insert(
+                            step,
+                            crate::AdapterNotice::DataflowDiagnostic {
+                                code,
+                                message,
+                                detail,
+                                hint,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(invalid());
+                    }
+                }
+                _ => return Err(invalid()),
             }
-            catalog_rows.push(payload);
         } else {
             writes
                 .get_mut(&tables[branch].0)
@@ -76,12 +108,10 @@ fn decode_candidate(
                 .push((payload, *diff));
         }
     }
-    let (catalog, outcomes) =
-        catalog::command::cluster_rename::decode_candidate(renames, catalog_rows)?;
     Ok(Candidate {
         writes,
         catalog,
-        outcomes,
+        notices: notices.into_values().collect(),
     })
 }
 
@@ -119,7 +149,8 @@ impl Coordinator {
             let (tables, mut branches) = table_branches(
                 crate::frontend_deterministic::compile_table_diffs(&block.mutations)?,
             );
-            let catalog_branch = cluster_mir(&block.renames, self.catalog())?;
+            let ts = self.deterministic_write_timestamp().await;
+            let catalog_branch = cluster_mir(&block.renames, self.catalog(), u64::from(ts))?;
             branches.push(catalog_branch);
             // Independently lowered branches each start numbering local Gets
             // at zero. The optimizer requires unique bindings across the union.
@@ -129,7 +160,6 @@ impl Coordinator {
                     .map_err(crate::optimize::OptimizerError::from)?;
             }
             let (layout, expr) = CandidateLayout::pack(branches);
-            let ts = self.deterministic_write_timestamp().await;
             let as_of = ts.step_back().ok_or(AdapterError::Unsupported(
                 "writing at the minimum timestamp",
             ))?;
@@ -151,6 +181,14 @@ impl Coordinator {
         let (tables, layout, sink_id, mut rx, mut write_ts) = match prepared {
             Ok(p) => p,
             Err(e) => return DdlCommitContext::Transaction(txn).finish(Err(e)),
+        };
+        // Only pre-bound DML depends on the preview namespace and catalog
+        // authorization snapshot. A catalog-only program resolves its names,
+        // checks privileges, and discovers dependencies in the dataflow at T.
+        let binding_revision = if block.mutations.is_empty() {
+            None
+        } else {
+            block.catalog_revision
         };
         let max_retries = self.catalog().system_config().max_occ_retries();
         let max_size = self
@@ -181,7 +219,7 @@ impl Coordinator {
                     if attempt == 0 {
                         catalog_preparation_test_pause("deterministic_candidate_before_cas").await;
                     }
-                    Ok::<_, AdapterError>(decode_candidate(&layout, &tables, &block.renames, rows))
+                    Ok::<_, AdapterError>(decode_candidate(&layout, &tables, rows))
                 };
                 let timeout = async {
                     match deadline {
@@ -205,7 +243,7 @@ impl Coordinator {
                     candidate,
                     write_ts,
                     rbac_enabled,
-                    revision: block.catalog_revision,
+                    revision: binding_revision,
                     retry: (attempt < max_retries).then_some(result_tx),
                 };
                 if tx
@@ -305,7 +343,7 @@ impl Coordinator {
                 .try_lock_owned()
                 .map_err(|_| AdapterError::ReadThenWriteContention)?;
             let result = Arc::make_mut(&mut self.catalog)
-                .transact_schema_rename_candidate(write_ts, Some(conn), candidate.catalog, diffs)
+                .transact_catalog_diffs_candidate(write_ts, Some(conn), candidate.catalog, diffs)
                 .await;
             self.release_ddl_lock(guard);
             let TransactionResult {
@@ -319,8 +357,8 @@ impl Coordinator {
             let updates = self.builtin_table_update().execute(builtin_table_updates);
             self.finish_catalog_transaction(Some(&mut txn.ctx), updates, catalog_updates)
                 .await;
-            for notice in candidate.outcomes.into_iter().flat_map(|o| o.notices) {
-                txn.ctx.session().add_notice(notice.into());
+            for notice in candidate.notices {
+                txn.ctx.session().add_notice(notice);
             }
             Ok(())
         }
@@ -357,6 +395,7 @@ impl Coordinator {
 fn cluster_mir(
     program: &catalog::command::SchemaRenameProgram,
     catalog: &catalog::Catalog,
+    audit_time: u64,
 ) -> Result<mz_expr::MirRelationExpr, AdapterError> {
     if program.is_empty() {
         return Ok(mz_expr::MirRelationExpr::constant(
@@ -364,7 +403,11 @@ fn cluster_mir(
             mz_repr::ReprRelationType::empty(),
         ));
     }
-    let sql = catalog::command::cluster_rename::candidate_sql(program, catalog.system_config())?;
+    let sql = catalog::command::cluster_rename::candidate_sql(
+        program,
+        catalog.system_config(),
+        audit_time,
+    )?;
     let trusted = catalog.for_system_session();
     let ast = mz_sql::parse::parse(&sql)
         .map_err(AdapterError::from)?
@@ -389,5 +432,21 @@ fn cluster_mir(
         ));
     }
     expr = expr.project(plan.finishing.project);
-    Ok(expr)
+    // SQL names the sign as a column. Turn it into differential multiplicity
+    // inside the dataflow, before any updates reach the subscription.
+    let mut ids = mz_ore::id_gen::IdGen::default();
+    mz_transform::normalize_lets::renumber_bindings(&mut expr, &mut ids)
+        .map_err(crate::optimize::OptimizerError::from)?;
+    expr.let_in(&mut ids, |_, get| {
+        use mz_expr::MirScalarExpr;
+        let branch = |sign| {
+            get.clone()
+                .filter([MirScalarExpr::column(1).call_binary(
+                    MirScalarExpr::literal_ok(Datum::Int64(sign), mz_repr::ReprScalarType::Int64),
+                    mz_expr::func::Eq,
+                )])
+                .project(vec![0, 2])
+        };
+        Ok(branch(1).union(branch(-1).negate()))
+    })
 }

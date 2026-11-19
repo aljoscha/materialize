@@ -18,6 +18,7 @@
 
 use std::fmt::Write;
 
+use mz_ore::str::StrExt;
 use mz_sql::ast::display::{AstDisplay, escaped_string_literal as lit};
 use mz_sql::ast::{Statement, UnresolvedObjectName};
 use mz_sql::session::metadata::SessionMetadata;
@@ -26,20 +27,27 @@ use mz_sql::session::vars::SystemVars;
 use super::SchemaRenameProgram;
 use crate::AdapterError;
 
-/// Result columns: (step int8, tag text, id text, before text, after text,
-/// detail text). Successful programs return consolidated schema/item edits,
-/// one audit per move (detail = database), and a notice per no-op (detail =
-/// SQL spelling). Errors suppress all edits, audits, and notices. Step numbers
-/// are zero-based and edits have step -1. Rows have no implicit ordering.
+/// Return (channel text, sign int8, payload jsonb). Catalog payloads are
+/// complete durable before/after images. Diagnostic payloads include a
+/// zero-based step. The first error suppresses all other outputs.
 pub(crate) fn candidate_sql(
     program: &SchemaRenameProgram,
     vars: &SystemVars,
+    audit_time: u64,
 ) -> Result<String, AdapterError> {
+    let audit_time = vars
+        .unsafe_mock_audit_event_timestamp()
+        .map(u64::from)
+        .unwrap_or(audit_time);
     let mut sql = String::from(
         "WITH
+        raw_schemas AS (
+            SELECT mz_internal.parse_catalog_id(data->'key'->'id') AS id, data
+            FROM mz_internal.mz_catalog_raw WHERE data->>'kind' = 'Schema'
+        ),
         schemas0 AS (SELECT id, database_id, owner_id, name FROM mz_catalog.mz_schemas),
         items0 AS (
-            SELECT mz_internal.parse_catalog_id(data->'key'->'gid') AS id,
+            SELECT data, mz_internal.parse_catalog_id(data->'key'->'gid') AS id,
                    mz_internal.parse_catalog_id(data->'value'->'schema_id') AS schema_id,
                    data->'value'->'definition'->'V1'->>'create_sql' AS def,
                    data->'value'->>'name' AS item_name,
@@ -53,8 +61,8 @@ pub(crate) fn candidate_sql(
                 jsonb_array_elements_text(mz_internal.parse_catalog_item_references(i.def)->'ids') e(ref)
             WHERE temp_session IS NOT NULL
         ),
-        events0(step, tag, id, old_val, new_val, detail) AS (
-            SELECT 0::int8, ''::text, NULL::text, NULL::text, NULL::text, NULL::text WHERE false
+        events0(step, tag, id, old_val, new_val, detail, username) AS (
+            SELECT 0::int8, ''::text, NULL::text, NULL::text, NULL::text, NULL::text, NULL::text WHERE false
         )",
     );
     for (i, step) in program.steps.iter().enumerate() {
@@ -66,11 +74,16 @@ pub(crate) fn candidate_sql(
         };
         let norm = mz_sql::normalize::unresolved_schema_name(name.clone())?;
         let explicit = norm.database.is_some();
-        let db = lit(norm.database.as_deref().unwrap_or(step.session.database()));
+        let database = norm.database.as_deref().unwrap_or(step.session.database());
+        let db = lit(database);
+        let quoted_db = database.quoted().to_string();
+        let quoted_db = lit(&quoted_db);
+        let username = lit(&step.session.user().name);
         let src = lit(&norm.schema);
         let dest = lit(rename.to_item_name.as_str());
         let spelling = name.to_ast_string_simple();
-        let notice = lit(&spelling);
+        let quoted = spelling.quoted().to_string();
+        let notice = lit(&quoted);
         let missing = rename.if_exists;
         let reserved = crate::catalog::is_reserved_name(rename.to_item_name.as_str());
         let temp = norm.schema == mz_repr::namespaces::MZ_TEMP_SCHEMA;
@@ -152,205 +165,33 @@ pub(crate) fn candidate_sql(
         ),
         events{next} AS (
             SELECT * FROM events{i} UNION ALL
-            SELECT {i}::int8, tag, id, CASE WHEN tag = 'no_create' THEN {db} ELSE {src} END, {dest}, CASE
+            SELECT {i}::int8, tag, id, CASE WHEN tag = 'no_create' THEN {quoted_db} ELSE {src} END, {dest}, CASE
                 WHEN tag = 'no_create' THEN (SELECT name FROM mz_catalog.mz_roles WHERE id = '{current}')
-                WHEN tag = 'notice' THEN {notice} WHEN tag = 'role_dropped' THEN missing_role ELSE {db} END
+                WHEN tag = 'notice' THEN {notice} WHEN tag = 'role_dropped' THEN missing_role ELSE {db} END, {username}
             FROM decision{i} UNION ALL
             SELECT {i}::int8, 'ambiguous', r.id, {db} || '.' || {src},
                 coalesce(d.name || '.', '') || coalesce(s.name, 'mz_temp') || '.' || it.item_name,
-                result->>'ambiguous_schema'
+                result->>'ambiguous_schema', {username}
             FROM rewrite{i} r JOIN items{i} it USING (id)
             LEFT JOIN schemas{i} s ON it.schema_id = s.id
             LEFT JOIN mz_catalog.mz_databases d ON d.id = s.database_id
             WHERE result->>'ambiguous_schema' IS NOT NULL
         )").expect("writing to String");
     }
+    use mz_catalog::durable::objects::serialization::proto::audit_log_event_v1::{
+        EventType, ObjectType,
+    };
     let n = program.steps.len();
-    write!(sql, ",
-        failure AS (SELECT * FROM events{n} WHERE tag NOT IN ('notice', 'audit')
-                    ORDER BY step, id LIMIT 1),
-        success AS (
-            SELECT * FROM events{n} UNION ALL
-            SELECT -1::int8, 'schema', s.id, b.name, s.name, NULL FROM schemas{n} s
-                JOIN schemas0 b USING (id) WHERE b.name <> s.name
-            UNION ALL
-            SELECT -1::int8, 'item', it.id, b.def, it.def, NULL FROM items{n} it
-                JOIN items0 b USING (id) WHERE b.def <> it.def
-        )
-        SELECT * FROM failure UNION ALL SELECT * FROM success WHERE NOT EXISTS (SELECT FROM failure)"
-    ).expect("writing to String");
+    write!(
+        sql,
+        include_str!("cluster_rename_result.sql"),
+        n = n,
+        audit_time = audit_time,
+        alter = EventType::Alter as i32,
+        schema = ObjectType::Schema as i32
+    )
+    .expect("writing to String");
     Ok(sql)
-}
-
-/// Decode a complete catalog candidate. Never apply edits from a partial result.
-pub(crate) fn decode_candidate(
-    program: &SchemaRenameProgram,
-    rows: impl IntoIterator<Item = mz_repr::Row>,
-) -> Result<
-    (
-        crate::catalog::SchemaRenameCandidate,
-        Vec<super::SchemaRenameOutcome>,
-    ),
-    AdapterError,
-> {
-    use std::collections::BTreeMap;
-
-    use mz_catalog::memory::error::{AmbiguousRename, Error, ErrorKind};
-    use mz_repr::Datum;
-    use mz_sql::catalog::{CatalogError, ErrorMessageObjectDescription, ObjectType};
-    use mz_sql::plan::{PlanError, PlanNotice};
-    use mz_sql::rbac::UnauthorizedError;
-
-    let invalid = || AdapterError::internal("schema rename candidate", "invalid result rows");
-    let mut candidate = crate::catalog::SchemaRenameCandidate::default();
-    let mut outcomes = BTreeMap::new();
-    for row in rows {
-        let cols = row.unpack();
-        let [
-            Datum::Int64(step),
-            Datum::String(tag),
-            id,
-            Datum::String(before),
-            Datum::String(after),
-            detail,
-        ] = cols.as_slice()
-        else {
-            return Err(invalid());
-        };
-        let string = |d| match d {
-            Datum::String(s) => Ok(s),
-            _ => Err(invalid()),
-        };
-        if *step == -1 {
-            let id = string(*id)?;
-            let edit = ((*before).to_owned(), (*after).to_owned());
-            let previous = match *tag {
-                "schema" => candidate
-                    .schemas
-                    .insert(id.parse().map_err(|_| invalid())?, edit),
-                "item" => candidate
-                    .items
-                    .insert(id.parse().map_err(|_| invalid())?, edit),
-                _ => return Err(invalid()),
-            };
-            if previous.is_some() {
-                return Err(invalid());
-            }
-            continue;
-        }
-        let i = usize::try_from(*step).map_err(|_| invalid())?;
-        if i >= program.steps.len() {
-            return Err(invalid());
-        }
-        let detail = string(*detail)?;
-        let (audit, notices) = match *tag {
-            "audit" => {
-                let id = string(*id)?
-                    .parse::<mz_sql::names::SchemaId>()
-                    .map_err(|_| invalid())?;
-                (
-                    Some(mz_audit_log::RenameSchemaV1 {
-                        id: id.to_string(),
-                        old_name: (*before).into(),
-                        new_name: (*after).into(),
-                        database_name: Some(detail.into()),
-                    }),
-                    Vec::new(),
-                )
-            }
-            "notice" => (
-                None,
-                vec![PlanNotice::ObjectDoesNotExist {
-                    name: detail.into(),
-                    object_type: ObjectType::Schema,
-                }],
-            ),
-            "unknown_database" => {
-                return Err(
-                    PlanError::Catalog(CatalogError::UnknownDatabase(detail.into())).into(),
-                );
-            }
-            "unknown_schema" => {
-                return Err(
-                    PlanError::Catalog(CatalogError::UnknownSchema((*before).into())).into(),
-                );
-            }
-            "occupied" => {
-                return Err(
-                    PlanError::Catalog(CatalogError::SchemaAlreadyExists((*after).into())).into(),
-                );
-            }
-            "reserved" => {
-                return Err(Error::new(ErrorKind::ReservedSchemaName((*after).into())).into());
-            }
-            "system_schema" => {
-                return Err(PlanError::NeverSupported {
-                    feature: format!("renaming the {before} schema"),
-                    documentation_link: None,
-                    details: None,
-                }
-                .into());
-            }
-            "ambient_temp" => {
-                return Err(PlanError::Unstructured(format!(
-                    "cannot rename schemas in the ambient database: {before:?}"
-                ))
-                .into());
-            }
-            "unsupported_temp" => {
-                return Err(AdapterError::Unsupported(
-                    "qualified temporary schema rename",
-                ));
-            }
-            "role_dropped" => {
-                return Err(UnauthorizedError::ConcurrentRoleDrop(
-                    detail.parse().map_err(|_| invalid())?,
-                )
-                .into());
-            }
-            "not_owner" => {
-                return Err(UnauthorizedError::Ownership {
-                    objects: vec![(ObjectType::Schema, format!("{detail}.{before}"))],
-                }
-                .into());
-            }
-            "no_create" => {
-                return Err(UnauthorizedError::Privilege {
-                    object_description: ErrorMessageObjectDescription::Object {
-                        object_type: ObjectType::Database,
-                        object_name: Some((*before).into()),
-                    },
-                    role_name: detail.into(),
-                    privileges: "CREATE".into(),
-                }
-                .into());
-            }
-            "ambiguous" => {
-                return Err(Error::new(ErrorKind::from(AmbiguousRename {
-                    depender: (*after).into(),
-                    dependee: (*before).into(),
-                    message: format!("ambiguous reference to schema named {detail}"),
-                }))
-                .into());
-            }
-            _ => return Err(invalid()),
-        };
-        if outcomes.insert(i, (audit, notices)).is_some() {
-            return Err(invalid());
-        }
-    }
-    if outcomes.len() != program.steps.len() {
-        return Err(invalid());
-    }
-    let outcomes = outcomes
-        .into_values()
-        .map(|(audit, notices)| {
-            let changed = audit.is_some();
-            candidate.audits.extend(audit);
-            super::SchemaRenameOutcome { changed, notices }
-        })
-        .collect();
-    Ok((candidate, outcomes))
 }
 
 #[cfg(test)]
@@ -384,7 +225,7 @@ mod tests {
                     .push(Arc::new(stmt.ast), Params::empty(), session.meta())
                     .unwrap();
             }
-            let sql = candidate_sql(&program, catalog.system_config()).unwrap();
+            let sql = candidate_sql(&program, catalog.system_config(), 1000).unwrap();
             let stmts = parse_statements(&sql).unwrap();
             let [stmt] = &stmts[..] else {
                 panic!("expected one candidate query");

@@ -4,6 +4,14 @@ Both demos pause the writer after compute has returned its first result but
 before the coordinator can commit it. Change an input in the other session,
 then watch the writer retry on the **same subscription ID**.
 
+The subscription carries signed table rows and complete signed records in the
+format of `mz_internal.mz_catalog_raw`. A rename retracts the old schema and
+item records and inserts their replacements. The dataflow also produces the
+audit event and the audit ID allocator change. Nothing is written on receipt:
+the adapter waits for progress, then submits the consolidated records to the
+shared WAL at one timestamp. If another writer wins, the same subscription
+updates the proposed write. Errors and notices are separate from durable rows.
+
 ## Start the demo
 
 From the repository root, point `MZDEV_POSTGRES` at your usual **throwaway**

@@ -80,6 +80,8 @@ use crate::durable::{
 };
 use crate::memory::objects::{StateDiff, StateUpdate, StateUpdateKind};
 
+mod candidate;
+
 type Timestamp = u64;
 
 #[derive(Debug, PartialEq)]
