@@ -10,7 +10,7 @@
 //! A cache of the txn shard contents.
 
 use std::cmp::{max, min};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Debug;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
@@ -560,6 +560,7 @@ impl<T: Timestamp + Lattice + TotalOrder + StepForward + Codec64 + Sync> TxnsCac
                 .insert(idx, (data_id, batch, ts.clone()));
             assert_eq!(prev, None);
             let times = self.datas.get_mut(&data_id).expect("data is initialized");
+            assert!(times.unapplied_ids.insert(idx));
             // Sanity check that shard is registered.
             assert_eq!(times.last_reg().forget_ts, None);
 
@@ -584,6 +585,8 @@ impl<T: Timestamp + Lattice + TotalOrder + StepForward + Codec64 + Sync> TxnsCac
                 .unapplied_batches
                 .remove(&idx)
                 .expect("invariant violation: batch index should exist");
+            let times = self.datas.get_mut(&data_id).expect("data is initialized");
+            assert!(times.unapplied_ids.remove(&idx));
             mz_ore::soft_assert_eq_no_log!(data_id, prev.0);
             mz_ore::soft_assert_eq_no_log!(batch, prev.1);
             // Insertion timestamp should be less equal retraction timestamp.
@@ -618,10 +621,12 @@ impl<T: Timestamp + Lattice + TotalOrder + StepForward + Codec64 + Sync> TxnsCac
 
         debug!("cache compact {:.9} times={:?}", data_id.to_string(), times);
 
-        if let Some(unapplied_write_ts) = self
-            .unapplied_batches
-            .first_key_value()
-            .map(|(_, (_, _, ts))| ts)
+        // Another shard can still have an unretired batch at the same time.
+        // Its eventual retraction will not revisit this shard for compaction.
+        if let Some(unapplied_write_ts) = times
+            .unapplied_ids
+            .first()
+            .map(|id| &self.unapplied_batches[id].2)
         {
             debug!(
                 "cache compact {:.9} unapplied_write_ts={:?}",
@@ -999,6 +1004,8 @@ pub(crate) struct DataTimes<T> {
     pub(crate) registered: VecDeque<DataRegistered<T>>,
     /// Invariant: These are in increasing order.
     pub(crate) writes: VecDeque<T>,
+    /// Keys into the global unapplied batch index, in commit order.
+    unapplied_ids: BTreeSet<usize>,
 }
 
 impl<T> Default for DataTimes<T> {
@@ -1006,6 +1013,7 @@ impl<T> Default for DataTimes<T> {
         Self {
             registered: Default::default(),
             writes: Default::default(),
+            unapplied_ids: Default::default(),
         }
     }
 }

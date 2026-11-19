@@ -484,8 +484,9 @@ impl GroupCommitter {
         op: impl FnOnce(Timestamp, Timestamp) -> oneshot::Receiver<Result<(), StorageError>>,
     ) -> TxnsWriteAttempt {
         let catalog_upper_start = Instant::now();
-        self.catalog_upper
-            .advance_upper(write_ts.advance_to)
+        let shared = self
+            .catalog_upper
+            .prepare_table_write(write_ts.timestamp)
             .await
             .unwrap_or_terminate("unable to advance catalog upper");
         self.metrics
@@ -508,6 +509,9 @@ impl GroupCommitter {
             Err(_recv) => return TxnsWriteAttempt::WorkerGone,
         }
 
+        if shared {
+            self.catalog_upper.materialize_committed_upper().await;
+        }
         let now: Timestamp = (self.now)().into();
         crate::coord::timeline::check_runaway_write_ts(&now, write_ts.timestamp);
 

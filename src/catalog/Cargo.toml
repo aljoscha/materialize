@@ -49,6 +49,7 @@ mz-sql-parser = { path = "../sql-parser" }
 mz-storage-client = { path = "../storage-client" }
 mz-storage-types = { path = "../storage-types" }
 mz-transform = { path = "../transform" }
+mz-txn-wal = { path = "../txn-wal" }
 paste.workspace = true
 prometheus.workspace = true
 rand.workspace = true

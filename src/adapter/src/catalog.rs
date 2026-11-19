@@ -173,6 +173,27 @@ pub struct CatalogUpperHandle {
 }
 
 impl CatalogUpperHandle {
+    /// Establishes the generation barrier for a table write. Leave its timestamp
+    /// open when the catalog shares the WAL: any intervening fence must now
+    /// consume that timestamp or a later one, invalidating the table write.
+    pub(crate) async fn prepare_table_write(
+        &self,
+        ts: mz_repr::Timestamp,
+    ) -> Result<bool, mz_catalog::durable::CatalogError> {
+        let mut catalog = self.storage.lock().await;
+        let shared = catalog.shares_table_wal();
+        catalog
+            .advance_upper(if shared { ts } else { ts.step_forward() })
+            .await?;
+        Ok(shared)
+    }
+
+    pub(crate) async fn materialize_committed_upper(&self) {
+        // Fetching the logical upper also applies committed catalog batches for
+        // physical-shard readers, before moving the timestamp oracle.
+        self.storage.lock().await.current_upper().await;
+    }
+
     /// Advances the durable catalog upper to at least `new_upper`.
     pub async fn advance_upper(
         &self,
@@ -740,6 +761,10 @@ impl Catalog {
         &'a self,
     ) -> MutexGuard<'a, Box<dyn mz_catalog::durable::DurableCatalogState>> {
         self.storage.lock().await
+    }
+
+    pub(crate) async fn shares_table_wal(&self) -> bool {
+        self.storage().await.shares_table_wal()
     }
 
     pub async fn current_upper(&self) -> mz_repr::Timestamp {

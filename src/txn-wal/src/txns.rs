@@ -180,6 +180,49 @@ where
         }
     }
 
+    /// Synchronizes registration state with a recent durable WAL upper.
+    pub async fn current_upper(&mut self) -> T {
+        let upper = self
+            .txns_write
+            .fetch_recent_upper()
+            .await
+            .clone()
+            .into_option()
+            .expect("WAL is open");
+        self.txns_cache.update_ge(&upper).await.clone()
+    }
+
+    /// Opens a writer for an existing participant using its registered schema.
+    /// Pair with compare_and_commit_at at the returned upper so a concurrent
+    /// forget or schema change invalidates the commit.
+    pub async fn attach_participant(&mut self, id: ShardId) -> (T, bool) {
+        let upper = self.current_upper().await;
+        if !self.txns_cache.registered_at_progress(&id, &upper) {
+            return (upper, false);
+        }
+        let writer = self.datas.open_data_write_for_apply(id).await.wrapped;
+        self.datas
+            .data_write_for_commit
+            .insert(id, DataWriteCommit(writer));
+        (upper, true)
+    }
+
+    /// Makes an always-registered participant physically readable through ts,
+    /// including empty WAL progress. Caller must never forget this shard.
+    pub async fn materialize_through(
+        &mut self,
+        writer: &mut WriteHandle<K, V, T, D>,
+        ts: T,
+    ) -> Tidy {
+        let tidy = self.apply_le(&ts).await;
+        assert!(
+            self.txns_cache
+                .registered_at_progress(&writer.shard_id(), &self.txns_cache.progress_exclusive)
+        );
+        crate::empty_caa(|| "materialize registered shard", writer, ts).await;
+        tidy
+    }
+
     /// Returns a new, empty transaction that can involve the data shards
     /// registered with this handle.
     pub fn begin(&self) -> Txn<K, V, T, D> {

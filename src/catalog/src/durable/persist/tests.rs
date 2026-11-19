@@ -148,3 +148,155 @@ async fn test_version_step() {
         "writable open + bootstrap should increment the catalog shard version"
     );
 }
+
+#[mz_ore::test(tokio::test)]
+async fn demo_wal_recovery_and_fencing() {
+    use super::*;
+    use crate::durable::objects::serialization::proto;
+    use mz_ore::metrics::MetricsRegistry;
+    use mz_repr::{Datum, RelationDesc, Row, SqlScalarType};
+
+    let mut cache = PersistClientCache::new_no_metrics();
+    cache.cfg.configs = Arc::new(mz_txn_wal::all_dyncfgs((*cache.cfg.configs).clone()));
+    let client = cache.open(PersistLocation::new_in_mem()).await.unwrap();
+    let org = Uuid::new_v4();
+    let direct_org = Uuid::new_v4();
+    let open = |org, demo| {
+        UnopenedPersistCatalogState::new_with_ownership(
+            client.clone(),
+            org,
+            cache.cfg.build_version.clone(),
+            Some(1),
+            Arc::new(Metrics::new(&MetricsRegistry::new())),
+            demo,
+        )
+    };
+    drop(open(direct_org, false).await.unwrap());
+    assert!(open(direct_org, true).await.is_err());
+
+    let unopened = open(org, true).await.unwrap();
+    assert!(open(org, false).await.is_err());
+    let catalog_id = unopened.shard_id;
+    let mut first = unopened
+        .open_inner(Mode::Writable, Timestamp::MIN, &test_bootstrap_args())
+        .await
+        .unwrap();
+    first.sync_to_current_updates().await.unwrap();
+
+    let table_id = ShardId::new();
+    let desc = RelationDesc::builder()
+        .with_column("v", SqlScalarType::Int64.nullable(false))
+        .finish();
+    let (writer, mut reader) = client
+        .open(
+            table_id,
+            Arc::new(desc),
+            Arc::new(UnitSchema),
+            Diagnostics::from_purpose("demo participant"),
+            false,
+        )
+        .await
+        .unwrap();
+    let row = Row::pack_slice(&[Datum::Int64(7)]);
+    let mut peer = open(org, true).await.unwrap();
+    let wal = &mut peer.wal.as_mut().unwrap().handle;
+    let registration = wal.current_upper().await;
+    wal.register(registration, [writer]).await.unwrap();
+    let ts = wal.current_upper().await;
+    let mut invalid = first.transaction().await.unwrap();
+    invalid
+        .set_setting("rejected".into(), Some("bad".into()))
+        .unwrap();
+    let _ = invalid.get_and_commit_op_updates();
+    let err = invalid
+        .commit_with_table_diffs(
+            ts,
+            TableDiffs::from([(ShardId::new(), vec![(row.clone(), Diff::ONE)])]),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        CatalogError::Durable(DurableCatalogError::NotWritable(_))
+    ));
+    assert_eq!(wal.current_upper().await, ts);
+    let mut txn = first.transaction().await.unwrap();
+    txn.set_setting("mixed".into(), Some("one".into())).unwrap();
+    let _ = txn.get_and_commit_op_updates();
+    let upper = txn
+        .commit_with_table_diffs(
+            ts,
+            TableDiffs::from([(table_id, vec![(row.clone(), Diff::ONE)])]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upper, ts.step_forward());
+    assert_eq!(
+        reader
+            .snapshot_and_fetch(Antichain::from_elem(ts))
+            .await
+            .unwrap(),
+        vec![((SourceData(Ok(row.clone())), ()), ts, 1)]
+    );
+    let stale = first.transaction().await.unwrap();
+
+    // Model a crash just after the durable WAL decision: neither data shard
+    // has been applied and no tidy token is available to the new process.
+    let mut incomplete = wal.begin();
+    let key: StateUpdateKindJson = StateUpdateKind::Setting(
+        proto::SettingKey {
+            name: "recovered".into(),
+        },
+        proto::SettingValue {
+            value: "two".into(),
+        },
+    )
+    .into();
+    incomplete
+        .write(&catalog_id, SourceData::from(key), (), 1)
+        .await;
+    incomplete
+        .write(&table_id, SourceData(Ok(row.clone())), (), -1)
+        .await;
+    incomplete
+        .compare_and_commit_at(wal, upper, upper)
+        .await
+        .unwrap();
+    drop(peer);
+
+    let mut reopened = open(org, true)
+        .await
+        .unwrap()
+        .open_inner(Mode::Writable, upper, &test_bootstrap_args())
+        .await
+        .unwrap();
+    reopened.sync_to_current_updates().await.unwrap();
+    let txn = reopened.transaction().await.unwrap();
+    assert_eq!(txn.get_setting("rejected".into()), None);
+    assert_eq!(txn.get_setting("mixed".into()), Some("one"));
+    assert_eq!(txn.get_setting("recovered".into()), Some("two"));
+    assert_eq!(txn.get_txn_wal_shard(), Some(shard_id(org, DEMO_WAL_SEED)));
+    assert!(
+        reader
+            .snapshot_and_fetch(Antichain::from_elem(upper))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // The requested timestamp is deliberately *after* the new owner's fence.
+    let fenced_upper = reopened.current_upper().await;
+    let future = upper.step_forward_by(&Timestamp::from(1000));
+    let err = stale
+        .commit_with_table_diffs(
+            future,
+            TableDiffs::from([(table_id, vec![(row, Diff::ONE)])]),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        CatalogError::Durable(DurableCatalogError::Fence(_))
+    ));
+    assert_eq!(reopened.current_upper().await, fenced_upper);
+}

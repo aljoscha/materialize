@@ -3083,6 +3083,14 @@ impl<'a> Transaction<'a> {
         self,
         commit_ts: mz_repr::Timestamp,
     ) -> Result<(&'a mut dyn DurableCatalogState, mz_repr::Timestamp), CatalogError> {
+        self.commit_internal_with_tables(commit_ts, None).await
+    }
+
+    async fn commit_internal_with_tables(
+        self,
+        commit_ts: mz_repr::Timestamp,
+        tables: Option<crate::durable::TableDiffs>,
+    ) -> Result<(&'a mut dyn DurableCatalogState, mz_repr::Timestamp), CatalogError> {
         self.ensure_committable()?;
         let (mut txn_batch, durable_catalog) = self.into_parts()?;
         let TransactionBatch {
@@ -3148,9 +3156,18 @@ impl<'a> Transaction<'a> {
         differential_dataflow::consolidation::consolidate_updates(txn_wal_shard);
         differential_dataflow::consolidation::consolidate_updates(audit_log_updates);
 
-        let upper = durable_catalog
-            .commit_transaction(txn_batch, commit_ts)
-            .await?;
+        let upper = match tables {
+            Some(tables) => {
+                durable_catalog
+                    .commit_transaction_with_table_diffs(txn_batch, commit_ts, tables)
+                    .await?
+            }
+            None => {
+                durable_catalog
+                    .commit_transaction(txn_batch, commit_ts)
+                    .await?
+            }
+        };
         Ok((durable_catalog, upper))
     }
 
@@ -3176,6 +3193,25 @@ impl<'a> Transaction<'a> {
     /// about the caller in this method, in practice it results in duplicate work on every commit.
     #[mz_ore::instrument(level = "debug")]
     pub async fn commit(self, commit_ts: mz_repr::Timestamp) -> Result<(), CatalogError> {
+        self.commit_and_drain(commit_ts, None).await.map(|_| ())
+    }
+
+    /// Commits a writable demo catalog transaction and existing table updates at
+    /// one WAL timestamp. Returns the exclusive upper. Do not separately submit
+    /// the table writes to storage. Consume catalog op updates as for commit.
+    pub async fn commit_with_table_diffs(
+        self,
+        commit_ts: mz_repr::Timestamp,
+        tables: crate::durable::TableDiffs,
+    ) -> Result<mz_repr::Timestamp, CatalogError> {
+        self.commit_and_drain(commit_ts, Some(tables)).await
+    }
+
+    async fn commit_and_drain(
+        self,
+        commit_ts: mz_repr::Timestamp,
+        tables: Option<crate::durable::TableDiffs>,
+    ) -> Result<mz_repr::Timestamp, CatalogError> {
         self.ensure_committable()?;
         let op_updates = self.get_op_updates();
         assert!(
@@ -3183,7 +3219,7 @@ impl<'a> Transaction<'a> {
             "unconsumed transaction updates: {op_updates:?}"
         );
 
-        let (durable_storage, upper) = self.commit_internal(commit_ts).await?;
+        let (durable_storage, upper) = self.commit_internal_with_tables(commit_ts, tables).await?;
         // Drain all the updates from the commit since it is assumed that they were already applied.
         let updates = durable_storage.sync_updates(upper).await?;
         // Writable and savepoint catalogs should have consumed all updates before committing a
@@ -3201,7 +3237,7 @@ impl<'a> Transaction<'a> {
                     .all(|update| update.ts >= commit_ts && update.ts < upper),
             "unconsumed updates existed before transaction commit: commit_ts={commit_ts:?}, upper={upper:?}, updates:{updates:?}"
         );
-        Ok(())
+        Ok(upper)
     }
 }
 

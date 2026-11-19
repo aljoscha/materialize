@@ -124,6 +124,27 @@ where
     where
         C: TxnsCodec,
     {
+        self.commit_at_inner(handle, None, commit_ts).await
+    }
+
+    /// Commits only if the WAL is still at the upper the caller read.
+    /// In particular, a timestamp in the future cannot skip a concurrent fence.
+    pub async fn compare_and_commit_at<C: TxnsCodec>(
+        &mut self,
+        handle: &mut TxnsHandle<K, V, T, D, C>,
+        expected_upper: T,
+        commit_ts: T,
+    ) -> Result<TxnApply<T>, T> {
+        self.commit_at_inner(handle, Some(expected_upper), commit_ts)
+            .await
+    }
+
+    async fn commit_at_inner<C: TxnsCodec>(
+        &mut self,
+        handle: &mut TxnsHandle<K, V, T, D, C>,
+        expected_upper: Option<T>,
+        commit_ts: T,
+    ) -> Result<TxnApply<T>, T> {
         let op = &Arc::clone(&handle.metrics).commit;
         op.run(async {
             let mut txns_upper = handle
@@ -139,7 +160,9 @@ where
                 // could possibly write. If our requested commit timestamp is before
                 // that, then it's no longer possible to write and the caller needs
                 // to decide what to do.
-                if commit_ts < txns_upper {
+                if commit_ts < txns_upper
+                    || expected_upper.as_ref().is_some_and(|u| u != &txns_upper)
+                {
                     debug!(
                         "commit_at {:?} mismatch current={:?}",
                         commit_ts, txns_upper

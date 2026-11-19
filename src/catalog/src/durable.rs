@@ -43,7 +43,7 @@ pub use crate::durable::objects::{
 };
 pub use crate::durable::persist::shard_id;
 use crate::durable::persist::{Timestamp, UnopenedPersistCatalogState};
-use crate::durable::transaction::TransactionBatch;
+pub use crate::durable::transaction::TransactionBatch;
 pub use crate::durable::transaction::{DryRunTransaction, Transaction};
 pub use crate::durable::upgrade::CATALOG_VERSION;
 use crate::memory;
@@ -57,6 +57,9 @@ mod persist;
 mod traits;
 mod transaction;
 mod upgrade;
+
+/// Row updates keyed by already-registered participant shard.
+pub type TableDiffs = std::collections::BTreeMap<ShardId, Vec<(mz_repr::Row, mz_repr::Diff)>>;
 
 pub const DATABASE_ID_ALLOC_KEY: &str = "database";
 pub const SCHEMA_ID_ALLOC_KEY: &str = "schema";
@@ -301,6 +304,11 @@ pub trait DurableCatalogState: ReadOnlyDurableCatalogState {
     /// Returns true if the catalog is opened is savepoint mode, false otherwise.
     fn is_savepoint(&self) -> bool;
 
+    /// Whether table writes and catalog writes compete for the same WAL timestamp.
+    fn shares_table_wal(&self) -> bool {
+        false
+    }
+
     /// Marks the bootstrap process as complete.
     async fn mark_bootstrap_complete(&mut self);
 
@@ -328,6 +336,14 @@ pub trait DurableCatalogState: ReadOnlyDurableCatalogState {
         &mut self,
         txn_batch: TransactionBatch,
         commit_ts: Timestamp,
+    ) -> Result<Timestamp, CatalogError>;
+
+    /// Atomically publishes a catalog batch and table diffs in the demo WAL.
+    async fn commit_transaction_with_table_diffs(
+        &mut self,
+        txn_batch: TransactionBatch,
+        commit_ts: Timestamp,
+        tables: TableDiffs,
     ) -> Result<Timestamp, CatalogError>;
 
     /// Advances the catalog upper to at least `new_upper`.

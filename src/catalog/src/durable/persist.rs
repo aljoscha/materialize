@@ -17,6 +17,7 @@ use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
+use crate::durable::TableDiffs;
 use async_trait::async_trait;
 use differential_dataflow::lattice::Lattice;
 use futures::{FutureExt, StreamExt};
@@ -39,9 +40,11 @@ use mz_persist_client::{Diagnostics, PersistClient, ShardId};
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_proto::TryFromProtoError;
 use mz_repr::Diff;
-use mz_storage_client::controller::PersistEpoch;
+use mz_storage_client::controller::{PersistEpoch, StorageTxn};
 use mz_storage_types::StorageDiff;
+use mz_storage_types::controller::TxnsCodecRow;
 use mz_storage_types::sources::SourceData;
+use mz_txn_wal::txns::{Tidy, TxnsHandle};
 use sha2::Digest;
 use timely::progress::{Antichain, Timestamp as TimelyTimestamp};
 use tracing::{debug, info, warn};
@@ -94,6 +97,92 @@ const _UPGRADE_SEED: usize = 2;
 pub const _BUILTIN_MIGRATION_SEED: usize = 3;
 /// Legacy seed used to generate the persist shard ID for the expression cache. DO NOT REUSE.
 pub const _EXPRESSION_CACHE_SEED: usize = 4;
+
+// The legacy shard becomes an immutable routing record. Its content version
+// also prevents binaries without routing support from opening it for writing.
+const DEMO_ROUTE_VERSION: &str = "18446744073709551615.0.0-demo-wal-v1";
+const DEMO_CATALOG_SEED: usize = 5;
+const DEMO_WAL_SEED: usize = 6;
+
+type CatalogWal = TxnsHandle<SourceData, (), Timestamp, StorageDiff, TxnsCodecRow>;
+
+#[derive(Debug)]
+struct WalOwner {
+    handle: CatalogWal,
+    tidy: Tidy,
+}
+
+impl WalOwner {
+    /// Register only during WAL bootstrap. A missing registration in a used WAL
+    /// cannot be repaired by silently claiming the shard at a later timestamp.
+    async fn open(
+        persist_client: &PersistClient,
+        wal_id: ShardId,
+        write_handle: &mut WriteHandle<SourceData, (), Timestamp, StorageDiff>,
+    ) -> Result<(Self, Timestamp), DurableCatalogError> {
+        let catalog_id = write_handle.shard_id();
+        let mut handle = CatalogWal::open(
+            Timestamp::MIN,
+            persist_client.clone(),
+            persist_client.dyncfgs().clone(),
+            Arc::new(mz_txn_wal::metrics::Metrics::new(
+                &mz_ore::metrics::MetricsRegistry::new(),
+            )),
+            wal_id,
+            Opaque::encode(&PersistEpoch::default()),
+        )
+        .await;
+        let mut tidy = Tidy::default();
+        loop {
+            let (upper, attached) = handle.attach_participant(catalog_id).await;
+            if attached {
+                break;
+            }
+            if upper != Timestamp::MIN.step_forward()
+                || write_handle.fetch_recent_upper().await != &Antichain::from_elem(Timestamp::MIN)
+            {
+                // A racing initializer may just have completed registration.
+                if handle.attach_participant(catalog_id).await.1 {
+                    break;
+                }
+                return Err(DurableCatalogError::Internal(
+                    "demo WAL missing catalog registration".into(),
+                ));
+            }
+            let writer = persist_client
+                .open_writer(
+                    catalog_id,
+                    Arc::new(persist_desc()),
+                    Arc::new(UnitSchema),
+                    Diagnostics::from_purpose("register demo catalog"),
+                )
+                .await
+                .expect("catalog schema");
+            if let Ok(work) = handle.register(upper, [writer]).await {
+                tidy.merge(work);
+                break;
+            }
+        }
+        let upper = handle.current_upper().await;
+        let mut owner = WalOwner { handle, tidy };
+        owner.materialize(write_handle, upper).await;
+        Ok((owner, upper))
+    }
+
+    async fn materialize(
+        &mut self,
+        writer: &mut WriteHandle<SourceData, (), Timestamp, StorageDiff>,
+        upper: Timestamp,
+    ) {
+        if upper > Timestamp::MIN {
+            self.tidy.merge(
+                self.handle
+                    .materialize_through(writer, upper.saturating_sub(1))
+                    .await,
+            );
+        }
+    }
+}
 
 /// Durable catalog mode that dictates the effect of mutable operations.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -346,6 +435,7 @@ pub(crate) struct PersistHandle<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> {
     since_handle: SinceHandle<SourceData, (), Timestamp, StorageDiff>,
     /// Write handle to persist.
     write_handle: WriteHandle<SourceData, (), Timestamp, StorageDiff>,
+    wal: Option<WalOwner>,
     /// Listener to catalog changes.
     listen: Listen<SourceData, (), Timestamp, StorageDiff>,
     /// Handle for connecting to persist.
@@ -385,6 +475,9 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
     async fn current_upper(&mut self) -> Timestamp {
         match self.mode {
             Mode::Writable | Mode::Readonly => {
+                if let Some(wal) = &mut self.wal {
+                    return wal.handle.current_upper().await;
+                }
                 let upper = self.write_handle.fetch_recent_upper().await;
                 antichain_to_timestamp(upper.clone())
             }
@@ -411,7 +504,8 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
         });
         let next_upper = commit_ts.step_forward();
         // Upper mismatches are classified by the commit and advance callers.
-        self.compare_and_append_inner(updates, next_upper).await?;
+        self.compare_and_append_inner(updates, next_upper, &TableDiffs::new())
+            .await?;
 
         self.sync(next_upper).await?;
         Ok(next_upper)
@@ -430,6 +524,7 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
         &mut self,
         updates: impl IntoIterator<Item = ((SourceData, ()), Timestamp, StorageDiff)>,
         next_upper: Timestamp,
+        tables: &TableDiffs,
     ) -> Result<(), CompareAndAppendError> {
         assert_eq!(self.mode, Mode::Writable);
         assert!(
@@ -438,15 +533,48 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
             self.upper,
         );
 
-        let res = self
-            .write_handle
-            .compare_and_append(
-                updates,
-                Antichain::from_elem(self.upper),
-                Antichain::from_elem(next_upper),
-            )
-            .await
-            .expect("invalid usage");
+        let res = if let Some(wal) = &mut self.wal {
+            self.fenceable_token.validate()?;
+            let commit_ts = next_upper.saturating_sub(1);
+            let mut txn = wal.handle.begin();
+            for ((key, ()), ts, diff) in updates {
+                assert_eq!(ts, commit_ts);
+                txn.write(&self.shard_id, key, (), diff).await;
+            }
+            for (id, rows) in tables {
+                for (row, diff) in rows {
+                    txn.write(id, SourceData(Ok(row.clone())), (), diff.into_inner())
+                        .await;
+                }
+            }
+            txn.tidy(std::mem::take(&mut wal.tidy));
+            match txn
+                .compare_and_commit_at(&mut wal.handle, self.upper, commit_ts)
+                .await
+            {
+                Ok(_) => {
+                    wal.materialize(&mut self.write_handle, next_upper).await;
+                    Ok(())
+                }
+                Err(current) => {
+                    wal.tidy.merge(txn.take_tidy());
+                    Err(UpperMismatch {
+                        expected: Antichain::from_elem(self.upper),
+                        current: Antichain::from_elem(current),
+                    })
+                }
+            }
+        } else {
+            assert!(tables.is_empty());
+            self.write_handle
+                .compare_and_append(
+                    updates,
+                    Antichain::from_elem(self.upper),
+                    Antichain::from_elem(next_upper),
+                )
+                .await
+                .expect("invalid usage")
+        };
 
         if let Err(e @ UpperMismatch { .. }) = res {
             // Most likely we were fenced out.
@@ -498,6 +626,11 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
     #[mz_ore::instrument]
     async fn snapshot_unconsolidated(&mut self) -> Vec<StateUpdate<StateUpdateKind>> {
         let current_upper = self.current_upper().await;
+        if self.mode != Mode::Savepoint
+            && let Some(wal) = &mut self.wal
+        {
+            wal.materialize(&mut self.write_handle, current_upper).await;
+        }
 
         let mut snapshot = Vec::new();
         let mut read_handle = self.read_handle().await;
@@ -560,6 +693,11 @@ impl<T: TryIntoStateUpdateKind, U: ApplyUpdate<T>> PersistHandle<T, U> {
         // current snapshot size as its baseline.
         self.size_at_last_consolidation = None;
 
+        if self.upper < target_upper
+            && let Some(wal) = &mut self.wal
+        {
+            wal.materialize(&mut self.write_handle, target_upper).await;
+        }
         while self.upper < target_upper {
             let listen_events = self.listen.fetch_next().await;
             for listen_event in listen_events {
@@ -1009,91 +1147,170 @@ impl UnopenedPersistCatalogState {
         deploy_generation: Option<u64>,
         metrics: Arc<Metrics>,
     ) -> Result<UnopenedPersistCatalogState, DurableCatalogError> {
-        let catalog_shard_id = shard_id(organization_id, CATALOG_SEED);
-        debug!(?catalog_shard_id, "new persist backed catalog state");
-
-        // Check the catalog shard version to ensure that we are compatible with the persist
-        // data format. This lets us return an error gracefully, rather than panicking later in
-        // persist.
-        let version_in_catalog_shard =
-            fetch_catalog_shard_version(&persist_client, catalog_shard_id).await;
-        if let Some(version_in_catalog_shard) = version_in_catalog_shard {
-            if !mz_persist_client::cfg::code_can_write_data(&version, &version_in_catalog_shard) {
-                return Err(DurableCatalogError::IncompatiblePersistVersion {
-                    found_version: version_in_catalog_shard,
-                    catalog_version: version,
-                });
-            }
-        }
-
-        let open_handles_start = Instant::now();
-        info!("startup: envd serve: catalog init: open handles beginning");
-        let since_handle = persist_client
-            .open_critical_since(
-                catalog_shard_id,
-                CATALOG_CRITICAL_SINCE.clone(),
-                Opaque::encode(&i64::MIN),
-                Diagnostics {
-                    shard_name: CATALOG_SHARD_NAME.to_string(),
-                    handle_purpose: "durable catalog state critical since".to_string(),
-                },
-            )
-            .await
-            .expect("invalid usage");
-
-        let (mut write_handle, mut read_handle) = persist_client
-            .open(
-                catalog_shard_id,
-                Arc::new(persist_desc()),
-                Arc::new(UnitSchema::default()),
-                Diagnostics {
-                    shard_name: CATALOG_SHARD_NAME.to_string(),
-                    handle_purpose: "durable catalog state handles".to_string(),
-                },
-                USE_CRITICAL_SINCE_CATALOG.get(persist_client.dyncfgs()),
-            )
-            .await
-            .expect("invalid usage");
-        info!(
-            "startup: envd serve: catalog init: open handles complete in {:?}",
-            open_handles_start.elapsed()
-        );
-
-        // Commit an empty write at the minimum timestamp so the catalog is always readable.
-        let upper = {
-            const EMPTY_UPDATES: &[((SourceData, ()), Timestamp, StorageDiff)] = &[];
-            let upper = Antichain::from_elem(Timestamp::minimum());
-            let next_upper = Timestamp::minimum().step_forward();
-            match write_handle
-                .compare_and_append(EMPTY_UPDATES, upper, Antichain::from_elem(next_upper))
-                .await
-                .expect("invalid usage")
-            {
-                Ok(()) => next_upper,
-                Err(mismatch) => antichain_to_timestamp(mismatch.current),
+        let demo = match std::env::var_os("MZ_DEMO_CATALOG_TXN_WAL") {
+            None => false,
+            Some(v) if v == "1" => true,
+            Some(_) => {
+                return Err(DurableCatalogError::Internal(
+                    "MZ_DEMO_CATALOG_TXN_WAL must be unset or 1".into(),
+                ));
             }
         };
+        Self::new_with_ownership(
+            persist_client,
+            organization_id,
+            version,
+            deploy_generation,
+            metrics,
+            demo,
+        )
+        .await
+    }
 
-        let snapshot_start = Instant::now();
-        info!("startup: envd serve: catalog init: snapshot beginning");
-        let as_of = as_of(&read_handle, upper);
-        let snapshot: Vec<_> = snapshot_binary(&mut read_handle, as_of, &metrics)
-            .await
-            .map(|StateUpdate { kind, ts, diff }| (kind, ts, diff))
-            .collect();
+    async fn new_with_ownership(
+        persist_client: PersistClient,
+        organization_id: Uuid,
+        version: semver::Version,
+        deploy_generation: Option<u64>,
+        metrics: Arc<Metrics>,
+        demo: bool,
+    ) -> Result<Self, DurableCatalogError> {
+        let marker: StateUpdateKindJson = StateUpdateKind::Setting(
+            crate::durable::objects::serialization::proto::SettingKey {
+                name: CATALOG_CONTENT_VERSION_KEY.into(),
+            },
+            crate::durable::objects::serialization::proto::SettingValue {
+                value: DEMO_ROUTE_VERSION.into(),
+            },
+        )
+        .into();
+        let mut catalog_shard_id = shard_id(organization_id, CATALOG_SEED);
+        let mut routed = false;
+        let open_snapshot_start = Instant::now();
+        let (since_handle, write_handle, read_handle, upper, snapshot, as_of, wal) = loop {
+            debug!(?catalog_shard_id, "new persist backed catalog state");
+
+            // Check the catalog shard version to ensure that we are compatible with the persist
+            // data format. This lets us return an error gracefully, rather than panicking later in
+            // persist.
+            let version_in_catalog_shard =
+                fetch_catalog_shard_version(&persist_client, catalog_shard_id).await;
+            if let Some(version_in_catalog_shard) = version_in_catalog_shard {
+                if !mz_persist_client::cfg::code_can_write_data(&version, &version_in_catalog_shard)
+                {
+                    return Err(DurableCatalogError::IncompatiblePersistVersion {
+                        found_version: version_in_catalog_shard,
+                        catalog_version: version,
+                    });
+                }
+            }
+
+            let open_handles_start = Instant::now();
+            info!("startup: envd serve: catalog init: open handles beginning");
+            let since_handle = persist_client
+                .open_critical_since(
+                    catalog_shard_id,
+                    CATALOG_CRITICAL_SINCE.clone(),
+                    Opaque::encode(&i64::MIN),
+                    Diagnostics {
+                        shard_name: CATALOG_SHARD_NAME.to_string(),
+                        handle_purpose: "durable catalog state critical since".to_string(),
+                    },
+                )
+                .await
+                .expect("invalid usage");
+
+            let (mut write_handle, mut read_handle) = persist_client
+                .open(
+                    catalog_shard_id,
+                    Arc::new(persist_desc()),
+                    Arc::new(UnitSchema::default()),
+                    Diagnostics {
+                        shard_name: CATALOG_SHARD_NAME.to_string(),
+                        handle_purpose: "durable catalog state handles".to_string(),
+                    },
+                    USE_CRITICAL_SINCE_CATALOG.get(persist_client.dyncfgs()),
+                )
+                .await
+                .expect("invalid usage");
+            info!(
+                "startup: envd serve: catalog init: open handles complete in {:?}",
+                open_handles_start.elapsed()
+            );
+
+            // Commit an empty write at the minimum timestamp so the catalog is always readable.
+            let mut wal = None;
+            let upper = if routed {
+                let wal_id = shard_id(organization_id, DEMO_WAL_SEED);
+                let (owner, upper) =
+                    WalOwner::open(&persist_client, wal_id, &mut write_handle).await?;
+                wal = Some(owner);
+                upper
+            } else {
+                let initial: Vec<_> = demo
+                    .then(|| ((SourceData::from(marker.clone()), ()), Timestamp::MIN, 1i64))
+                    .into_iter()
+                    .collect();
+                let upper = Antichain::from_elem(Timestamp::minimum());
+                let next_upper = Timestamp::minimum().step_forward();
+                match write_handle
+                    .compare_and_append(initial, upper, Antichain::from_elem(next_upper))
+                    .await
+                    .expect("invalid usage")
+                {
+                    Ok(()) => next_upper,
+                    Err(mismatch) => antichain_to_timestamp(mismatch.current),
+                }
+            };
+
+            info!("startup: envd serve: catalog init: snapshot beginning");
+            let as_of = as_of(&read_handle, upper);
+            let snapshot: Vec<_> = snapshot_binary(&mut read_handle, as_of, &metrics)
+                .await
+                .map(|StateUpdate { kind, ts, diff }| (kind, ts, diff))
+                .collect();
+            if !routed {
+                let marked = snapshot.iter().any(|(kind, _, _)| kind == &marker);
+                if marked != demo
+                    || (marked
+                        && (snapshot.len() != 1
+                            || upper != Timestamp::MIN.step_forward()
+                            || snapshot[0].2 != Diff::ONE))
+                {
+                    return Err(DurableCatalogError::NotWritable("catalog ownership mismatch: demo mode requires a fresh or marked environment".into()));
+                }
+                if marked {
+                    write_handle.expire().await;
+                    read_handle.expire().await;
+                    catalog_shard_id = shard_id(organization_id, DEMO_CATALOG_SEED);
+                    routed = true;
+                    continue;
+                }
+            }
+            break (
+                since_handle,
+                write_handle,
+                read_handle,
+                upper,
+                snapshot,
+                as_of,
+                wal,
+            );
+        };
         let listen = read_handle
             .listen(Antichain::from_elem(as_of))
             .await
             .expect("invalid usage");
         info!(
             "startup: envd serve: catalog init: snapshot complete in {:?}",
-            snapshot_start.elapsed()
+            open_snapshot_start.elapsed()
         );
 
         let mut handle = UnopenedPersistCatalogState {
             // Unopened catalogs are always writeable until they're opened in an explicit mode.
             mode: Mode::Writable,
             since_handle,
+            wal,
             write_handle,
             listen,
             persist_client,
@@ -1297,6 +1514,7 @@ impl UnopenedPersistCatalogState {
             mode: self.mode,
             since_handle: self.since_handle,
             write_handle: self.write_handle,
+            wal: self.wal,
             listen: self.listen,
             persist_client: self.persist_client,
             shard_id: self.shard_id,
@@ -1326,8 +1544,15 @@ impl UnopenedPersistCatalogState {
         catalog.apply_updates_and_consolidate(updates)?;
 
         let catalog_content_version = catalog.catalog_content_version.to_string();
+        let wal_id = catalog.wal.as_ref().map(|wal| wal.handle.txns_id());
         let txn = if is_initialized {
             let mut txn = catalog.transaction_unchecked().await?;
+            if wal_id.is_some() && txn.get_txn_wal_shard() != wal_id {
+                return Err(DurableCatalogError::Internal(
+                    "catalog and storage disagree on WAL ownership".into(),
+                )
+                .into());
+            }
 
             // Ad-hoc migration: Initialize the `migration_version` expected by adapter to be
             // present in existing catalogs.
@@ -1371,6 +1596,10 @@ impl UnopenedPersistCatalogState {
             );
 
             let mut txn = catalog.transaction_unchecked().await?;
+            if let Some(id) = wal_id {
+                txn.write_txn_wal_shard(id)
+                    .map_err(DurableCatalogError::from)?;
+            }
             initialize::initialize(
                 &mut txn,
                 bootstrap_args,
@@ -1512,6 +1741,12 @@ impl OpenableDurableCatalogState for UnopenedPersistCatalogState {
 
     #[mz_ore::instrument(level = "debug")]
     async fn open_debug(mut self: Box<Self>) -> Result<DebugCatalogState, CatalogError> {
+        if self.wal.is_some() {
+            return Err(DurableCatalogError::NotWritable(
+                "debug writes disabled for demo WAL".into(),
+            )
+            .into());
+        }
         Ok(DebugCatalogState(*self))
     }
 
@@ -1831,6 +2066,9 @@ impl ReadOnlyDurableCatalogState for PersistCatalogState {
 #[async_trait]
 #[allow(mismatched_lifetime_syntaxes)]
 impl DurableCatalogState for PersistCatalogState {
+    fn shares_table_wal(&self) -> bool {
+        self.wal.is_some()
+    }
     fn is_read_only(&self) -> bool {
         matches!(self.mode, Mode::Readonly)
     }
@@ -1966,6 +2204,54 @@ impl DurableCatalogState for PersistCatalogState {
             .await
     }
 
+    async fn commit_transaction_with_table_diffs(
+        &mut self,
+        batch: TransactionBatch,
+        commit_ts: Timestamp,
+        tables: TableDiffs,
+    ) -> Result<Timestamp, CatalogError> {
+        self.fenceable_token.validate()?;
+        if self.mode != Mode::Writable || self.wal.is_none() {
+            return Err(DurableCatalogError::NotWritable(
+                "atomic table commits require writable demo WAL ownership".into(),
+            )
+            .into());
+        }
+        assert_eq!(self.upper, batch.upper);
+        if commit_ts < self.upper {
+            return Err(DurableCatalogError::WalTimestampPassed(self.upper).into());
+        }
+        let wal = self.wal.as_mut().expect("checked above");
+        for id in tables.keys() {
+            if *id == self.shard_id || !wal.handle.attach_participant(*id).await.1 {
+                return Err(DurableCatalogError::NotWritable(format!(
+                    "not a participant table: {id}"
+                ))
+                .into());
+            }
+        }
+        let updates = StateUpdate::from_txn_batch(batch).map(|(kind, diff)| {
+            (
+                (SourceData::from(StateUpdateKindJson::from(kind)), ()),
+                commit_ts,
+                diff.into_inner(),
+            )
+        });
+        let next = commit_ts.step_forward();
+        let updates_applied_before = self.updates_applied;
+        match self.compare_and_append_inner(updates, next, &tables).await {
+            Ok(()) => {
+                self.sync(next).await?;
+                Ok(next)
+            }
+            Err(CompareAndAppendError::Fence(e)) => Err(e.into()),
+            Err(CompareAndAppendError::UpperMismatch { actual_upper, .. }) => {
+                self.classify_upper_mismatch(updates_applied_before, actual_upper)?;
+                Err(DurableCatalogError::WalTimestampPassed(actual_upper).into())
+            }
+        }
+    }
+
     #[mz_ore::instrument(level = "debug")]
     async fn advance_upper(&mut self, new_upper: Timestamp) -> Result<(), CatalogError> {
         loop {
@@ -1991,7 +2277,10 @@ impl DurableCatalogState for PersistCatalogState {
             }
 
             let updates_applied_before = self.updates_applied;
-            match self.compare_and_append_inner([], new_upper).await {
+            match self
+                .compare_and_append_inner([], new_upper, &TableDiffs::new())
+                .await
+            {
                 Ok(()) => {
                     self.upper = new_upper;
                     // No sync needed since no data was written.

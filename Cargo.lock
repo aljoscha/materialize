@@ -6641,6 +6641,7 @@ dependencies = [
  "mz-storage-client",
  "mz-storage-types",
  "mz-transform",
+ "mz-txn-wal",
  "paste",
  "prometheus",
  "proptest",

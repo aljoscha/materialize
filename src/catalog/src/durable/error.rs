@@ -68,6 +68,9 @@ pub enum DurableCatalogError {
     /// Catalog is not in a writable state.
     #[error("{0}")]
     NotWritable(String),
+    /// The conditional WAL commit definitely did not land at its requested timestamp.
+    #[error("WAL upper {0} invalidated the transaction snapshot")]
+    WalTimestampPassed(Timestamp),
     /// A dry-run transaction reached a commit path.
     #[error("cannot commit a dry-run catalog transaction")]
     DryRunTransaction,
