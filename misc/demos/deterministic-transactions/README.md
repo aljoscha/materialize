@@ -32,6 +32,52 @@ with the same URL. It only reads: it checks both schema IDs, absence of old and
 intermediate names, and exactly one copy each of rows 1 and 2. Running `run`
 again creates a different example and does not verify the original.
 
+## Race the cluster candidate before its WAL compare-and-set
+
+Use `competition.py` with the cluster candidate implementation on a dedicated
+local instance. The failpoint is process-wide. Run only one deterministic
+writer. Use the same txn-WAL setup described above, enable unsafe mode, and
+keep INFO coordinator events in a private, uncolored text log. For example,
+from this directory, with `MZDEV_POSTGRES` set:
+
+```sh
+umask 077
+export SERVER_LOG=$(mktemp)
+UNSAFE_MODE=1 LOG_FORMAT=text NO_COLOR=1 ./start >>"$SERVER_LOG" 2>&1
+```
+
+In another shell, set `SERVER_LOG` to the same path and `MZ_URL` to the demo
+database, then run:
+
+```sh
+python3 competition.py run --server-log "$SERVER_LOG"
+```
+
+The runner seeks to EOF before each COMMIT. It waits for the first candidate
+read, commits the competing write, then releases the pause. Do not rotate the
+log during the run. The runner reports only the arrangement ID, attempt and
+write timestamp from the log. Do not share the log itself.
+
+The source insert forces a reread on the same arrangement. The destination
+and both dependent views must return 1 and 2 exactly once. The outside
+view's stored CREATE SQL must reference the renamed schema. In the second
+transaction the competitor creates the claimed schema. Only an explicit
+already-exists error for that schema passes. The claimant keeps its ID and
+neither the rename nor the staged insert may survive.
+
+Restart with the same durable state, then use the IDs printed by the runner:
+
+```sh
+python3 competition.py inspect PREFIX SCHEMA_ID OUTSIDE_ID CLAIMANT_ID
+```
+
+Inspection reads only the catalog, tables and views. If the client was killed
+while the hook was armed, clear it on the dedicated server before rerunning:
+
+```sql
+SET unsafe_failpoints = 'deterministic_candidate_before_cas=off';
+```
+
 ## Try it in two psql sessions
 
 In a shell, generate fresh names and start the following command twice (use
