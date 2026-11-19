@@ -24,6 +24,7 @@
 //! uses a pinned publication command instead of retrying its external mutation. Catalog
 //! rollback cannot undo either secret writes or changes in external services.
 
+pub(crate) mod cluster_rename;
 pub(crate) mod connection;
 mod schema_rename;
 pub(crate) mod source;
@@ -320,6 +321,10 @@ pub(crate) struct SchemaRenameOutcome {
 }
 
 impl SchemaRenameProgram {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
     pub(crate) fn supports(statement: &Statement<Raw>) -> bool {
         matches!(statement, Statement::AlterObjectRename(rename)
             if rename.object_type == mz_sql::ast::ObjectType::Schema)

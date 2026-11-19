@@ -97,6 +97,11 @@ impl Coordinator {
                     .boxed_local()
                     .await;
             }
+            Message::DeterministicCandidateReady(ready) => {
+                self.deterministic_candidate_ready(*ready)
+                    .boxed_local()
+                    .await;
+            }
             Message::DdlCommandsReady { pending, otel_ctx } => {
                 otel_ctx.attach_as_parent();
                 self.sequence_ddl_commit(pending).boxed_local().await;

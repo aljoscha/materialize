@@ -2068,6 +2068,25 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// Replace existing schemas together so uniqueness is checked on their final names.
+    /// The caller must supply distinct, existing schema IDs.
+    pub fn update_schemas(&mut self, schemas: Vec<Schema>) -> Result<(), CatalogError> {
+        if schemas.is_empty() {
+            return Ok(());
+        }
+        let len = schemas.len();
+        let updated = self.schemas.update_by_keys(
+            schemas.into_iter().map(DurableType::into_key_value),
+            self.op_id,
+        )?;
+        if usize::try_from(updated.into_inner()).ok() != Some(len) {
+            return Err(
+                DurableCatalogError::Internal("missing schema in batch update".into()).into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Updates schema `schema_id` in the transaction to `schema`.
     ///
     /// Returns an error if `schema_id` is not found.

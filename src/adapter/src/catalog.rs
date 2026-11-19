@@ -98,7 +98,9 @@ pub use crate::catalog::open::{InitializeStateResult, OpenCatalogResult};
 pub use crate::catalog::state::CatalogState;
 #[cfg(test)]
 pub(crate) use crate::catalog::state::LocalExpressionCache;
-pub(crate) use crate::catalog::transact::{CommandExecutionError, CommandResponse, CommandWork};
+pub(crate) use crate::catalog::transact::{
+    CommandExecutionError, CommandResponse, CommandWork, SchemaRenameCandidate,
+};
 pub use crate::catalog::transact::{
     DropObjectInfo, InjectedAuditEvent, Op, ReplicaCreateDropReason, TransactionResult,
 };

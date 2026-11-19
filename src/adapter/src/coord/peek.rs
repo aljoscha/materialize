@@ -650,7 +650,7 @@ impl crate::coord::Coordinator {
     ///
     /// On error, nothing stays installed. On success, the caller must drop the returned
     /// collection, after queuing any peek on it, to release the dataflow's implied holds.
-    fn create_transient_peek_target(
+    pub(super) fn create_transient_peek_target(
         &mut self,
         plan: PeekDataflowPlan,
         source_arity: usize,

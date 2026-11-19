@@ -77,6 +77,7 @@ use tracing::{info, trace};
 use uuid::Uuid;
 
 use crate::AdapterError;
+#[cfg(test)]
 use crate::catalog::command::{SchemaRenameOutcome, SchemaRenameProgram};
 use crate::catalog::state::LocalExpressionCache;
 use crate::catalog::{
@@ -494,7 +495,64 @@ impl CommandExecutionError {
     }
 }
 
+/// Consolidated field replacements and statement-ordered audits for a certified rename program.
+#[derive(Debug, Default)]
+pub(crate) struct SchemaRenameCandidate {
+    /// (Expected schema name, final schema name) by schema ID.
+    pub schemas: BTreeMap<SchemaId, (String, String)>,
+    /// (Expected create_sql, final create_sql) by item ID.
+    pub items: BTreeMap<CatalogItemId, (String, String)>,
+    pub audits: Vec<mz_audit_log::RenameSchemaV1>,
+}
+
+impl SchemaRenameCandidate {
+    fn stage(
+        self,
+        state: &CatalogState,
+        tx: &mut Transaction<'_>,
+        ts: mz_repr::Timestamp,
+        session: Option<&ConnMeta>,
+        audit_events: &mut Vec<VersionedEvent>,
+    ) -> Result<(), AdapterError> {
+        let mut schemas = Vec::with_capacity(self.schemas.len());
+        for (id, (before, after)) in self.schemas {
+            let mut schema = tx
+                .get_schema(&id)
+                .filter(|schema| schema.name == before)
+                .ok_or(AdapterError::ReadThenWriteContention)?;
+            schema.name = after;
+            schemas.push(schema);
+        }
+        tx.update_schemas(schemas)?;
+
+        let mut items = BTreeMap::new();
+        for (id, (before, after)) in self.items {
+            let mut item = tx
+                .get_item(&id)
+                .filter(|item| item.create_sql == before)
+                .ok_or(AdapterError::ReadThenWriteContention)?;
+            item.create_sql = after;
+            items.insert(id, item);
+        }
+        tx.update_items(items)?;
+        for audit in self.audits {
+            CatalogState::add_to_audit_log(
+                &state.system_configuration,
+                ts,
+                session,
+                tx,
+                audit_events,
+                EventType::Alter,
+                ObjectType::Schema,
+                EventDetails::RenameSchemaV1(audit),
+            )?;
+        }
+        Ok(())
+    }
+}
+
 enum TransactionOperations<'a> {
+    ExactRenames(SchemaRenameCandidate),
     Raw(Vec<Op>),
     Commands {
         commands: &'a mut [super::command::CatalogCommand],
@@ -885,6 +943,7 @@ impl Catalog {
     ///
     /// With `Some(tables)`, commit at exactly `oracle_write_ts` or fail.
     /// The caller must validate the table writes and must not submit them separately.
+    #[cfg(test)]
     pub(crate) async fn transact_schema_renames(
         &mut self,
         oracle_write_ts: mz_repr::Timestamp,
@@ -908,6 +967,29 @@ impl Catalog {
             .await
             .map_err(CommandExecutionError::into_adapter_error)?;
         Ok((result, outcomes))
+    }
+
+    /// Commit the certified rename result and table writes together at exactly `ts`.
+    ///
+    /// The caller holds the DDL lock and certifies all reads, authorization, and table
+    /// participants for this attempt. Do not submit the table diffs separately or publish
+    /// outcomes before success. On contention, recertify at a fresh timestamp.
+    pub(crate) async fn transact_schema_rename_candidate(
+        &mut self,
+        ts: mz_repr::Timestamp,
+        session: Option<&ConnMeta>,
+        candidate: SchemaRenameCandidate,
+        tables: TableDiffs,
+    ) -> Result<TransactionResult, AdapterError> {
+        self.commit_program(
+            None,
+            ts,
+            session,
+            TransactionOperations::ExactRenames(candidate),
+            Ok(Some(tables)),
+        )
+        .await
+        .map_err(CommandExecutionError::into_adapter_error)
     }
 
     async fn commit_program(
@@ -1219,6 +1301,7 @@ impl Catalog {
         let mut state = Cow::Borrowed(state);
 
         let empty = match &operations {
+            TransactionOperations::ExactRenames(_) => false,
             TransactionOperations::Raw(ops) => ops.is_empty(),
             TransactionOperations::Commands { commands, .. } => commands.is_empty(),
         };
@@ -1231,7 +1314,9 @@ impl Catalog {
             TransactionOperations::Raw(ops) => {
                 Self::extract_expressions_from_ops(ops, &optimizer_features)
             }
-            TransactionOperations::Commands { .. } => BTreeMap::new(),
+            TransactionOperations::ExactRenames(_) | TransactionOperations::Commands { .. } => {
+                BTreeMap::new()
+            }
         };
 
         let mut storage_collections_to_create = BTreeSet::new();
@@ -1240,7 +1325,14 @@ impl Catalog {
 
         let mut updates = Vec::new();
 
+        let mut exact_item_ids = Vec::new();
         let (groups, mut responses): (std::collections::VecDeque<_>, _) = match operations {
+            TransactionOperations::ExactRenames(candidate) => {
+                exact_item_ids.extend(candidate.items.keys().copied());
+                candidate.stage(&state, tx, oracle_write_ts, session, audit_events)?;
+                updates = tx.get_and_commit_op_updates();
+                (Default::default(), None)
+            }
             TransactionOperations::Raw(ops) => {
                 ([OperationGroup::Raw(ops)].into_iter().collect(), None)
             }
@@ -1366,6 +1458,10 @@ impl Catalog {
             builtin_table_updates.extend(op_builtin_table_updates);
             parsed_catalog_updates.extend(op_catalog_updates);
         }
+
+        state
+            .record_item_metadata(tx, exact_item_ids)
+            .map_err(AdapterError::from)?;
 
         match mode {
             TransactInnerMode::Commit => {
@@ -4582,6 +4678,44 @@ mod tests {
             }],
             privileges.all_values_owned().collect::<Vec<_>>()
         );
+    }
+
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)]
+    async fn exact_rename_missing_item_aborts_staged_schema() {
+        Catalog::with_debug(|mut catalog| async move {
+            let db = catalog
+                .resolve_database(DEFAULT_DATABASE_NAME)
+                .expect("database")
+                .id();
+            let schema_id = catalog.state().get_database(&db).schemas_by_name[DEFAULT_SCHEMA];
+            let (missing, _) = catalog
+                .allocate_user_id_for_test()
+                .await
+                .expect("unused id");
+            let candidate = super::SchemaRenameCandidate {
+                schemas: [(schema_id, (DEFAULT_SCHEMA.into(), "renamed".into()))].into(),
+                items: [(missing, ("before".into(), "after".into()))].into(),
+                audits: Vec::new(),
+            };
+            let ts = catalog.current_upper().await;
+            let revision = catalog.transient_revision();
+            let result = catalog
+                .transact_schema_rename_candidate(ts, None, candidate, Default::default())
+                .await;
+            assert!(matches!(
+                result,
+                Err(crate::AdapterError::ReadThenWriteContention)
+            ));
+            assert_eq!(catalog.transient_revision(), revision);
+            assert_eq!(catalog.current_upper().await, ts);
+            assert_eq!(
+                catalog.state().get_database(&db).schemas_by_name[DEFAULT_SCHEMA],
+                schema_id
+            );
+            catalog.expire().await;
+        })
+        .await
     }
 
     #[mz_ore::test(tokio::test)]

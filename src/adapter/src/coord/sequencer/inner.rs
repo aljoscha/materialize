@@ -1765,7 +1765,23 @@ impl Coordinator {
             }),
         };
 
-        let result = self.sequence_end_transaction_inner(&mut ctx, action).await;
+        let (mut txn, retire_notify) = self.clear_transaction(ctx.session_mut()).await;
+        ctx.delay_response_until(retire_notify);
+        if let EndTransactionAction::Commit = action
+            && let Some(block) = txn.inner_mut().and_then(|txn| txn.deterministic.take())
+        {
+            self.sequence_deterministic_commit(
+                PendingTxn {
+                    ctx,
+                    response,
+                    action,
+                },
+                *block,
+            )
+            .await;
+            return;
+        }
+        let result = self.sequence_end_transaction_inner(txn, action);
 
         let (response, action) = match result {
             Ok(Some(TransactionOps::DDL { commands, .. })) => {
@@ -1864,19 +1880,12 @@ impl Coordinator {
     }
 
     #[instrument(level = "debug")]
-    async fn sequence_end_transaction_inner(
-        &mut self,
-        ctx: &mut ExecuteContext,
+    fn sequence_end_transaction_inner(
+        &self,
+        txn: TransactionStatus,
         action: EndTransactionAction,
     ) -> Result<Option<TransactionOps>, AdapterError> {
-        let (mut txn, retire_notify) = self.clear_transaction(ctx.session_mut()).await;
-        ctx.delay_response_until(retire_notify);
-
         if let EndTransactionAction::Commit = action {
-            if let Some(block) = txn.inner_mut().and_then(|txn| txn.deterministic.take()) {
-                Box::pin(self.commit_deterministic_block(ctx, *block)).await?;
-                return Ok(None);
-            }
             if let Some(mut ops) = txn.into_ops() {
                 match &mut ops {
                     TransactionOps::Writes(writes) => {

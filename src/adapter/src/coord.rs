@@ -219,6 +219,8 @@ pub(crate) mod appends;
 pub(crate) mod catalog_serving;
 pub(crate) mod cluster_controller;
 pub(crate) mod consistency;
+mod deterministic_compute;
+mod deterministic_packet;
 pub(crate) mod id_bundle;
 pub(crate) mod in_memory_oracle;
 pub(crate) mod peek;
@@ -372,6 +374,7 @@ pub enum Message {
         pending: ddl::PendingDdlCommit,
         otel_ctx: OpenTelemetryContext,
     },
+    DeterministicCandidateReady(Box<ddl::DeterministicReady>),
     /// Initiates a group commit.
     GroupCommitInitiate(Span, Option<GroupCommitPermit>),
     /// Finalizes an applied group commit.
@@ -536,6 +539,7 @@ impl Message {
             } => "controller_ready(internal)",
             Message::PurifiedStatementReady(_) => "purified_statement_ready",
             Message::SourceStatementReady { .. } => "source_statement_ready",
+            Message::DeterministicCandidateReady(_) => "deterministic_candidate_ready",
             Message::DdlCommandsReady { .. } => "ddl_commands_ready",
             Message::GroupCommitInitiate(..) => "group_commit_initiate",
             Message::GroupCommitApplied { .. } => "group_commit_applied",
