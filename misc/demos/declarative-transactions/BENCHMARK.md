@@ -61,3 +61,33 @@ bin/pyactivate misc/demos/declarative-transactions/benchmark.py \
 Use `--mode ordinary` against upstream. The [baseline](benchmark-baseline.jsonl)
 and [prototype](benchmark-change.jsonl) JSONL files contain elapsed times,
 p99, and error counts as well.
+
+
+## Fifty chained renames, 1 to 256 clients
+
+Ordinary transactions committed all 525 attempts. Declarative transactions hit
+an optimizer recursion limit of 2048 at COMMIT, even with one client. All 269
+attempts at 1 through 128 clients returned XX000. At 256 clients the server
+logged 256 matching planner errors, but the driver timed out at its post-wave
+barrier and emitted no timing row. A separate single-client probe committed 32
+renames and failed at 50. This does not establish the precise cutoff.
+
+These are synchronized waves on one r5a.4xlarge with the same optimized revisions
+as above, no inserts, one schema and one empty table per client. Both arms had
+max_connections and startup max_concurrent_occ_writes set to 512. The declarative
+commit path does not acquire that OCC semaphore. Each client attempted three
+transactions at levels 1, 2 and 4, and one at higher levels. There was no warmup.
+
+| Clients | Ordinary commits/s | Ordinary p50 s | Ordinary p95 s |
+|---:|---:|---:|---:|
+| 1 | 2.67 | 0.37 | 0.38 |
+| 2 | 2.82 | 0.70 | 0.72 |
+| 4 | 2.83 | 1.39 | 1.44 |
+| 8 | 2.80 | 2.64 | 2.86 |
+| 16 | 2.74 | 5.35 | 5.84 |
+| 32 | 2.77 | 10.63 | 11.50 |
+| 64 | 2.65 | 22.20 | 23.92 |
+| 128 | 2.42 | 48.92 | 52.51 |
+| 256 | 2.11 | 112.71 | 120.54 |
+
+Raw results: [ordinary](benchmark-50-baseline.jsonl), [declarative](benchmark-50-change.jsonl).

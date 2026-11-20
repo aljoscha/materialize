@@ -40,6 +40,7 @@ def cell(url, mode, clients, renames, writes, count, warmup):
         completed = []
         failures = Counter()
         examples = {}
+        failed_phases = Counter()
         try:
             with psycopg.connect(url, autocommit=True, prepare_threshold=None) as c:
                 c.execute("SET statement_timeout = '120s'")
@@ -49,15 +50,19 @@ def cell(url, mode, clients, renames, writes, count, warmup):
                         start = clock()
                     t = clock()
                     try:
+                        phase = "begin"
                         c.execute(begin)
                         source = name
                         dest = root + ("b" if name.endswith("_a") else "a")
+                        phase = "rename"
                         for k in range(renames):
                             target = dest if k == renames - 1 else root + f"tmp{k}"
                             c.execute(f"ALTER SCHEMA {source} RENAME TO {target}")
                             source = target
+                        phase = "insert"
                         for _ in range(writes):
                             c.execute(f"INSERT INTO {source}.data VALUES (1)")
+                        phase = "commit"
                         c.execute("COMMIT")
                         name = source
                         inserted += writes
@@ -70,6 +75,7 @@ def cell(url, mode, clients, renames, writes, count, warmup):
                         c.execute("ROLLBACK")
                         if j >= warmup:
                             failures[e.sqlstate] += 1
+                            failed_phases[phase] += 1
                             examples[e.sqlstate] = e.diag.message_primary
                 end = clock()
                 barrier.wait(timeout=600)
@@ -78,7 +84,7 @@ def cell(url, mode, clients, renames, writes, count, warmup):
                     raise RuntimeError(
                         f"expected {inserted} committed rows, found {actual}"
                     )
-            return start, end, completed, failures, examples, name
+            return start, end, completed, failures, examples, failed_phases, name
         except BaseException:
             barrier.abort()
             raise
@@ -103,6 +109,7 @@ def cell(url, mode, clients, renames, writes, count, warmup):
             f"p{p}": times[math.ceil(p * len(times) / 100) - 1] if times else None
             for p in (50, 95, 99)
         },
+        failed_phases=dict(sum((r[5] for r in runs), Counter())),
         failures=dict(sum((r[3] for r in runs), Counter())),
         errors={k: v for r in runs for k, v in r[4].items()},
     )
