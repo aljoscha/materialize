@@ -1,0 +1,4 @@
+{"status": "verified", "mode": "declarative", "clients": 1, "renames": 32, "writes": 0, "attempts": 1, "commits": 1, "elapsed_s": 58.89785003399993, "tps": 0.016978548443155914, "latency_ms": {"p50": 58897.31730499989, "p95": 58897.31730499989, "p99": 58897.31730499989}, "failed_phases": {}, "failures": {}, "errors": {}}
+{"status": "verified", "mode": "declarative", "clients": 2, "renames": 32, "writes": 0, "attempts": 2, "commits": 2, "elapsed_s": 116.000492097, "tps": 0.01724130616900826, "latency_ms": {"p50": 109058.47011800006, "p95": 116000.31614299996, "p99": 116000.31614299996}, "failed_phases": {}, "failures": {}, "errors": {}}
+{"mode": "declarative", "clients": 4, "renames": 32, "status": "budget", "attempts": 4, "commits": 1, "validated": 0}
+{"mode": "declarative", "clients": 8, "renames": 32, "status": "budget", "attempts": 8, "commits": 1, "validated": 0}

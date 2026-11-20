@@ -91,3 +91,22 @@ transactions at levels 1, 2 and 4, and one at higher levels. There was no warmup
 | 256 | 2.11 | 112.71 | 120.54 |
 
 Raw results: [ordinary](benchmark-50-baseline.jsonl), [declarative](benchmark-50-change.jsonl).
+
+## Thirty-two chained renames
+
+At one client upstream committed in 0.243 s and the declarative prototype in
+58.90 s. At two clients aggregate throughput was 4.15 vs 0.0172 commits/s.
+Upstream completed every wave through 256 clients (511/511 commits).
+
+Each client attempted one transaction against its own schema with one empty
+table. Each cell started with a fresh catalog, no warmup, and both arms used
+the optimized revisions above. Connection and ordinary OCC limits were 512.
+These are single synchronized waves, not steady-state latency distributions.
+
+The declarative waves at four and eight clients exceeded a 240-second cell
+budget including setup and validation. A client received a successful COMMIT
+response after 218 s in each wave, but final state validation did not finish.
+No full-wave throughput is reported for either. Levels 16 through 256 were
+not run on the prototype after two successive budget hits.
+
+Raw results: [upstream](benchmark-32-baseline.jsonl), [prototype](benchmark-32-change.jsonl).
